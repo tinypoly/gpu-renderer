@@ -1093,7 +1093,8 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
   });
 
   try {
-    return (await serializeScene(scene)).scene;
+    // The path tracer samples only the base level of a texture: the mip chain would be built and thrown away.
+    return (await serializeScene(scene, { mipmaps: false })).scene;
   } finally {
     for (const [material, type] of renamed) material.type = type;
   }

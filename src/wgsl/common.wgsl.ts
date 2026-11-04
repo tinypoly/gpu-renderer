@@ -1,15 +1,21 @@
 import { FRAME_LAYOUT } from "../frameLayout.js";
 import { MATERIAL_KIND, MATERIAL_LAYOUT } from "../materialLayout.js";
+import { SOBOL_TABLE, SRGB_TABLE, TEXTURE_TABLE } from "../texturePack.js";
 
 /** Bindings and structs shared by every stage of the path tracing module. */
 export const COMMON_WGSL = /* wgsl */ `
 ${FRAME_LAYOUT.wgsl}
-// Thirty two bytes: a corner and a link, twice. A leaf stores -1 - start in place of its left child.
+// Sixty four bytes: the boxes of a node's two children, each a corner and a link, then a corner and a count. A link of
+// zero or more is the child's own node; a leaf stores -1 - start in it, into the hierarchy's leaf order. See bvh.ts.
 struct BvhNode {
-  low: vec3<f32>,
-  link: i32,
-  high: vec3<f32>,
-  count: i32,
+  leftLow: vec3<f32>,
+  leftLink: i32,
+  leftHigh: vec3<f32>,
+  leftCount: i32,
+  rightLow: vec3<f32>,
+  rightLink: i32,
+  rightHigh: vec3<f32>,
+  rightCount: i32,
 };
 
 /** As materialLayout.ts packs it. A map index of NO_TEXTURE means the slot is empty. */
@@ -119,14 +125,21 @@ const BLEND_MULTIPLY: u32 = 4u;
 const NO_TEXTURE: u32 = 0xffffffffu;
 const NO_PROGRAM: u32 = 0xffffffffu;
 
+// The lookup tables that lead the texture buffer, and where its table of textures starts after them: see texturePack.ts.
+const SOBOL_TABLE: u32 = ${SOBOL_TABLE}u;
+const SRGB_TABLE: u32 = ${SRGB_TABLE}u;
+const TEXTURE_TABLE: u32 = ${TEXTURE_TABLE}u;
+
 // A WebGPU device only has to offer eight storage buffers per stage, so arrays of the same kind share one binding and
 // the uniform says where the second one starts. See sceneUpload.ts, which joins them.
 @group(0) @binding(0) var<uniform> frame: Frame;
+// Nine coordinates per triangle, in the hierarchy's leaf order: see leafOf in bvh.wgsl.ts.
 @group(0) @binding(1) var<storage, read> positions: array<f32>;
 // Normals, then the UV sets from frame.uvOffset, vertex colours from frame.colorOffset and shader varyings from
 // frame.varyingOffset.
 @group(0) @binding(2) var<storage, read> attributes: array<f32>;
-// One material index per triangle, then the hierarchy's triangle order from frame.orderOffset on.
+// One material index per triangle, then the hierarchy's triangle order from frame.orderOffset on (the triangle at each
+// position of the leaf order), then from frame.leafOffset on the other way (the position of each triangle).
 @group(0) @binding(3) var<storage, read> indices: array<u32>;
 @group(0) @binding(4) var<storage, read> materials: array<Material>;
 @group(0) @binding(5) var<storage, read> nodes: array<BvhNode>;
@@ -174,7 +187,7 @@ fn extraVec4(at: u32) -> vec4<f32> {
 
 /** One entry of the texture table, unpacked from the words it shares with the texels. */
 fn textureInfo(index: u32) -> TextureInfo {
-  let at = index * 16u;
+  let at = TEXTURE_TABLE + index * 16u;
   var info: TextureInfo;
 
   info.size = vec2<u32>(textures[at], textures[at + 1u]);

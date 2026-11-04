@@ -33,10 +33,6 @@ fn wrapIndex(index: i32, size: i32, mode: u32) -> i32 {
   return clamp(index, 0, size - 1);
 }
 
-fn srgbChannelToLinear(value: f32) -> f32 {
-  return select(pow((value + 0.055) / 1.055, 2.4), value / 12.92, value <= 0.04045);
-}
-
 /** One texel, in linear light. Alpha is never encoded, as in Three. */
 fn readTexel(info: TextureInfo, x: i32, y: i32) -> vec4<f32> {
   let index = u32(y) * info.size.x + u32(x);
@@ -52,18 +48,21 @@ fn readTexel(info: TextureInfo, x: i32, y: i32) -> vec4<f32> {
   }
 
   let word = textures[info.offset + index];
-  let raw = vec4<f32>(
+
+  // The decode is a table of the 256 codes rather than a power per channel and per texel: the same values, read.
+  if ((info.flags & TEXTURE_SRGB) != 0u) {
+    return vec4<f32>(
+      bitcast<f32>(textures[SRGB_TABLE + (word & 0xffu)]),
+      bitcast<f32>(textures[SRGB_TABLE + ((word >> 8u) & 0xffu)]),
+      bitcast<f32>(textures[SRGB_TABLE + ((word >> 16u) & 0xffu)]),
+      f32((word >> 24u) & 0xffu) / 255.0);
+  }
+
+  return vec4<f32>(
     f32(word & 0xffu),
     f32((word >> 8u) & 0xffu),
     f32((word >> 16u) & 0xffu),
     f32((word >> 24u) & 0xffu)) / 255.0;
-
-  if ((info.flags & TEXTURE_SRGB) != 0u) {
-    return vec4<f32>(
-      srgbChannelToLinear(raw.r), srgbChannelToLinear(raw.g), srgbChannelToLinear(raw.b), raw.a);
-  }
-
-  return raw;
 }
 
 /** One texture of the table, sampled with its own transform, wrap modes and filter. */

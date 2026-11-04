@@ -330,7 +330,21 @@ fn traceRadiance(
       continue;
     }
 
-    let surface = resolveSurface(hit.triangle, bary, direction);
+    let base = sampleMap(materials[m].map, hit.triangle, bary);
+
+    // A cutout lets the ray through before anything else about the surface is read: the normal map, the other maps and
+    // the lobes would only be thrown away. The draw and the comparison are the ones made below, so nothing changes.
+    if (coverageFirst(m)) {
+      let opacity = coverageOf(m, materialAlphaFrom(m, hit.triangle, bary, base));
+
+      if (opacity < 1.0 && coverage.x >= opacity) {
+        origin = point + direction * RAY_EPSILON;
+        limit = select(1e30, limit - hit.distance, straight);
+        continue;
+      }
+    }
+
+    let surface = resolveSurfaceFrom(hit.triangle, bary, direction, base);
 
     // Blending other than normal: the surface adds its light to, or filters, whatever is behind it, and the path goes on.
     if (surface.blending == BLEND_ADDITIVE || surface.blending == BLEND_MULTIPLY || surface.blending == BLEND_SUBTRACTIVE) {

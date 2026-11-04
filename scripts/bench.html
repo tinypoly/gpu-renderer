@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>@tinypoly/gpu-renderer: timings</title>
+    <style>
+      body { font: 13px/1.6 ui-monospace, monospace; margin: 2rem; background: #16181c; color: #d8dbe0; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">Tracing…</pre>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/": "/node_modules/three/",
+          "@tinypoly/cpu-renderer": "/node_modules/@tinypoly/cpu-renderer/dist/index.js",
+          "@tinypoly/cpu-renderer/engine": "/node_modules/@tinypoly/cpu-renderer/dist/engine.js",
+          "naga-wasm": "/node_modules/naga-wasm/dist/index.js"
+        }
+      }
+    </script>
+    <script>
+      const post = (url, body) => fetch(url, { method: "POST", body });
+      addEventListener("error", event => post("/report", `ERROR ${event.message} @${event.lineno}`));
+      addEventListener("unhandledrejection", event =>
+        post("/report", `REJECT ${(event.reason && event.reason.stack) || event.reason}`));
+    </script>
+    <script type="module">
+      /**
+       * Timings, and the finished pixels, of a few scenes that lean on different parts of the renderer: traversal and
+       * the lobes, cutouts and sRGB textures, and many emissive triangles. Each is rendered once to warm the pipeline
+       * and the packed scene, then timed: without a canvas, which gives the pixels to compare between two builds, and
+       * with a canvas and the denoiser, which is what a page sees while the image converges.
+       *
+       * Usage: pnpm build && pnpm verify --page bench.html > timings.txt
+       *
+       * A build of another revision in node_modules/.cache/bench-base/dist (tsc of that revision's sources) is timed in
+       * turns against this one, so whatever the machine does meanwhile (heat, other work) weighs on both alike, and the
+       * report carries both images for comparison.
+       */
+      import * as THREE from "three";
+      import * as current from "/dist/index.js";
+
+      const BASE = "/node_modules/.cache/bench-base/dist/index.js";
+      const base = await fetch(BASE, { method: "HEAD" }).then(r => (r.ok ? import(BASE) : null), () => null);
+
+      const query = new URLSearchParams(location.search);
+      const [WIDTH, HEIGHT] = (query.get("size") ?? "480x320").split("x").map(Number);
+      const SAMPLES = Number(query.get("samples") ?? 128);
+      const REPEAT = Number(query.get("repeat") ?? 3);
+      const lines = [];
+      const show = line => {
+        lines.push(line);
+        document.getElementById("out").textContent = lines.join("\n");
+        post("/log", line);
+      };
+
+      /** A small deterministic generator, so every build renders the same scene. */
+      let state = 12345;
+      const random = () => ((state = (state * 1103515245 + 12345) >>> 0) / 4294967296);
+
+      function texture(size, paint, srgb = true) {
+        const data = new Uint8Array(size * size * 4);
+
+        for (let y = 0; y < size; y++) {
+          for (let x = 0; x < size; x++) data.set(paint(x / size, y / size), (y * size + x) * 4);
+        }
+
+        const map = new THREE.DataTexture(data, size, size);
+        map.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+        map.wrapS = map.wrapT = THREE.RepeatWrapping;
+        map.magFilter = THREE.LinearFilter;
+        map.needsUpdate = true;
+
+        return map;
+      }
+
+      function camera(position, target) {
+        const view = new THREE.PerspectiveCamera(40, WIDTH / HEIGHT, 0.1, 200);
+        view.position.set(...position);
+        view.lookAt(...target);
+        view.updateMatrixWorld(true);
+
+        return view;
+      }
+
+      function floor(scene, material) {
+        const mesh = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), material);
+        mesh.rotation.x = -Math.PI / 2;
+        scene.add(mesh);
+      }
+
+      /** Spheres and knots of every lobe: traversal, the GGX lobes, clearcoat and glass. */
+      function spheres() {
+        const scene = new THREE.Scene();
+        const geometry = new THREE.IcosahedronGeometry(0.45, 4);
+        const knot = new THREE.TorusKnotGeometry(0.5, 0.16, 160, 24);
+
+        for (let i = 0; i < 160; i++) {
+          const kind = i % 4;
+          const material = kind === 0 ? new THREE.MeshStandardMaterial({ roughness: random(), metalness: 0 })
+            : kind === 1 ? new THREE.MeshStandardMaterial({ roughness: 0.2 + random() * 0.4, metalness: 1 })
+            : kind === 2 ? new THREE.MeshPhysicalMaterial({ roughness: 0.6, clearcoat: 1, clearcoatRoughness: 0.1 })
+            : new THREE.MeshPhysicalMaterial({ roughness: 0.05, transmission: 1, thickness: 0.5, ior: 1.5 });
+          material.color.setHSL(random(), 0.6, 0.55);
+          const mesh = new THREE.Mesh(i % 5 === 0 ? knot : geometry, material);
+          mesh.position.set((i % 16) * 1.1 - 8, 0.5 + (i % 5 === 0 ? 0.2 : 0), Math.floor(i / 16) * 1.1 - 6);
+          mesh.rotation.set(random() * 3, random() * 3, 0);
+          scene.add(mesh);
+        }
+
+        floor(scene, new THREE.MeshStandardMaterial({ color: 0x808080, roughness: 0.5 }));
+
+        const sun = new THREE.DirectionalLight(0xffffff, 2);
+        sun.position.set(4, 8, 3);
+        sun.castShadow = true;
+        scene.add(sun);
+
+        const lamp = new THREE.PointLight(0xffd0a0, 30);
+        lamp.position.set(-3, 3, 2);
+        lamp.castShadow = true;
+        scene.add(lamp);
+
+        const panel = new THREE.Mesh(new THREE.PlaneGeometry(3, 1),
+          new THREE.MeshStandardMaterial({ emissive: 0xaaccff, emissiveIntensity: 4, color: 0 }));
+        panel.position.set(0, 4, -8);
+        scene.add(panel);
+
+        return { scene, camera: camera([0, 5, 10], [0, 0, -1]) };
+      }
+
+      /** Cards cut out by alphaTest, with sRGB colour maps and a normal map: the coverage path and texture decoding. */
+      function foliage() {
+        const scene = new THREE.Scene();
+        const leaf = texture(128, (u, v) => {
+          const inside = (u - 0.5) ** 2 * 4 + (v - 0.5) ** 2 * 1.6 < 0.25 ? 255 : 0;
+
+          return [60 + 120 * u, 140 + 80 * v, 50, inside];
+        });
+        const bumps = texture(128, (u, v) => [128 + 60 * Math.sin(u * 40), 128 + 60 * Math.cos(v * 40), 255, 255], false);
+        const ground = texture(512, (u, v) => {
+          const check = (Math.floor(u * 16) + Math.floor(v * 16)) % 2;
+
+          return [120 + 80 * check, 100 + 40 * check, 80, 255];
+        });
+        ground.repeat.set(4, 4);
+
+        const card = new THREE.PlaneGeometry(0.6, 0.9);
+        const material = new THREE.MeshStandardMaterial({
+          map: leaf, normalMap: bumps, alphaTest: 0.5, side: THREE.DoubleSide, roughness: 0.7 });
+
+        for (let i = 0; i < 2500; i++) {
+          const mesh = new THREE.Mesh(card, material);
+          const cluster = Math.floor(i / 250);
+          mesh.position.set((cluster % 5) * 3 - 6 + (random() - 0.5) * 2.2, 0.3 + random() * 2.4,
+            Math.floor(cluster / 5) * 3 - 3 + (random() - 0.5) * 2.2);
+          mesh.rotation.set(random() * 3, random() * 3, random() * 3);
+          scene.add(mesh);
+        }
+
+        floor(scene, new THREE.MeshStandardMaterial({ map: ground, roughness: 0.9 }));
+
+        const sun = new THREE.DirectionalLight(0xfff2dd, 3);
+        sun.position.set(3, 10, 4);
+        sun.castShadow = true;
+        scene.add(sun);
+
+        return { scene, camera: camera([0, 3.5, 9], [0, 1, 0]) };
+      }
+
+      /** Hundreds of small emissive tiles over a glossy floor: picking a light among many, and MIS on their hits. */
+      function emissive() {
+        const scene = new THREE.Scene();
+        const tile = new THREE.PlaneGeometry(0.3, 0.3, 2, 2);
+
+        for (let i = 0; i < 600; i++) {
+          const color = new THREE.Color().setHSL(random(), 0.8, 0.5);
+          const mesh = new THREE.Mesh(tile, new THREE.MeshStandardMaterial({
+            color: 0, emissive: color, emissiveIntensity: 2 + random() * 6 }));
+          mesh.position.set((i % 30) * 0.5 - 7.5, 3 + random() * 0.5, Math.floor(i / 30) * 0.5 - 6);
+          mesh.rotation.x = Math.PI / 2;
+          scene.add(mesh);
+        }
+
+        const geometry = new THREE.IcosahedronGeometry(0.6, 3);
+
+        for (let i = 0; i < 20; i++) {
+          const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ roughness: 0.3, metalness: i % 2 }));
+          mesh.position.set((i % 10) * 1.4 - 6.3, 0.6, Math.floor(i / 10) * 2 - 2);
+          scene.add(mesh);
+        }
+
+        floor(scene, new THREE.MeshStandardMaterial({ color: 0x606060, roughness: 0.15 }));
+
+        return { scene, camera: camera([0, 2.5, 8], [0, 1, -2]) };
+      }
+
+      const SCENES = { spheres, foliage, emissive };
+
+      const settings = denoise => ({
+        samples: SAMPLES,
+        toneMapping: "aces",
+        globalIllumination: { bounces: 4, denoise },
+      });
+
+      const environment = { kind: "gradient", topColor: "#6d87a8", bottomColor: "#2a2620" };
+
+      async function prepared(library, build, denoise, canvas) {
+        state = 12345;
+        const { scene, camera: view } = build();
+        scene.updateMatrixWorld(true);
+        const renderer = new library.GpuRenderer({ width: WIDTH, height: HEIGHT, scene, camera: view,
+          settings: settings(denoise), environment, bvhWorker: false });
+        const detach = canvas ? library.attachCanvas(renderer, canvas) : () => {};
+
+        // The first frame packs the scene, builds the hierarchy and compiles the kernel; the later ones only trace.
+        await renderer.render();
+
+        return { renderer, detach, canvas, ms: Infinity, data: null };
+      }
+
+      /** The fastest of a few renders of each build, in turns: a machine only ever adds time to a measurement. */
+      async function timed(build, denoise, withCanvas) {
+        const runs = [];
+
+        for (const library of base ? [current, base] : [current]) {
+          const canvas = withCanvas ? document.body.appendChild(document.createElement("canvas")) : null;
+          runs.push(await prepared(library, build, denoise, canvas));
+        }
+
+        for (let run = 0; run < REPEAT; run++) {
+          for (const entry of runs) {
+            const started = performance.now();
+            const image = await entry.renderer.render();
+            entry.ms = Math.min(entry.ms, performance.now() - started);
+            entry.data = image.data;
+          }
+        }
+
+        for (const entry of runs) {
+          entry.detach();
+          entry.renderer.dispose();
+          entry.canvas?.remove();
+        }
+
+        return runs;
+      }
+
+      function encode(bytes) {
+        let text = "";
+
+        for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+
+        return btoa(text);
+      }
+
+      const only = query.get("only");
+      const results = [];
+      const versus = (a, b) => (b ? `   base ${b.ms.toFixed(0).padStart(7)} ms  ${((a.ms / b.ms - 1) * 100).toFixed(1)}%` : "");
+
+      for (const [name, build] of Object.entries(SCENES)) {
+        if (only && only !== name) continue;
+
+        const [plain, plainBase] = await timed(build, false, false);
+        const [preview, previewBase] = await timed(build, true, true);
+
+        show(`${name.padEnd(10)} plain    ${plain.ms.toFixed(0).padStart(7)} ms${versus(plain, plainBase)}`);
+        show(`${name.padEnd(10)} denoised ${preview.ms.toFixed(0).padStart(7)} ms${versus(preview, previewBase)}`);
+
+        const result = { name, plain: plain.ms, denoised: preview.ms,
+          image: encode(plain.data), denoisedImage: encode(preview.data) };
+
+        if (plainBase) {
+          result.base = { plain: plainBase.ms, denoised: previewBase.ms,
+            image: encode(plainBase.data), denoisedImage: encode(previewBase.data) };
+        }
+
+        results.push(result);
+      }
+
+      post("/report", JSON.stringify({ width: WIDTH, height: HEIGHT, samples: SAMPLES, results }));
+    </script>
+  </body>
+</html>

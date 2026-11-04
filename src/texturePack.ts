@@ -10,10 +10,10 @@ import type { SerializedScene, SerializedTexture } from "./upstream.js";
  */
 export interface PackedTextures {
   /**
-   * One buffer for all of it: `TEXTURE_WORDS` words per texture first, as `TextureInfo` in `wgsl/common.wgsl.ts`, then
-   * the texels each entry points at. A byte texture takes one word per texel, RGBA in the low to high bytes; a float
-   * texture takes four, each the bits of one linear channel. Keeping the two in one binding is what holds the shader
-   * inside the eight storage buffers a WebGPU device has to offer.
+   * One buffer for all of it: the lookup tables first (see `TEXTURE_TABLE`), then `TEXTURE_WORDS` words per texture, as
+   * `TextureInfo` in `wgsl/common.wgsl.ts`, then the texels each entry points at. A byte texture takes one word per
+   * texel, RGBA in the low to high bytes; a float texture takes four, each the bits of one linear channel. Keeping them
+   * in one binding is what holds the shader inside the eight storage buffers a WebGPU device has to offer.
    */
   data: Uint32Array;
   count: number;
@@ -32,6 +32,62 @@ export interface TextureExtras {
 /** Sixteen words per entry: see `TextureInfo` in `wgsl/common.wgsl.ts`. */
 export const TEXTURE_WORDS = 16;
 
+/**
+ * Lookup tables that lead the buffer, at offsets the shader knows as constants: the second Sobol dimension one byte of
+ * the index at a time (four tables of 256), then the linear value of each of the 256 sRGB codes. Both replace work the
+ * kernel did on every read with the very numbers it computed, so nothing they feed changes.
+ */
+export const SOBOL_TABLE = 0;
+export const SRGB_TABLE = SOBOL_TABLE + 4 * 256;
+/** Where the texture table starts, after the lookup tables. */
+export const TEXTURE_TABLE = SRGB_TABLE + 256;
+
+/** The four byte tables of the Sobol sequence's second dimension, whose generator matrix is Pascal's triangle mod 2. */
+function sobolTables(): Uint32Array {
+  const directions: number[] = [];
+  let direction = 0x80000000;
+
+  for (let bit = 0; bit < 32; bit++) {
+    directions.push(direction >>> 0);
+    direction = (direction ^ (direction >>> 1)) >>> 0;
+  }
+
+  const tables = new Uint32Array(4 * 256);
+
+  for (let byte = 0; byte < 4; byte++) {
+    for (let value = 0; value < 256; value++) {
+      let xor = 0;
+
+      for (let bit = 0; bit < 8; bit++) if (value & (1 << bit)) xor ^= directions[byte * 8 + bit];
+
+      tables[byte * 256 + value] = xor >>> 0;
+    }
+  }
+
+  return tables;
+}
+
+/** The linear value of every sRGB code, worked out in double precision and rounded once. */
+function srgbTable(): Float32Array {
+  return Float32Array.from({ length: 256 }, (_, code) => {
+    const value = Math.fround(code / 255);
+
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+}
+
+const LOOKUP = (() => {
+  const words = new Uint32Array(TEXTURE_TABLE);
+
+  words.set(sobolTables(), SOBOL_TABLE);
+  words.set(new Uint32Array(srgbTable().buffer), SRGB_TABLE);
+
+  return words;
+})();
+
+/** Where a texture's entry starts in the buffer. */
+export const textureEntry = (index: number) => TEXTURE_TABLE + index * TEXTURE_WORDS;
+
 /** What a material's map index means when the material has no such map. */
 export const NO_TEXTURE = 0xffffffff;
 
@@ -48,6 +104,9 @@ const MIRRORED_REPEAT = 1002;
 
 /** How many UV sets the geometry carries, and so the highest channel a texture may ask for. */
 export const UV_CHANNELS = 2;
+
+/** Whether a word's first byte is its lowest, as it is on the device: then RGBA bytes are already RGBA words. */
+const LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
 
 const texelCount = (texture: SerializedTexture) => Math.max(0, texture.width) * Math.max(0, texture.height);
 
@@ -66,6 +125,7 @@ const isEncoded = (texture: SerializedTexture) => !isFloat(texture) && texture.c
 export interface TexturePlan {
   textures: SerializedTexture[];
   indexOf: Map<string, number>;
+  /** The lookup tables and the texture table together: where the texels begin. */
   tableWords: number;
   /** Where the words appended after the texels begin. */
   extraOffset: number;
@@ -80,7 +140,7 @@ export function planTextures(scene: SerializedScene, extraTextures: readonly Ser
     .filter(texture => !seen.has(texture.id) && !!seen.add(texture.id));
 
   const indexOf = new Map(textures.map((texture, index) => [texture.id, index]));
-  const tableWords = Math.max(1, textures.length) * TEXTURE_WORDS;
+  const tableWords = TEXTURE_TABLE + Math.max(1, textures.length) * TEXTURE_WORDS;
   const texelWords = textures.reduce((sum, texture) => sum + texelCount(texture) * (isFloat(texture) ? 4 : 1), 0);
 
   return { textures, indexOf, tableWords, extraOffset: tableWords + texelWords };
@@ -100,8 +160,10 @@ export function writeTextures(plan: TexturePlan, extraWords: Uint32Array): Packe
   const floats = new Float32Array(data.buffer);
   let texelAt = tableWords;
 
+  data.set(LOOKUP, 0);
+
   textures.forEach((texture, index) => {
-    const at = index * TEXTURE_WORDS;
+    const at = textureEntry(index);
     const texels = texelCount(texture);
     const float = isFloat(texture);
 
@@ -131,13 +193,18 @@ export function writeTextures(plan: TexturePlan, extraWords: Uint32Array): Packe
     } else {
       const source = texture.data as Uint8Array;
 
-      for (let texel = 0; texel < texels; texel++) {
-        const offset = texel * 4;
+      if (LITTLE_ENDIAN) {
+        // The bytes already sit in the order the words want them: copied whole, as the GPU reads them.
+        new Uint8Array(data.buffer, texelAt * 4, texels * 4).set(source.subarray(0, texels * 4));
+      } else {
+        for (let texel = 0; texel < texels; texel++) {
+          const offset = texel * 4;
 
-        words[texelAt + texel] = source[offset]
-          | (source[offset + 1] << 8)
-          | (source[offset + 2] << 16)
-          | (source[offset + 3] << 24);
+          words[texelAt + texel] = source[offset]
+            | (source[offset + 1] << 8)
+            | (source[offset + 2] << 16)
+            | (source[offset + 3] << 24);
+        }
       }
 
       texelAt += texels;

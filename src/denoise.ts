@@ -86,6 +86,10 @@ struct Params {
 @group(0) @binding(3) var<storage, read> specularIn: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> diffuseOut: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> specularOut: array<vec4<f32>>;
+// The guides each tap compares, worked out once per pixel by prepare: the normal and the depth, then the roughness, or
+// -1 where no sample has landed. The same numbers the accumulation gives, two reads a tap instead of four.
+@group(0) @binding(6) var<storage, read_write> guides: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> roughnesses: array<f32>;
 
 fn luminance(color: vec3<f32>) -> f32 {
   return dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -153,9 +157,14 @@ fn prepare(@builtin(global_invocation_id) id: vec3<u32>) {
   if (count <= 0.0) {
     diffuseOut[index] = vec4<f32>(0.0);
     specularOut[index] = vec4<f32>(0.0);
+    guides[index] = vec4<f32>(0.0);
+    roughnesses[index] = -1.0;
 
     return;
   }
+
+  guides[index] = vec4<f32>(guideNormal(index), guideDepth(index));
+  roughnesses[index] = guideRoughness(index);
 
   let squares = accumulation[params.count + index];
   let diffuse = diffuseMean(index);
@@ -269,9 +278,10 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
     return;
   }
 
-  let normal = guideNormal(index);
-  let depth = guideDepth(index);
-  let roughness = guideRoughness(index);
+  let guide = guides[index];
+  let normal = guide.xyz;
+  let depth = guide.w;
+  let roughness = roughnesses[index];
   let diffuseSigma = params.edge * sqrt(max(localVariance(pixel, false), 0.0)) + 1e-6;
   let specularSigma = params.edge * sqrt(max(localVariance(pixel, true), 0.0)) + 1e-6;
   let radius = specularRadius(index, depth);
@@ -299,19 +309,23 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
       var ws = base;
 
       if (dx != 0 || dy != 0) {
-        if (accumulation[other].w <= 0.0) {
+        let otherRoughness = roughnesses[other];
+
+        // No sample has landed there.
+        if (otherRoughness < 0.0) {
           continue;
         }
 
+        let otherGuide = guides[other];
         let offset = length(vec2<f32>(f32(dx * step), f32(dy * step)));
-        let alignment = max(dot(normal, guideNormal(other)), 0.0);
-        let depthWeight = exp(-abs(depth - guideDepth(other)) / (0.02 * depth * offset + 1e-3));
+        let alignment = max(dot(normal, otherGuide.xyz), 0.0);
+        let depthWeight = exp(-abs(depth - otherGuide.w) / (0.02 * depth * offset + 1e-3));
 
         wd = wd * pow(alignment, 128.0) * depthWeight
           * exp(-abs(luminance(d.rgb) - luminance(diffuseCenter.rgb)) / diffuseSigma);
 
         ws = ws * pow(alignment, specularPower) * depthWeight
-          * exp(-abs(guideRoughness(other) - roughness) * 10.0)
+          * exp(-abs(otherRoughness - roughness) * 10.0)
           * exp(-abs(luminance(s.rgb) - luminance(specularCenter.rgb)) / specularSigma)
           * select(0.0, exp(-offset * offset / (radius * radius)), radius >= 0.5);
       }
@@ -381,8 +395,21 @@ export class DenoisePass {
   private readonly finish: GPUComputePipeline;
   /** One uniform per stage, so a whole denoise is a single submit. */
   private readonly params: GPUBuffer[];
-  /** Two ping-pong pairs, diffuse and specular, and the output. */
+  /** Two ping-pong pairs, diffuse and specular, the output, then the guides and the roughness. */
   private buffers: GPUBuffer[] = [];
+  /** Bind groups by the buffers they bind, and a number for each buffer seen, which is what the key is made of. */
+  private readonly groups = new Map<string, GPUBindGroup>();
+  private readonly ids = new WeakMap<GPUBuffer, number>();
+  private nextId = 0;
+
+  private idOf(buffer: GPUBuffer): number {
+    let id = this.ids.get(buffer);
+
+    if (id === undefined) this.ids.set(buffer, id = this.nextId++);
+
+    return id;
+  }
+
   private width = 0;
   private height = 0;
 
@@ -402,6 +429,8 @@ export class DenoisePass {
         { binding: 3, visibility, buffer: storage("read-only-storage") },
         { binding: 4, visibility, buffer: storage("storage") },
         { binding: 5, visibility, buffer: storage("storage") },
+        { binding: 6, visibility, buffer: storage("storage") },
+        { binding: 7, visibility, buffer: storage("storage") },
       ],
     });
 
@@ -423,9 +452,12 @@ export class DenoisePass {
 
     const size = Math.max(16, width * height * 16);
 
-    this.buffers = Array.from({ length: 5 }, () =>
+    this.buffers = Array.from({ length: 6 }, () =>
       this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }));
+    this.buffers.push(
+      this.device.createBuffer({ size: Math.max(16, width * height * 4), usage: GPUBufferUsage.STORAGE }));
     this.output = this.buffers[4];
+    this.groups.clear();
     this.width = width;
     this.height = height;
   }
@@ -460,22 +492,34 @@ export class DenoisePass {
     this.resize(width, height);
     this.writeParams(width, height, settings, view);
 
-    const [diffuseA, diffuseB, specularA, specularB, output] = this.buffers;
+    const [diffuseA, diffuseB, specularA, specularB, output, guides, roughnesses] = this.buffers;
     const groups = [Math.ceil(width / 8), Math.ceil(height / 8)] as const;
 
     const run = (pipeline: GPUComputePipeline, params: GPUBuffer,
       sources: [GPUBuffer, GPUBuffer], targets: [GPUBuffer, GPUBuffer]) => {
-      const group = this.device.createBindGroup({
-        layout: this.layout,
-        entries: [
-          { binding: 0, resource: { buffer: params } },
-          { binding: 1, resource: { buffer: accumulation } },
-          { binding: 2, resource: { buffer: sources[0] } },
-          { binding: 3, resource: { buffer: sources[1] } },
-          { binding: 4, resource: { buffer: targets[0] } },
-          { binding: 5, resource: { buffer: targets[1] } },
-        ],
-      });
+      // The same few groups serve every denoise of an image size: they are made once and kept.
+      const key = [params, accumulation, ...sources, ...targets].map(buffer => this.idOf(buffer)).join();
+      let group = this.groups.get(key);
+
+      if (!group) {
+        group = this.device.createBindGroup({
+          layout: this.layout,
+          entries: [
+            { binding: 0, resource: { buffer: params } },
+            { binding: 1, resource: { buffer: accumulation } },
+            { binding: 2, resource: { buffer: sources[0] } },
+            { binding: 3, resource: { buffer: sources[1] } },
+            { binding: 4, resource: { buffer: targets[0] } },
+            { binding: 5, resource: { buffer: targets[1] } },
+            { binding: 6, resource: { buffer: guides } },
+            { binding: 7, resource: { buffer: roughnesses } },
+          ],
+        });
+        // A new accumulation buffer comes with a new size, which clears these; the cap is only a guard.
+        if (this.groups.size > 64) this.groups.clear();
+
+        this.groups.set(key, group);
+      }
 
       const pass = encoder.beginComputePass({ label: "denoise" });
 
@@ -509,6 +553,7 @@ export class DenoisePass {
     for (const buffer of [...this.buffers, ...this.params]) buffer.destroy();
 
     this.buffers = [];
+    this.groups.clear();
     this.output = null;
   }
 }

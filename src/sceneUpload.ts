@@ -11,7 +11,7 @@ export interface SceneByteLength {
   materials: number;
   /** Vertex normals, the UV sets, vertex colours and shader varyings, in one buffer. */
   attributes: number;
-  /** One material index per triangle and then the hierarchy's triangle order, in one buffer. */
+  /** One material index per triangle, then the hierarchy's triangle order and its inverse, in one buffer. */
   indices: number;
   nodes: number;
   lights: number;
@@ -37,11 +37,16 @@ export interface SceneBuffers {
   varyingOffset: number;
   hasColors: boolean;
   orderOffset: number;
+  /** Where each triangle's position in the leaf order starts inside `indices`. */
+  leafOffset: number;
   triangleCount: number;
   /** Everything the integrator can aim a shadow ray at. */
   lightCount: number;
   /** How many of those are emissive triangles, which lead the buffer. */
   areaLightCount: number;
+  /** Where the lights' cumulative probabilities and the emissive ones' triangles sit in `textures`. */
+  lightCdf: number;
+  lightTriangles: number;
   /** Radiance an ambient or hemisphere light adds, which no shadow ray can reach. */
   ambient: PackedLights["ambient"];
   /** Where the surrounding image and its distributions ended up, for the frame uniform. */
@@ -76,7 +81,7 @@ export function sceneByteLength(
   const lengths = {
     positions: sized(geometry.positions.byteLength),
     attributes: sized(attributeBytes(geometry)),
-    indices: sized(geometry.materials.byteLength + bvh.order.byteLength),
+    indices: sized(geometry.materials.byteLength + 2 * bvh.order.byteLength),
     materials: sized(Math.max(1, geometry.materialCount) * MATERIAL_WORDS * 4),
     nodes: sized(bvh.nodes.byteLength),
     lights: sized(lights.entries.byteLength),
@@ -108,6 +113,25 @@ export function packMaterials(geometry: PackedGeometry): ArrayBuffer {
 /** The power a surrounding image radiates over the whole sphere, which is what weighs it against the scene's lights. */
 export function environmentPower(environment: PackedEnvironment | null): number {
   return environment ? environment.total * 2 * Math.PI ** 2 / (environment.width * environment.height) : 0;
+}
+
+/**
+ * The positions in the hierarchy's leaf order, which is the order its traversal reads them in, so a leaf is one run of
+ * the buffer; and where each triangle went, for everything that reads a triangle by its own number.
+ */
+export function leafOrder(
+  positions: Float32Array, order: Uint32Array): { positions: Float32Array; inverse: Uint32Array } {
+  const ordered = new Float32Array(order.length * 9);
+  const inverse = new Uint32Array(order.length);
+
+  for (let at = 0; at < order.length; at++) {
+    const triangle = order[at];
+
+    ordered.set(positions.subarray(triangle * 9, triangle * 9 + 9), at * 9);
+    inverse[triangle] = at;
+  }
+
+  return { positions: ordered, inverse };
 }
 
 export function uploadScene(
@@ -147,11 +171,12 @@ export function uploadScene(
 
   const colors = geometry.colors ?? new Float32Array(0);
   const varyings = geometry.varyings ?? new Float32Array(0);
+  const leaves = leafOrder(geometry.positions, bvh.order);
 
   const buffers = {
-    positions: write(geometry.positions, lengths.positions),
+    positions: write(leaves.positions, lengths.positions),
     attributes: join([geometry.normals, geometry.uvs, colors, varyings], lengths.attributes),
-    indices: join([geometry.materials, bvh.order], lengths.indices),
+    indices: join([geometry.materials, bvh.order, leaves.inverse], lengths.indices),
     materials: write(new Uint8Array(packMaterials(geometry)), lengths.materials),
     nodes: write(new Uint8Array(bvh.nodes), lengths.nodes),
     lights: write(new Uint8Array(lights.entries), lengths.lights),
@@ -166,9 +191,12 @@ export function uploadScene(
     varyingOffset: geometry.normals.length + geometry.uvs.length + colors.length,
     hasColors: colors.length > 0,
     orderOffset: geometry.materials.length,
+    leafOffset: geometry.materials.length + bvh.order.length,
     triangleCount: geometry.triangleCount,
     lightCount: lights.count,
     areaLightCount: lights.areaCount,
+    lightCdf: lights.cdfAt,
+    lightTriangles: lights.trianglesAt,
     ambient: lights.ambient,
     environment: {
       texture: environment ? textures.indexOf.get(environment.texture.id) ?? NO_TEXTURE : NO_TEXTURE,

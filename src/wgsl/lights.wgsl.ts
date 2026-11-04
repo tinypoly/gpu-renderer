@@ -41,7 +41,8 @@ fn lightByProbability(u: f32) -> Light {
 
     let middle = (low + high) / 2u;
 
-    if (lights[middle].cdf > u) {
+    // The probabilities packed tight in the texture buffer: the same floats as lights[].cdf, a word apart.
+    if (extraFloat(frame.lightCdf + middle) > u) {
       high = middle;
     } else {
       low = middle + 1u;
@@ -65,7 +66,7 @@ fn lightPdfOfTriangle(triangle: u32) -> f32 {
     }
 
     let middle = (low + high) / 2u;
-    let candidate = lights[middle].triangle;
+    let candidate = textures[frame.lightTriangles + middle];
 
     if (candidate == triangle) {
       return lights[middle].pdf;

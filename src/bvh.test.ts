@@ -77,51 +77,113 @@ const cross = (a: number[], b: number[]) =>
 
 const dot = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
-/**
- * The traversal the shader performs, in TypeScript: the same stack, the same slab test and the same leaf encoding.
- * It is the reference the WGSL is written against, and it is what makes a packing mistake fail here instead of on a
- * GPU where nothing can be printed.
- */
-function traverse(bvh: PackedBvh, positions: Float32Array, origin: number[], direction: number[]): number {
+/** One child of a node: its box, and its link and count, as `struct BvhNode` holds them. */
+function child(bvh: PackedBvh, node: number, side: 0 | 1) {
   const floats = new Float32Array(bvh.nodes);
   const ints = new Int32Array(bvh.nodes);
-  const inverse = direction.map(value => 1 / value);
-  const stack = [0];
-  let closest = Infinity;
+  const word = node * NODE_WORDS + side * 8;
 
-  while (stack.length) {
-    const node = stack.pop() as number;
-    const word = node * NODE_WORDS;
-    let near = 0, far = closest;
+  return {
+    low: [floats[word], floats[word + 1], floats[word + 2]],
+    high: [floats[word + 4], floats[word + 5], floats[word + 6]],
+    link: ints[word + 3],
+    count: ints[word + 7],
+  };
+}
 
-    for (let axis = 0; axis < 3; axis++) {
-      const a = (floats[word + axis] - origin[axis]) * inverse[axis];
-      const b = (floats[word + 4 + axis] - origin[axis]) * inverse[axis];
+function enter(box: { low: number[]; high: number[] }, origin: number[], inverse: number[], limit: number): number {
+  let near = 0, far = limit;
 
-      near = Math.max(near, Math.min(a, b));
-      far = Math.min(far, Math.max(a, b));
-    }
+  for (let axis = 0; axis < 3; axis++) {
+    const a = (box.low[axis] - origin[axis]) * inverse[axis];
+    const b = (box.high[axis] - origin[axis]) * inverse[axis];
 
-    if (near > far) continue;
-
-    const link = ints[word + 3];
-
-    if (link < 0) {
-      const start = -1 - link;
-
-      for (let i = start; i < start + ints[word + 7]; i++) {
-        const distance = intersect(positions, bvh.order[i], origin, direction);
-
-        if (distance < closest) closest = distance;
-      }
-
-      continue;
-    }
-
-    stack.push(link, ints[word + 7]);
+    near = Math.max(near, Math.min(a, b));
+    far = Math.min(far, Math.max(a, b));
   }
 
-  return closest;
+  return near <= far ? near : Infinity;
+}
+
+/**
+ * The traversal the shader performs, in TypeScript: the same stack, the same order, the same slab test and the same
+ * leaf encoding, a leaf that has to wait included. It is the reference the WGSL is written against, and it is what
+ * makes a packing mistake fail here instead of on a GPU where nothing can be printed. Also returns how many triangle
+ * tests it took, which says the search was cut short.
+ */
+function traverse(bvh: PackedBvh, positions: Float32Array, origin: number[], direction: number[]) {
+  const inverse = direction.map(value => 1 / value);
+  const stack: { entry: { node: number } | { parent: number; side: 0 | 1 }; enter: number }[] = [];
+  let closest = Infinity, tests = 0;
+  let current: number | null = 0;
+
+  const leaf = (link: number, count: number) => {
+    for (let i = -1 - link; i < -1 - link + count; i++) {
+      tests++;
+      closest = Math.min(closest, intersect(positions, bvh.order[i], origin, direction));
+    }
+  };
+
+  for (;;) {
+    if (current === null) {
+      const top = stack.pop();
+
+      if (!top) break;
+      if (top.enter > closest) continue;
+
+      if ("parent" in top.entry) {
+        const waiting = child(bvh, top.entry.parent, top.entry.side);
+
+        leaf(waiting.link, waiting.count);
+        continue;
+      }
+
+      current = top.entry.node;
+    }
+
+    const left = child(bvh, current, 0), right = child(bvh, current, 1);
+    const leftEnter = enter(left, origin, inverse, closest), rightEnter = enter(right, origin, inverse, closest);
+    const leftFirst = leftEnter <= rightEnter;
+
+    const [near, nearEnter, far, farEnter] = leftFirst
+      ? [left, leftEnter, right, rightEnter] : [right, rightEnter, left, leftEnter];
+
+    const parent: number = current;
+
+    current = null;
+
+    if (nearEnter < Infinity) {
+      if (near.link < 0) leaf(near.link, near.count);
+      else current = near.link;
+    }
+
+    if (farEnter < Infinity && farEnter <= closest) {
+      if (current === null) {
+        if (far.link < 0) leaf(far.link, far.count);
+        else current = far.link;
+      } else {
+        stack.push({ entry: far.link < 0 ? { parent, side: leftFirst ? 1 : 0 } : { node: far.link }, enter: farEnter });
+      }
+    }
+  }
+
+  return { closest, tests };
+}
+
+/** Every leaf, as the run of `order` it covers and the box its parent keeps for it. */
+function leaves(bvh: PackedBvh) {
+  const found: { start: number; count: number; low: number[]; high: number[] }[] = [];
+
+  for (let node = 0; node < bvh.nodeCount; node++) {
+    for (const side of [0, 1] as const) {
+      const slot = child(bvh, node, side);
+
+      if (slot.link < 0 && slot.count > 0)
+        found.push({ start: -1 - slot.link, count: slot.count, low: slot.low, high: slot.high });
+    }
+  }
+
+  return found;
 }
 
 it("hands back an empty tree for an empty scene", () => {
@@ -149,43 +211,42 @@ it("holds every triangle of a leaf inside that leaf's bounds", () => {
   const count = 800;
   const positions = randomTriangles(count);
   const bvh = buildBvh(positions, count);
-  const floats = new Float32Array(bvh.nodes);
-  const ints = new Int32Array(bvh.nodes);
 
-  for (let node = 0; node < bvh.nodeCount; node++) {
-    const word = node * NODE_WORDS;
-    const link = ints[word + 3];
-
-    if (link >= 0) continue;
-
-    const start = -1 - link;
-
-    for (let i = start; i < start + ints[word + 7]; i++)
+  for (const { start, count: size, low, high } of leaves(bvh))
+    for (let i = start; i < start + size; i++)
       for (let corner = 0; corner < 3; corner++)
         for (let axis = 0; axis < 3; axis++) {
           const value = positions[bvh.order[i] * 9 + corner * 3 + axis];
 
-          expect(value).toBeGreaterThanOrEqual(floats[word + axis]);
-          expect(value).toBeLessThanOrEqual(floats[word + 4 + axis]);
+          expect(value).toBeGreaterThanOrEqual(low[axis]);
+          expect(value).toBeLessThanOrEqual(high[axis]);
         }
-  }
 });
 
-it("contains each child inside its parent", () => {
+it("covers every triangle with exactly one leaf", () => {
+  const bvh = buildBvh(randomTriangles(700), 700);
+  const covered = new Uint8Array(700);
+
+  for (const { start, count } of leaves(bvh)) for (let i = start; i < start + count; i++) covered[i]++;
+
+  expect([...covered].every(times => times === 1)).toBe(true);
+});
+
+it("contains each child's children inside the box its parent keeps for it", () => {
   const bvh = buildBvh(randomTriangles(600), 600);
-  const floats = new Float32Array(bvh.nodes);
-  const ints = new Int32Array(bvh.nodes);
 
   for (let node = 0; node < bvh.nodeCount; node++) {
-    const word = node * NODE_WORDS;
+    for (const side of [0, 1] as const) {
+      const slot = child(bvh, node, side);
 
-    if (ints[word + 3] < 0) continue;
+      if (slot.link < 0) continue;
 
-    for (const child of [ints[word + 3], ints[word + 7]])
-      for (let axis = 0; axis < 3; axis++) {
-        expect(floats[child * NODE_WORDS + axis]).toBeGreaterThanOrEqual(floats[word + axis]);
-        expect(floats[child * NODE_WORDS + 4 + axis]).toBeLessThanOrEqual(floats[word + 4 + axis]);
-      }
+      for (const inner of [child(bvh, slot.link, 0), child(bvh, slot.link, 1)])
+        for (let axis = 0; axis < 3; axis++) {
+          expect(inner.low[axis]).toBeGreaterThanOrEqual(slot.low[axis]);
+          expect(inner.high[axis]).toBeLessThanOrEqual(slot.high[axis]);
+        }
+    }
   }
 });
 
@@ -202,7 +263,10 @@ it("finds the same closest hit as testing every triangle", () => {
     const length = Math.hypot(...direction);
     const unit = direction.map(value => value / length);
 
-    expect(traverse(bvh, positions, origin, unit)).toBeCloseTo(bruteForce(positions, count, origin, unit), 4);
+    const { closest, tests } = traverse(bvh, positions, origin, unit);
+
+    expect(closest).toBeCloseTo(bruteForce(positions, count, origin, unit), 4);
+    expect(tests).toBeLessThan(count);
   }
 });
 
@@ -215,6 +279,18 @@ it("keeps triangles that share a centroid in one leaf instead of looping forever
 
   const bvh = buildBvh(positions, count);
 
+  // One leaf, held by a node beside an empty child.
   expect(bvh.nodeCount).toBe(1);
   expect(bvh.order.length).toBe(count);
+  expect(leaves(bvh)).toHaveLength(1);
+  expect(child(bvh, 0, 1).count).toBe(0);
+});
+
+it("finds a single leaf's closest hit, held beside the empty child", () => {
+  const positions = randomTriangles(3, 5);
+  const bvh = buildBvh(positions, 3);
+  const unit = [0.3, -0.2, 0.93].map(value => value / Math.hypot(0.3, -0.2, 0.93));
+
+  expect(traverse(bvh, positions, [0, 0, -20], unit).closest)
+    .toBeCloseTo(bruteForce(positions, 3, [0, 0, -20], unit), 4);
 });

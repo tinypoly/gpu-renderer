@@ -1,16 +1,16 @@
 import { PerspectiveCamera, type LightProbe, type Material, type Object3D, type Scene } from "three";
 import { Accumulator } from "./accumulator.js";
-import { type PackedBvh } from "./bvh.js";
 import { BvhBuilder, createDefaultBvhWorker, type BvhWorkerFactory } from "./bvhBuilder.js";
 import { cameraMatrices, type CameraMatrices } from "./camera.js";
 import { requestRenderDevice, type RenderDevice } from "./device.js";
 import { loadEnvironment, type PackedEnvironment } from "./environment.js";
 import { DispatchScheduler } from "./dispatchScheduler.js";
-import { packGeometry, type PackedGeometry } from "./geometry.js";
+import { packGeometry } from "./geometry.js";
 import { packLights } from "./lights.js";
 import { NO_PROGRAM } from "./materialLayout.js";
-import { NO_TEXTURE, planTextures, writeTextures, type PackedTextures } from "./texturePack.js";
+import { NO_TEXTURE, planTextures, writeTextures } from "./texturePack.js";
 import { PathTracePass, type FrameUniforms } from "./pathTracePass.js";
+import { ImageResolvePass } from "./imageResolve.js";
 import { PresentPass } from "./presentPass.js";
 import {
   CONVERGED_ERROR,
@@ -27,7 +27,6 @@ import { environmentPower, uploadScene, type SceneBuffers } from "./sceneUpload.
 import {
   DEFAULT_RENDER_ENVIRONMENT,
   DEFAULT_RENDER_SETTINGS,
-  encodeColor,
   EventEmitter,
   mergeSettings,
   serializeCamera,
@@ -161,8 +160,18 @@ function rowRanges(rows: readonly number[]): [number, number][] {
 const CAPTURE_SAMPLES = 32;
 
 /** A scene on the device, with where its extra words went. */
+/**
+ * What is kept of a packed scene once it is on the device: whether it follows the camera, and where each texture's
+ * texels start, for the captures that write into them. The packed arrays themselves, hundreds of megabytes for a large
+ * scene, are let go as soon as they are uploaded.
+ */
+interface PackedSummary {
+  cameraDependent: boolean;
+  textureOffsets: ReadonlyMap<string, number>;
+}
+
 interface PackedTarget {
-  packed: { geometry: PackedGeometry; bvh: PackedBvh; textures: PackedTextures };
+  packed: PackedSummary;
   buffers: SceneBuffers;
   skyData: number;
   volumetricData: number;
@@ -201,7 +210,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private pathTrace: PathTracePass | null = null;
   private present: PresentPass | null = null;
   private buffers: SceneBuffers | null = null;
-  private packed: { geometry: PackedGeometry; bvh: PackedBvh; textures: PackedTextures } | null = null;
+  private packed: PackedSummary | null = null;
+  private imageResolve: ImageResolvePass | null = null;
   private sceneDirty = true;
   // Compute bakes, the procedural sky and translated shaders: prepared once per scene.
   private assets: Promise<SceneAssets> | null = null;
@@ -472,6 +482,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.buffers?.destroy();
     this.accumulator?.destroy();
     this.denoisePass?.destroy();
+    this.imageResolve?.dispose();
+    this.imageResolve = null;
     this.gpu?.device.destroy();
     this.buffers = null;
     this.accumulator = null;
@@ -698,17 +710,22 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     const environment = assets.sky?.environment ?? image;
     const matrices = cameraMatrices(camera, width, height);
     const view = `${JSON.stringify(camera)}|${width}|${height}`;
-    const moved = (!!this.packed?.geometry.cameraDependent || this.planar) && view !== this.packedView;
+    const moved = (!!this.packed?.cameraDependent || this.planar) && view !== this.packedView;
 
     if (this.sceneDirty || !this.buffers || moved) {
       // Planar surfaces need their captures, from this camera, before the scene that samples them is packed.
       const planar = planarCaptures(assets.scene, camera, width, height);
 
+      // The scene on the device is replaced: letting it go first keeps the two from being held at once.
+      this.buffers?.destroy();
+      this.buffers = null;
+      this.target = null;
+      this.packed = null;
+
       const packed = await this.packScene(
         gpu, revision, planar?.scene ?? assets.scene, assets, matrices, width, height, environment);
 
       this.packed = packed.packed;
-      this.buffers?.destroy();
       this.buffers = packed.buffers;
       this.target = packed;
       this.sceneDirty = false;
@@ -802,8 +819,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     // Nothing is on the device yet, so a frame replaced while the hierarchy was built has nothing to give back.
     this.check(revision);
 
-    const packed = { geometry, bvh, textures };
-    const buffers = uploadScene(gpu.device, geometry, packed.bvh, textures, lights, environment, cdf);
+    const buffers = uploadScene(gpu.device, geometry, bvh, textures, lights, environment, cdf);
+    const textureOffsets = new Map([...textures.indexOf].map(([id, index]) => [id, textures.data[index * 16 + 2]]));
+    const packed: PackedSummary = { cameraDependent: geometry.cameraDependent, textureOffsets };
 
     if (buffers.bytes.largest > gpu.maxStorageBufferBindingSize) {
       buffers.destroy();
@@ -869,9 +887,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
         }
 
         const offset = (id: string | undefined) => {
-          const index = id === undefined ? undefined : main.packed.textures.indexOf.get(id);
-
-          return index === undefined ? NO_TEXTURE : main.packed.textures.data[index * 16 + 2];
+          return (id === undefined ? undefined : main.packed.textureOffsets.get(id)) ?? NO_TEXTURE;
         };
 
         const encoder = gpu.device.createCommandEncoder();
@@ -1021,55 +1037,14 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private async readImage(
     gpu: RenderDevice, width: number, height: number, denoised: GPUBuffer | null): Promise<RenderImage> {
     const accumulator = this.accumulator as Accumulator;
-    // The radiance and the coverage; the guides and the row flags after them are not part of the image.
-    const length = width * height * 32;
-
-    const read = async(buffer: GPUBuffer, bytes: number) => {
-      const usage = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
-      const staging = gpu.device.createBuffer({ size: bytes, usage });
-      const encoder = gpu.device.createCommandEncoder();
-
-      encoder.copyBufferToBuffer(buffer, 0, staging, 0, bytes);
-      gpu.device.queue.submit([encoder.finish()]);
-      await staging.mapAsync(GPUMapMode.READ);
-
-      const floats = new Float32Array(staging.getMappedRange().slice(0));
-
-      staging.unmap();
-      staging.destroy();
-
-      return floats;
-    };
-
-    const floats = await read(accumulator.buffer, length);
-    // The denoiser's output is the mean radiance itself, one vec4 per pixel.
-    const filtered = denoised ? await read(denoised, width * height * 16) : null;
-
-    const data = new Uint8ClampedArray(width * height * 4);
     const { exposure, toneMapping, vignette } = this.current;
     const transparent = this.current.background.mode === "transparent";
-    const coverage = width * height * 4;
 
-    for (let pixel = 0; pixel < width * height; pixel++) {
-      const samples = floats[pixel * 4 + 3];
-      const x = (pixel % width) / width - 0.5, y = Math.floor(pixel / width) / height - 0.5;
-      const falloff = Math.max(0, 1 - vignette * (x * x + y * y) * 2);
+    // Resolved on the device, so the page only copies the bytes of the image.
+    this.imageResolve ??= new ImageResolvePass(gpu.device);
 
-      // The radiance is premultiplied by the coverage, which a transparent background makes the alpha.
-      const alpha = !transparent ? 1
-        : samples > 0 ? Math.min(1, Math.max(0, floats[coverage + pixel * 4] / samples)) : 0;
-
-      const mean = (channel: number) =>
-        (filtered ? filtered[pixel * 4 + channel] : floats[pixel * 4 + channel] / samples);
-
-      const color = samples > 0 && alpha > 0
-        ? [0, 1, 2].map(channel => mean(channel) / alpha * falloff)
-        : [0, 0, 0];
-
-      const [r, g, b] = encodeColor(color, exposure, toneMapping);
-
-      data.set([r, g, b, Math.round(alpha * 255)], pixel * 4);
-    }
+    const data = await this.imageResolve.read(accumulator.buffer, denoised, width, height,
+      { exposure, toneMapping, vignette, transparent });
 
     return { width, height, data };
   }

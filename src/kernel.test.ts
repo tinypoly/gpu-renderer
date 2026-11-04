@@ -4,6 +4,7 @@ import { pathTraceSource } from "./pathTracePass.js";
 import { compileShaderPrograms } from "./shaderProgram.js";
 import { DENOISE_WGSL } from "./denoise.js";
 import { PRESENT_WGSL } from "./wgsl/present.wgsl.js";
+import { IMAGE_RESOLVE_WGSL } from "./imageResolve.js";
 import type { SerializedMaterial, SerializedScene } from "./upstream.js";
 
 /**
@@ -24,6 +25,10 @@ it("validates the path tracing kernel without any shader", () => {
 
 it("validates the presentation pass", () => {
   expect(() => check(PRESENT_WGSL)).not.toThrow();
+});
+
+it("validates the pass that resolves the finished image to bytes", () => {
+  expect(() => check(IMAGE_RESOLVE_WGSL)).not.toThrow();
 });
 
 it("validates the denoiser", () => {

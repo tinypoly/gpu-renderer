@@ -1,5 +1,6 @@
 import { environmentFromImage, type PackedEnvironment } from "./environment.js";
 import { compileShaderPrograms, type ShaderPrograms } from "./shaderProgram.js";
+import { bakeSkyOnDevice, compileSkyProgram } from "./skyBake.js";
 import { CpuComputePipeline, CpuEnvironment } from "./upstream.js";
 import type { SerializedMaterial, SerializedScene, SerializedTexture, UniformValue } from "./upstream.js";
 
@@ -13,6 +14,8 @@ export interface SceneAssets {
   scene: SerializedScene;
   programs: ShaderPrograms;
   sky: ProceduralSkyEnvironment | null;
+  /** The baked sky, kept by the renderer so a scene with the same sky does not bake it again. */
+  skyBake: { key: string; baked: Promise<ProceduralSkyEnvironment | null> } | null;
 }
 
 export interface ProceduralSkyEnvironment {
@@ -83,12 +86,10 @@ function bakeComputations(source: SerializedScene): SerializedScene {
   };
 }
 
-/** Bakes a procedural sky with the CPU renderer's own interpreter, at the size its environment uses. */
-function bakeSky(scene: SerializedScene): ProceduralSkyEnvironment | null {
-  const sky = scene.sky;
+type ProceduralSky = NonNullable<SerializedScene["sky"]>;
 
-  if (!sky) return null;
-
+/** Bakes a procedural sky with the CPU renderer's own interpreter: the fallback, when the device cannot run it. */
+function bakeSkyOnCpu(sky: ProceduralSky): Float32Array | null {
   const generator = CpuEnvironment.fromProcedural(sky, SKY_WIDTH);
   let step = generator.next();
 
@@ -97,22 +98,66 @@ function bakeSky(scene: SerializedScene): ProceduralSkyEnvironment | null {
   // The snapshot is the environment's public face; its texture is the baked panorama.
   const texture = step.value.snapshot().texture;
 
-  if (!texture || !(texture.data instanceof Float32Array)) return null;
+  return texture && texture.data instanceof Float32Array ? texture.data : null;
+}
 
-  const environment = environmentFromImage(texture.data, texture.width, texture.height, "procedural-sky");
+/**
+ * Bakes a procedural sky at the size its environment uses. On a device the sky's shader is translated and run there,
+ * over every texel at once; the CPU renderer's interpreter, which runs it texel by texel, is what is left when there is
+ * no device or the shader does not translate.
+ */
+async function bakeSky(sky: ProceduralSky, device?: GPUDevice): Promise<ProceduralSkyEnvironment | null> {
+  let radiance: Float32Array | null = null;
+
+  if (device) {
+    try {
+      radiance = await bakeSkyOnDevice(device, await compileSkyProgram(sky.fragmentShader), sky.uniforms, SKY_WIDTH);
+    } catch(error) {
+      console.warn("GPU renderer: the procedural sky is baked on the CPU, its shader did not run on the device.", error);
+    }
+  }
+
+  radiance ??= bakeSkyOnCpu(sky);
+
+  if (!radiance) return null;
+
+  const environment = environmentFromImage(radiance, SKY_WIDTH, SKY_WIDTH / 2, "procedural-sky");
 
   if (!environment) return null;
 
   return { environment, intensity: sky.intensity, background: sky.background, uniforms: sky.uniforms };
 }
 
-export async function prepareSceneAssets(source: SerializedScene): Promise<SceneAssets> {
+/** What decides a baked sky: the same shader with the same uniforms bakes the same panorama. */
+export function skyKey(sky: ProceduralSky | undefined): string {
+  return sky ? JSON.stringify([sky.fragmentShader, sky.uniforms]) : "";
+}
+
+export interface SceneAssetOptions {
+  /** Where the sky is baked; without one, on the CPU. */
+  device?: GPUDevice;
+  /** A sky baked for an earlier scene, reused when its key matches this scene's. */
+  sky?: { key: string; baked: Promise<ProceduralSkyEnvironment | null> } | null;
+}
+
+export async function prepareSceneAssets(
+  source: SerializedScene, options: SceneAssetOptions = {}): Promise<SceneAssets> {
   const scene = source.meshes.some(mesh => mesh.materials.some(material => material?.compute))
     ? bakeComputations(source)
     : source;
 
-  const sky = bakeSky(scene);
-  const programs = await compileShaderPrograms(scene, scene.sky?.foregroundShader);
+  const key = skyKey(scene.sky);
+  const reused = options.sky && options.sky.key === key ? options.sky.baked : null;
+  const baked = reused ?? (scene.sky ? bakeSky(scene.sky, options.device) : Promise.resolve(null));
+  const [sky, programs] = await Promise.all([baked, compileShaderPrograms(scene, scene.sky?.foregroundShader)]);
+  // The sky the scene uses, with its baked panorama, for the next scene to reuse.
+  const skyBake = scene.sky ? { key, baked } : null;
 
-  return { scene, programs, sky };
+  // The panorama comes from the shader and its uniforms; how strongly it lights and whether it paints the background
+  // are this scene's own.
+  const current = sky && scene.sky
+    ? { ...sky, intensity: scene.sky.intensity, background: scene.sky.background, uniforms: scene.sky.uniforms }
+    : null;
+
+  return { scene, programs, sky: current, skyBake };
 }

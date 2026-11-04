@@ -105,7 +105,7 @@ Every option has a setter of the same name, except `bvhWorker` and `createBvhWor
 | Method | |
 | --- | --- |
 | `render()` | Starts a frame with the current inputs and discards the one in progress. Resolves with the finished image, `{ width, height, data }`: `data` is RGBA bytes, straight sRGB, `width * height * 4` long. Rejects with an `AbortError` (see `isAbortError`) when a later `render()`, `cancel()` or `dispose()` replaces the frame, and with the error when the frame fails, a lost device included. |
-| `setScene(scene)` | A Three scene is serialized in the background; `render()` waits for it. |
+| `setScene(scene)` | A Three scene is serialized in the background; `render()` waits for it. Handing over the same snapshot again keeps what was prepared for it (packed triangles, BVH, textures and the baked sky), so the next frame of an unchanged scene starts tracing at once. |
 | `setCamera(camera)` | A Three camera is read as it is at every `render()`, so moving it or changing its aspect only needs a new frame. A `CameraState` from `serializeCamera` stays fixed. |
 | `setSettings(settings)` | Merges the given fields into the current settings, group by group: `{ fog: { enabled: true } }` keeps the other fog fields. |
 | `setEnvironment(environment)` | Replaces the environment. A change of intensity or rotation alone does not load the image again. |

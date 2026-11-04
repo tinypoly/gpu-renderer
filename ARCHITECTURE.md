@@ -6,7 +6,8 @@ How `@tinypoly/gpu-renderer` works inside, and the decisions behind it. For inst
 The renderer takes a serialized Three.js scene, uploads geometry, a BVH, materials, textures and lights to the GPU, and
 runs a path tracing compute shader that accumulates radiance into a float buffer. A small render pipeline presents that
 buffer, dividing by the sample count and applying exposure, tone mapping, vignette and grain. There is no worker pool and
-no `SharedArrayBuffer`: the state lives on the device.
+no `SharedArrayBuffer`: the state lives on the device. The one worker there is builds the BVH of a large scene off the
+page's thread, and changes nothing about the tree it builds.
 
 ## Relationship with @tinypoly/cpu-renderer
 
@@ -28,7 +29,11 @@ stay the algorithmic reference, line by line.
 - `camera.ts`: the camera's matrices. Every ray goes through the inverse of the camera's own projection.
 - `geometry.ts`, `bvh.ts`: flat triangle and attribute buffers, and the BVH built straight into 32 byte nodes. Packing
   also builds what Three draws in screen space (points, lines, sprites, dashes) as triangles facing the camera, applies
-  displacement maps, and runs vertex shaders.
+  displacement maps, and runs vertex shaders. A plain mesh, with no vertex shader and no displacement, takes a faster
+  path that transforms each vertex once into typed arrays and writes exactly what the general one would.
+- `bvhBuilder.ts`, `bvhWorker.ts`: the BVH built in a Web Worker from a copy of the positions, for scenes of at least
+  `BVH_WORKER_MIN_TRIANGLES`; on the main thread below that, when `bvhWorker` is false, or for good once the worker
+  fails to start or load.
 - `structLayout.ts`, `frameLayout.ts`, `materialLayout.ts`: one description of each struct, from which both the WGSL
   declaration and the TypeScript writer are generated, so their word offsets cannot drift apart.
 - `texturePack.ts`, `lights.ts`: the remaining storage buffer layouts. `lights.ts` holds the emissive triangles and

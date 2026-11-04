@@ -1,6 +1,7 @@
 import { PerspectiveCamera, type LightProbe, type Material, type Object3D, type Scene } from "three";
 import { Accumulator } from "./accumulator.js";
-import { buildBvh, type PackedBvh } from "./bvh.js";
+import { type PackedBvh } from "./bvh.js";
+import { BvhBuilder, createDefaultBvhWorker, type BvhWorkerFactory } from "./bvhBuilder.js";
 import { cameraMatrices, type CameraMatrices } from "./camera.js";
 import { requestRenderDevice, type RenderDevice } from "./device.js";
 import { loadEnvironment, type PackedEnvironment } from "./environment.js";
@@ -85,6 +86,17 @@ export interface GpuRendererOptions {
   pixelRatio?: number;
   /** How the denoiser filters, when `settings.globalIllumination.denoise` turns it on. Merged over `DEFAULT_DENOISER`. */
   denoiser?: Partial<DenoiserSettings>;
+  /**
+   * Builds the BVH of a large scene in a Web Worker, so the page keeps responding while it is split. The tree is the
+   * same either way. Defaults to true where Web Workers exist, or when `createBvhWorker` is given; false builds on the
+   * main thread. If the worker cannot start, the renderer warns once and builds on the main thread.
+   */
+  bvhWorker?: boolean;
+  /**
+   * Starts the BVH worker. Replace it when the bundler cannot follow `new URL("./bvhWorker.js", import.meta.url)`, or
+   * outside the browser, with anything shaped like a Web Worker that runs `dist/bvhWorker.js`.
+   */
+  createBvhWorker?: BvhWorkerFactory;
 }
 
 interface PendingFrame {
@@ -213,9 +225,13 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private revision = 0;
   private frameIndex = 0;
   private disposed = false;
+  private bvh: BvhBuilder;
 
   constructor(options: GpuRendererOptions) {
     super();
+    this.bvh = new BvhBuilder(
+      options.bvhWorker ?? (options.createBvhWorker !== undefined || typeof Worker !== "undefined"),
+      options.createBvhWorker ?? createDefaultBvhWorker);
     this.width = Math.max(1, Math.floor(options.width));
     this.height = Math.max(1, Math.floor(options.height));
     this.pixelRatio = checkedPixelRatio(options.pixelRatio ?? 1);
@@ -443,6 +459,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.revision++;
     this.resume();
     this.abort("The renderer was disposed.");
+    this.bvh.dispose();
     this.buffers?.destroy();
     this.accumulator?.destroy();
     this.denoisePass?.destroy();
@@ -504,7 +521,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     const assets = await this.assets;
 
     this.check(revision);
-    this.prepare(gpu, assets, camera, width, height, environment);
+    await this.prepare(gpu, revision, assets, camera, width, height, environment);
     this.output = { width, height, data: new Uint8ClampedArray(width * height * 4) };
     this.emit("start", { width, height });
 
@@ -655,8 +672,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   }
 
   /** Uploads what changed and makes sure the passes point at the current buffers. */
-  private prepare(
+  private async prepare(
     gpu: RenderDevice,
+    revision: number,
     assets: SceneAssets,
     camera: CameraState,
     width: number,
@@ -674,17 +692,21 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     if (this.sceneDirty || !this.buffers || moved) {
       // Planar surfaces need their captures, from this camera, before the scene that samples them is packed.
       const planar = planarCaptures(assets.scene, camera, width, height);
-      const packed = this.packScene(gpu, planar?.scene ?? assets.scene, assets, matrices, width, height, environment);
+
+      const packed = await this.packScene(
+        gpu, revision, planar?.scene ?? assets.scene, assets, matrices, width, height, environment);
 
       this.packed = packed.packed;
       this.buffers?.destroy();
       this.buffers = packed.buffers;
       this.target = packed;
       this.sceneDirty = false;
-      this.packedView = view;
       this.planar = !!planar;
 
-      if (planar) this.renderCaptures(gpu, planar, assets, environment);
+      if (planar) await this.renderCaptures(gpu, revision, planar, assets, environment);
+
+      // Only once the captures are in: a frame replaced while they were taken has to take them again.
+      this.packedView = view;
     }
 
     const resized = !this.accumulator || this.accumulator.resize(width, height);
@@ -708,14 +730,15 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   }
 
   /** Packs and uploads one scene: its textures, geometry, hierarchy, lights and every extra word they point at. */
-  private packScene(
+  private async packScene(
     gpu: RenderDevice,
+    revision: number,
     scene: SerializedScene,
     assets: SceneAssets,
     matrices: CameraMatrices,
     width: number,
     height: number,
-    environment: PackedEnvironment | null): PackedTarget {
+    environment: PackedEnvironment | null): Promise<PackedTarget> {
     // The textures are planned first: a material refers to one by the index it lands on in that table, and to its
     // extra words by where they land after the texels. The environment rides along in the same buffer.
     const plan = planTextures(scene, environment ? [environment.texture] : []);
@@ -763,7 +786,12 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     const volumetric = packVolumetricLights(scene.lights);
     const volumetricData = append(new Uint32Array(volumetric.buffer));
     const textures = writeTextures(plan, new Uint32Array(extra));
-    const packed = { geometry, bvh: buildBvh(geometry.positions, geometry.triangleCount), textures };
+    const bvh = await this.bvh.build(geometry.positions, geometry.triangleCount);
+
+    // Nothing is on the device yet, so a frame replaced while the hierarchy was built has nothing to give back.
+    this.check(revision);
+
+    const packed = { geometry, bvh, textures };
     const buffers = uploadScene(gpu.device, geometry, packed.bvh, textures, lights, environment, cdf);
 
     if (buffers.bytes.largest > gpu.maxStorageBufferBindingSize) {
@@ -785,8 +813,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
    * the texels of its placeholder in the main scene's texture buffer. Everything is queued ahead of the frame itself,
    * which the queue then runs in order.
    */
-  private renderCaptures(
-    gpu: RenderDevice, planar: PlanarCaptures, assets: SceneAssets, environment: PackedEnvironment | null) {
+  private async renderCaptures(gpu: RenderDevice, revision: number, planar: PlanarCaptures, assets: SceneAssets,
+    environment: PackedEnvironment | null) {
     const main = this.target as PackedTarget;
     const pathTrace = this.pathTrace as PathTracePass;
     const { width, height } = planar;
@@ -801,7 +829,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
         let target = scenes.get(capture.scene);
 
         if (!target) {
-          target = this.packScene(gpu, capture.scene === "scene" ? planar.captureScene : empty, assets,
+          target = await this.packScene(gpu, revision, capture.scene === "scene" ? planar.captureScene : empty, assets,
             cameraMatrices(capture.camera, width, height), width, height, environment);
           scenes.set(capture.scene, target);
         }

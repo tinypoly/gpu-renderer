@@ -29,7 +29,7 @@
     </script>
     <script type="module">
       import * as THREE from "three";
-      import { GpuRenderer } from "/dist/index.js";
+      import { createDefaultBvhWorker, GpuRenderer } from "/dist/index.js";
 
       /**
        * Every check renders a scene whose answer is known on paper. A unit albedo Lambert surface facing a light of
@@ -801,6 +801,42 @@
         log("gradient");
         check("gradient environment, top colour only",
           (await measureEnvironment({ kind: "gradient", topColor: "#ffffff", bottomColor: "#ffffff", exponent: 1 })).mean, 1.0, 3);
+        // ---- the BVH worker ----
+        // A scene above the worker's threshold, built off the page and on it: the tree is the same, so the image is too.
+        log("bvh worker");
+        const heavy = new THREE.Scene();
+        heavy.add(new THREE.Mesh(new THREE.TorusKnotGeometry(0.6, 0.2, 600, 100), white()));
+        const sunlight = new THREE.DirectionalLight(0xffffff, 2);
+        sunlight.position.set(1, 2, 3);
+        heavy.add(sunlight);
+        heavy.updateMatrixWorld(true);
+        const warnings = [];
+        const warn = console.warn;
+        console.warn = (...args) => { warnings.push(args.join(" ")); warn(...args); };
+        const renderHeavy = async options => {
+          // The longest the page went without running a timer, which is what a held main thread looks like.
+          let last = performance.now(), longest = 0;
+          const timer = setInterval(() => {
+            const now = performance.now();
+            longest = Math.max(longest, now - last);
+            last = now;
+          }, 4);
+          const renderer = new GpuRenderer({ width: SIZE, height: SIZE, scene: heavy, camera, ...options,
+            settings: { samples: 16, toneMapping: "linear", exposure: 1, globalIllumination: { bounces: 2 } } });
+          const { data } = await renderer.render();
+          renderer.dispose();
+          clearInterval(timer);
+          return { data, longest };
+        };
+        let started = 0;
+        const offPage = await renderHeavy({ createBvhWorker: () => (started++, createDefaultBvhWorker()) });
+        const onPage = await renderHeavy({ bvhWorker: false });
+        console.warn = warn;
+        check("the BVH worker was started", started, 1, 0);
+        check("the BVH worker loaded without falling back", warnings.length, 0, 0);
+        check("same image with the BVH worker and without", offPage.data.every((v, i) => v === onPage.data[i]) ? 1 : 0, 1, 0);
+        lines.push(`main thread held at most ${offPage.longest.toFixed(0)} ms with the BVH worker, `
+          + `${onPage.longest.toFixed(0)} ms without`);
         await post("/report", lines.join("\n"));
       } catch (error) {
         await post("/report", `EXC ${error.stack}`);

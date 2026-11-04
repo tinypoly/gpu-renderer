@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>@tinypoly/gpu-renderer: divergence</title>
+    <style>
+      body { font: 13px/1.6 ui-monospace, monospace; margin: 2rem; background: #16181c; color: #d8dbe0; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">Tracing…</pre>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/": "/node_modules/three/",
+          "@tinypoly/cpu-renderer": "/node_modules/@tinypoly/cpu-renderer/dist/index.js",
+          "@tinypoly/cpu-renderer/engine": "/node_modules/@tinypoly/cpu-renderer/dist/engine.js",
+          "naga-wasm": "/node_modules/naga-wasm/dist/index.js"
+        }
+      }
+    </script>
+    <script>
+      const post = (url, body) => fetch(url, { method: "POST", body });
+      addEventListener("error", event => post("/report", `ERROR ${event.message} @${event.lineno}`));
+      addEventListener("unhandledrejection", event =>
+        post("/report", `REJECT ${(event.reason && event.reason.stack) || event.reason}`));
+    </script>
+    <script type="module">
+      import * as THREE from "three";
+      import { GpuRenderer } from "/dist/index.js";
+
+      /**
+       * Measures what divergence costs the megakernel. The same grid of spheres is rendered once per material kind,
+       * every sphere alike, and once with the kinds alternating sphere by sphere. Each kind covers the same share of
+       * the image, so without divergence the mixed image would cost the mean of the uniform ones; what it costs above
+       * that mean is what threads waiting on each other's materials cost, which a wavefront integrator would recover.
+       */
+      const SIZE = 640, SAMPLES = 32, ROWS = 8, COLUMNS = 8;
+      const lines = [];
+      const log = body => post("/log", body);
+      const linear = (r, g = r, b = r) => new THREE.Color().setRGB(r, g, b, THREE.LinearSRGBColorSpace);
+
+      const KINDS = {
+        lambert: () => new THREE.MeshLambertMaterial({ color: linear(0.7, 0.3, 0.2) }),
+        metal: () => new THREE.MeshStandardMaterial({ color: linear(0.9, 0.8, 0.5), metalness: 1, roughness: 0.25 }),
+        clearcoat: () => new THREE.MeshPhysicalMaterial({ color: linear(0.6, 0.05, 0.05), roughness: 0.6, clearcoat: 1, clearcoatRoughness: 0.1 }),
+        glass: () => new THREE.MeshPhysicalMaterial({ color: linear(1), transmission: 1, roughness: 0.05, thickness: 1, ior: 1.5 }),
+        sheen: () => new THREE.MeshPhysicalMaterial({ color: linear(0.2, 0.2, 0.6), roughness: 0.5, sheen: 1, sheenColor: linear(1),
+          iridescence: 1, iridescenceIOR: 1.3 }),
+        phong: () => new THREE.MeshPhongMaterial({ color: linear(0.2, 0.6, 0.3), specular: linear(0.5), shininess: 80 }),
+        toon: () => new THREE.MeshToonMaterial({ color: linear(0.8, 0.6, 0.2) }),
+        shader: () => new THREE.ShaderMaterial({
+          vertexShader: "varying vec3 vNormal; varying vec2 vUv; void main() { vNormal = normal; vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: "varying vec3 vNormal; varying vec2 vUv;\n"
+            + "float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }\n"
+            + "float noise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);\n"
+            + "  return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y); }\n"
+            + "void main() { float v = 0.0; float a = 0.5; vec2 p = vUv * 8.0;\n"
+            + "  for (int i = 0; i < 6; i++) { v += a * noise(p); p *= 2.0; a *= 0.5; }\n"
+            + "  gl_FragColor = vec4(mix(vec3(0.1, 0.2, 0.5), vec3(0.9, 0.8, 0.6), v) * (0.5 + 0.5 * vNormal.z), 1.0); }",
+        }),
+      };
+      const NAMES = Object.keys(KINDS);
+
+      function grid(kindAt) {
+        const scene = new THREE.Scene();
+        const geometry = new THREE.SphereGeometry(0.45, 48, 24);
+        const materials = Object.fromEntries(NAMES.map(name => [name, KINDS[name]()]));
+        for (let row = 0; row < ROWS; row++)
+          for (let column = 0; column < COLUMNS; column++) {
+            const mesh = new THREE.Mesh(geometry, materials[kindAt(row, column)]);
+            mesh.position.set(column - (COLUMNS - 1) / 2, (ROWS - 1) / 2 - row, 0);
+            scene.add(mesh);
+          }
+        const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshStandardMaterial({ color: linear(0.5), roughness: 0.8 }));
+        floor.position.z = -0.6;
+        scene.add(floor);
+        const sun = new THREE.DirectionalLight(0xffffff, 3);
+        sun.position.set(-3, 4, 6);
+        sun.castShadow = true;
+        scene.add(sun);
+        scene.updateMatrixWorld(true);
+        return scene;
+      }
+
+      const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+      camera.position.set(0, 0, 11.5);
+      camera.lookAt(0, 0, 0);
+      camera.updateMatrixWorld(true);
+
+      async function time(scene) {
+        let best = Infinity;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const renderer = new GpuRenderer({
+            width: SIZE, height: SIZE, scene, camera,
+            settings: { samples: SAMPLES, globalIllumination: { bounces: 4, denoise: false }, toneMapping: "aces" },
+            environment: { kind: "gradient", topColor: "#9cb8d8", bottomColor: "#2b2a28" },
+          });
+          // The first frame compiles the kernel and uploads the scene: only the frames after it are timed.
+          await renderer.render();
+          const started = performance.now();
+          await renderer.render();
+          best = Math.min(best, performance.now() - started);
+          renderer.dispose();
+        }
+        return best;
+      }
+
+      try {
+        const uniform = {};
+        for (const name of NAMES) {
+          log(name);
+          uniform[name] = await time(grid(() => name));
+          lines.push(`${name.padEnd(10)} alone      ${uniform[name].toFixed(0).padStart(6)} ms`);
+        }
+        const mean = NAMES.reduce((sum, name) => sum + uniform[name], 0) / NAMES.length;
+        log("mixed");
+        // Neighbouring spheres differ, and every kind appears once in every row.
+        const mixed = await time(grid((row, column) => NAMES[(row + column) % NAMES.length]));
+        lines.push("");
+        lines.push(`mean of the kinds alone    ${mean.toFixed(0).padStart(6)} ms`);
+        lines.push(`all kinds mixed            ${mixed.toFixed(0).padStart(6)} ms`);
+        lines.push(`divergence overhead        ${((mixed / mean - 1) * 100).toFixed(1).padStart(6)} %`);
+        await post("/report", lines.join("\n"));
+      } catch (error) {
+        await post("/report", `EXC ${error.stack}`);
+      }
+    </script>
+  </body>
+</html>

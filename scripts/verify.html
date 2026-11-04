@@ -1,0 +1,810 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>@tinypoly/gpu-renderer: checks</title>
+    <style>
+      body { font: 13px/1.6 ui-monospace, monospace; margin: 2rem; background: #16181c; color: #d8dbe0; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">Tracing…</pre>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/": "/node_modules/three/",
+          "@tinypoly/cpu-renderer": "/node_modules/@tinypoly/cpu-renderer/dist/index.js",
+          "@tinypoly/cpu-renderer/engine": "/node_modules/@tinypoly/cpu-renderer/dist/engine.js",
+          "naga-wasm": "/node_modules/naga-wasm/dist/index.js"
+        }
+      }
+    </script>
+    <script>
+      const post = (url, body) => fetch(url, { method: "POST", body });
+      addEventListener("error", event => post("/report", `ERROR ${event.message} @${event.lineno}`));
+      addEventListener("unhandledrejection", event =>
+        post("/report", `REJECT ${(event.reason && event.reason.stack) || event.reason}`));
+    </script>
+    <script type="module">
+      import * as THREE from "three";
+      import { GpuRenderer } from "/dist/index.js";
+
+      /**
+       * Every check renders a scene whose answer is known on paper. A unit albedo Lambert surface facing a light of
+       * irradiance pi/4 leaves a radiance of exactly 0.25, so that number stands behind most of what follows.
+       */
+      const SIZE = 48;
+      const lines = [];
+      const log = body => post("/log", body);
+      const toLinear = c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+
+      const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
+      camera.position.set(0, 0, 3);
+      camera.lookAt(0, 0, 0);
+      camera.updateMatrixWorld(true);
+
+      const white = () => {
+        const material = new THREE.MeshLambertMaterial();
+        material.color.setRGB(1, 1, 1, THREE.LinearSRGBColorSpace);
+        return material;
+      };
+
+      /** A plane facing the camera, so the light, the view and the normal all line up and every cosine is one. */
+      function planeScene(material, addLights) {
+        const scene = new THREE.Scene();
+        scene.add(new THREE.Mesh(new THREE.PlaneGeometry(40, 40), material));
+        addLights(scene);
+        scene.updateMatrixWorld(true);
+        return scene;
+      }
+
+      const measure = (scene, settings = {}) => measureWith(scene, camera, settings);
+
+      async function measureWith(scene, viewpoint, settings = {}, environment) {
+        const renderer = new GpuRenderer({
+          width: SIZE,
+          height: SIZE,
+          scene,
+          camera: viewpoint,
+          // The estimator is what these checks measure: the denoiser has checks of its own, below.
+          settings: { samples: 512, toneMapping: "linear", exposure: 1, ...settings,
+            globalIllumination: { bounces: 2, denoise: false, ...settings.globalIllumination } },
+          environment: environment ?? { kind: "gradient", topColor: "#000000", bottomColor: "#000000" },
+        });
+        const { data } = await renderer.render();
+        renderer.dispose();
+
+        // Only the very middle: a point light's falloff and cosine already vary across half the image.
+        let sum = 0, squares = 0, n = 0;
+        const low = SIZE / 2 - 3, high = SIZE / 2 + 3;
+        for (let y = low; y < high; y++) {
+          for (let x = low; x < high; x++) {
+            const byte = data[(y * SIZE + x) * 4 + (settings.readAlpha ? 3 : 0)];
+            const value = settings.readAlpha ? byte / 255 : toLinear(byte / 255);
+            sum += value;
+            squares += value * value;
+            n++;
+          }
+        }
+        const mean = sum / n;
+        return { mean, deviation: Math.sqrt(Math.max(0, squares / n - mean * mean)) };
+      }
+
+      /** A measurement is either the reading itself or the whole result it came in; both say the same thing. */
+      const check = (name, measured, want, tolerance = 2) => {
+        const got = typeof measured === "number" ? measured : measured.mean;
+        const error = want === 0 ? Math.abs(got) * 100 : Math.abs(got - want) / want * 100;
+        lines.push(`${name.padEnd(46)} got ${got.toFixed(4)}  want ${want.toFixed(4)}  ${error.toFixed(1)}%`
+          + (error > tolerance ? "   <-- OFF" : ""));
+        document.getElementById("out").textContent = lines.join("\n");
+      };
+
+      /** A flat Radiance file, which is what HDRLoader reads when the scanlines are not run length encoded. */
+      function radianceUrl(width, height, texelColor) {
+        const header = `#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y ${height} +X ${width}\n`;
+        const bytes = new Uint8Array(header.length + width * height * 4);
+        for (let i = 0; i < header.length; i++) bytes[i] = header.charCodeAt(i);
+        let at = header.length;
+        for (let y = 0; y < height; y++) {
+          for (let x = 0; x < width; x++) {
+            const [r, g, b] = texelColor(x, y);
+            const peak = Math.max(r, g, b);
+            if (peak < 1e-32) { at += 4; continue; }
+            const exponent = Math.floor(Math.log2(peak)) + 1;
+            const scale = 256 / 2 ** exponent;
+            bytes[at++] = Math.min(255, Math.round(r * scale));
+            bytes[at++] = Math.min(255, Math.round(g * scale));
+            bytes[at++] = Math.min(255, Math.round(b * scale));
+            bytes[at++] = exponent + 128;
+          }
+        }
+        return URL.createObjectURL(new Blob([bytes], { type: "image/vnd.radiance" }));
+      }
+
+      /** A bare unit albedo plane, for the checks that are about the surroundings rather than the surface. */
+      const plainScene = () => planeScene(white(), () => {});
+      const measureEnvironment = (environment, samples = 512) =>
+        measureWith(plainScene(), camera, { samples }, environment);
+
+      try {
+        const I = Math.PI / 4;   // an irradiance of pi/4 on a unit-albedo Lambert surface leaves a radiance of 0.25
+
+        // 1. DirectionalLight, no shadow ray at all.
+        log("directional");
+        check("directional, castShadow off", await measure(planeScene(white(), s => {
+          const l = new THREE.DirectionalLight(0xffffff, I);
+          l.position.set(0, 0, 1); l.castShadow = false; s.add(l);
+        })), 0.25);
+
+        // 2. The same light with the occlusion ray on: the surface must not shadow itself.
+        log("directional shadowed");
+        check("directional, castShadow on (self-shadow test)", await measure(planeScene(white(), s => {
+          const l = new THREE.DirectionalLight(0xffffff, I);
+          l.position.set(0, 0, 1); l.castShadow = true; s.add(l);
+        })), 0.25);
+
+        // 3. PointLight at distance 2, decay 2: the irradiance is the intensity over the distance squared.
+        log("point");
+        const pointIntensity = I * 4;
+        check("point light, decay 2 at distance 2", await measure(planeScene(white(), s => {
+          const l = new THREE.PointLight(0xffffff, pointIntensity, 0, 2);
+          l.position.set(0, 0, 2); l.castShadow = true; s.add(l);
+        })), 0.25);
+
+        // 4. SpotLight straight on, well inside its cone.
+        log("spot");
+        check("spot light, inside the cone", await measure(planeScene(white(), s => {
+          const l = new THREE.SpotLight(0xffffff, pointIntensity, 0, Math.PI / 3, 0, 2);
+          l.position.set(0, 0, 2); l.target.position.set(0, 0, 0); l.castShadow = true;
+          s.add(l); s.add(l.target);
+        })), 0.25);
+
+        // 5. A small RectAreaLight far away behaves like a point light of intensity L*w*h.
+        log("rect");
+        const rectIntensity = I * 4 / (0.2 * 0.2);
+        check("rect area light, small and far", await measure(planeScene(white(), s => {
+          const l = new THREE.RectAreaLight(0xffffff, rectIntensity, 0.2, 0.2);
+          l.position.set(0, 0, 2); l.lookAt(0, 0, 0); s.add(l);
+        })), 0.25);
+
+        // 6. AmbientLight, which this renderer turns into an equally bright surrounding.
+        log("ambient");
+        check("ambient light over an open surface", await measure(planeScene(white(), s => {
+          s.add(new THREE.AmbientLight(0xffffff, Math.PI / 4));
+        })), 0.25);
+
+        // 7. HemisphereLight: the surface faces the camera, so it sees the sky and the ground equally.
+        log("hemisphere");
+        check("hemisphere light, sky only", await measure(planeScene(white(), s => {
+          const l = new THREE.HemisphereLight(0xffffff, 0x000000, Math.PI / 2);
+          l.position.set(0, 1, 0); s.add(l);
+        })), 0.25);
+
+        // 8/9. A floor lit from straight above, with a panel over it that the camera does not look through. The camera sits
+        // off the light's axis, so the shadowed floor at the origin stays in view while the panel itself does not cover it.
+        log("occlusion");
+        const corner = (withPanel, settings) => {
+          const scene = new THREE.Scene();
+          const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), white());
+          floor.rotation.x = -Math.PI / 2;
+          scene.add(floor);
+          const light = new THREE.DirectionalLight(0xffffff, I);
+          light.position.set(0, 1, 0);
+          light.castShadow = true;
+          scene.add(light);
+          if (withPanel) {
+            const panel = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), white());
+            panel.rotation.x = -Math.PI / 2;
+            panel.position.set(0, 1, 0);
+            scene.add(panel);
+          }
+          scene.updateMatrixWorld(true);
+          const tilted = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
+          tilted.position.set(0, 1.2, 5);
+          tilted.lookAt(0, 0, 0);
+          tilted.updateMatrixWorld(true);
+          return measureWith(scene, tilted, settings);
+        };
+
+        check("floor lit from above, no panel", await corner(false), 0.25);
+        check("same floor under a panel (shadow)", await corner(true), 0);
+        check("same, with shadows disabled", await corner(true, { shadows: { enabled: false } }), 0.25);
+
+        // 10. A basic material is not lit by anything and reads as its own colour.
+        log("unlit");
+        const basic = new THREE.MeshBasicMaterial();
+        basic.color.setRGB(0.25, 0.25, 0.25, THREE.LinearSRGBColorSpace);
+        check("basic material, unlit", await measure(planeScene(basic, s => {
+          const l = new THREE.DirectionalLight(0xffffff, I * 8);
+          l.position.set(0, 0, 1); s.add(l);
+        })), 0.25);
+
+        // 11. A standard material, as Three r185 lights it: Lambert, GGX and the energy multiple scattering returns.
+        log("standard");
+        const standard = new THREE.MeshStandardMaterial({ roughness: 1, metalness: 0 });
+        standard.color.setRGB(1, 1, 1, THREE.LinearSRGBColorSpace);
+        const view = 1, f = 0.04 + 0.96 * (1 - view) ** 5;   // straight on, so the half vector is the normal
+        const alpha2 = 1, d = alpha2 / Math.PI, v = 0.5 / (1 * 1 + 1 * 1);
+        // Karis' DFG fit at roughness one, head on, which is what Three's multiscatter term reads.
+        const r = [0, 0.015, 0.468, -0.018], a004 = Math.min(r[0] * r[0], 2 ** -9.28) * r[0] + r[1];
+        const fab = [-1.04 * a004 + r[2], 1.04 * a004 + r[3]], ess = 0.04 * fab[0] + fab[1], ems = 1 - fab[0] - fab[1];
+        const average = 0.04 + 0.96 * 0.047619, multiple = ess * ess * average / (1 - ems * ems * average) * ems * ems;
+        check("standard material, diffuse + GGX head on", await measure(planeScene(standard, s => {
+          const l = new THREE.DirectionalLight(0xffffff, Math.PI / 4);
+          l.position.set(0, 0, 1); s.add(l);
+        })), (1 / Math.PI + f * d * v + multiple) * Math.PI / 4);
+
+
+        // ---- textures ----
+        const dataTexture = (bytes, width = 1, height = 1, srgb = true) => {
+          const t = new THREE.DataTexture(new Uint8Array(bytes), width, height);
+          t.colorSpace = srgb ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+          t.needsUpdate = true;
+          return t;
+        };
+        const srgbToLinear = c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+        const lit = (material, intensity = I) => planeScene(material, s => {
+          const l = new THREE.DirectionalLight(0xffffff, intensity);
+          l.position.set(0, 0, 1); s.add(l);
+        });
+
+        // 12. A byte colour map is decoded from sRGB as it is read.
+        log("srgb map");
+        const mapped = white();
+        mapped.map = dataTexture([188, 188, 188, 255]);
+        check("base colour map, sRGB byte decode", await measure(lit(mapped)),
+          srgbToLinear(188 / 255) * 0.25);
+
+        // 13. A float texture is already linear and must not be decoded again.
+        log("float map");
+        const floatMaterial = white();
+        const floatTexture = new THREE.DataTexture(
+          new Float32Array([0.5, 0.5, 0.5, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+        floatTexture.colorSpace = THREE.LinearSRGBColorSpace;
+        floatTexture.needsUpdate = true;
+        floatMaterial.map = floatTexture;
+        check("base colour map, linear float", await measure(lit(floatMaterial)), 0.5 * 0.25);
+
+        // 14. The colour map multiplies the material colour, as in Three.
+        log("map times colour");
+        const tinted = new THREE.MeshLambertMaterial();
+        tinted.color.setRGB(0.5, 0.5, 0.5, THREE.LinearSRGBColorSpace);
+        tinted.map = dataTexture([255, 255, 255, 255], 1, 1, false);
+        check("colour map times material colour", await measure(lit(tinted)), 0.5 * 0.25);
+
+        // 15. An emissive map, which direct light sampling has to read at the very point it samples.
+        log("emissive map");
+        const glowing = new THREE.MeshStandardMaterial({ emissiveIntensity: 1 });
+        glowing.color.setRGB(0, 0, 0, THREE.LinearSRGBColorSpace);
+        glowing.emissive.setRGB(1, 1, 1, THREE.LinearSRGBColorSpace);
+        glowing.emissiveMap = dataTexture([128, 128, 128, 255], 1, 1, false);
+        check("emissive map, seen by the camera", await measure(lit(glowing, 0)), 128 / 255);
+
+        // 16. A flat normal map must leave the surface exactly as it was.
+        log("normal map");
+        const bumped = white();
+        bumped.normalMap = dataTexture([128, 128, 255, 255], 1, 1, false);
+        check("flat normal map changes nothing", await measure(lit(bumped)), 0.25);
+
+        // 17. Opacity: half the rays pass straight through to what is behind.
+        log("opacity");
+        const behind = new THREE.MeshBasicMaterial();
+        behind.color.setRGB(0.5, 0.5, 0.5, THREE.LinearSRGBColorSpace);
+        const sheer = new THREE.MeshLambertMaterial({ transparent: true, opacity: 0.5 });
+        check("half opaque surface over an unlit one", await measure((() => {
+          const scene = new THREE.Scene();
+          const back = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), behind);
+          back.position.set(0, 0, -1);
+          const front = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), sheer);
+          scene.add(back); scene.add(front);
+          scene.updateMatrixWorld(true);
+          return scene;
+        })()), 0.25);
+
+        // 18. A cutout must let a shadow ray through where it is cut away.
+        log("cutout shadow");
+        const cutout = new THREE.MeshLambertMaterial({ alphaTest: 0.5 });
+        cutout.alphaMap = dataTexture([0, 0, 0, 255], 1, 1, false);
+        check("fully cut-away occluder casts no shadow", await measure((() => {
+          const scene = new THREE.Scene();
+          const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), white());
+          scene.add(floor);
+          const blocker = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), cutout);
+          blocker.position.set(0, 0, 1);
+          scene.add(blocker);
+          const l = new THREE.DirectionalLight(0xffffff, I);
+          l.position.set(0, 0, 2); l.castShadow = true;
+          scene.add(l);
+          scene.updateMatrixWorld(true);
+          return scene;
+        })()), 0.25);
+
+        // 19. Glass. Head on, a dielectric of index 1.5 reflects exactly ((1.5 - 1) / (1.5 + 1))^2 = 0.04, so a thin
+        // wall lets 0.96 through. The floor behind the window is lit through it and seen through it: two crossings.
+        log("glass");
+        const glass = (options = {}) => {
+          const material = new THREE.MeshPhysicalMaterial({ transmission: 1, roughness: 0, metalness: 0, ior: 1.5, ...options });
+          material.color.setRGB(options.tint ?? 1, options.tint ?? 1, options.tint ?? 1, THREE.LinearSRGBColorSpace);
+          return material;
+        };
+        const window = material => {
+          const scene = new THREE.Scene();
+          scene.add(new THREE.Mesh(new THREE.PlaneGeometry(40, 40), white()));
+          const pane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), material);
+          pane.position.set(0, 0, 1);
+          scene.add(pane);
+          const l = new THREE.DirectionalLight(0xffffff, I);
+          l.position.set(0, 0, 2); l.castShadow = true;
+          scene.add(l);
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        check("thin glass window, lit and seen through", await measure(window(glass())), 0.25 * 0.96 * 0.96);
+        check("thin glass tinted 0.5, both crossings", await measure(window(glass({ tint: 0.5 }))), 0.25 * 0.48 * 0.48);
+
+        // A slab one unit thick that halves the light per unit, over an unlit floor: two interfaces and the absorption.
+        const slab = (material, floor) => {
+          const scene = new THREE.Scene();
+          scene.add(new THREE.Mesh(new THREE.PlaneGeometry(40, 40), floor));
+          const box = new THREE.Mesh(new THREE.BoxGeometry(40, 40, 1), material);
+          box.position.set(0, 0, 1);
+          scene.add(box);
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        const absorbing = glass({ thickness: 1, attenuationDistance: 1 });
+        absorbing.attenuationColor.setRGB(0.5, 0.5, 0.5, THREE.LinearSRGBColorSpace);
+        const quarter = new THREE.MeshBasicMaterial();
+        quarter.color.setRGB(0.25, 0.25, 0.25, THREE.LinearSRGBColorSpace);
+        check("glass slab, two interfaces", await measure(slab(glass({ thickness: 1 }), quarter)), 0.25 * 0.96 * 0.96);
+        check("glass slab absorbing half per unit", await measure(slab(absorbing, quarter)), 0.25 * 0.96 * 0.96 * 0.5);
+
+        // ---- Three's other shading models and material switches ----
+        const linear = (r, g = r, b = r) => new THREE.Color().setRGB(r, g, b, THREE.LinearSRGBColorSpace);
+        const lightAt = (angle, intensity = I) => s => {
+          const l = new THREE.DirectionalLight(0xffffff, intensity);
+          l.position.set(Math.sin(angle), 0, Math.cos(angle)); s.add(l);
+        };
+        const floatTexture1 = value => {
+          const t = new THREE.DataTexture(new Float32Array([value, value, value, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+          t.colorSpace = THREE.LinearSRGBColorSpace;
+          t.needsUpdate = true;
+          return t;
+        };
+        /** A plane in front of a lit white one, so what the front one lets through is measured against 0.25. */
+        const inFront = (material, z = 1) => {
+          const scene = new THREE.Scene();
+          scene.add(new THREE.Mesh(new THREE.PlaneGeometry(40, 40), white()));
+          const front = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), material);
+          front.position.z = z;
+          scene.add(front);
+          lightAt(0)(scene);
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+
+        log("phong");
+        const phong = new THREE.MeshPhongMaterial({ color: linear(1), specular: linear(0.5), shininess: 30 });
+        check("phong, Blinn-Phong highlight head on", await measure(lit(phong)),
+          (1 / Math.PI + 0.5 * 0.25 * (30 * 0.5 + 1) / Math.PI) * Math.PI / 4);
+
+        log("toon");
+        const toon = new THREE.MeshToonMaterial({ color: linear(1) });
+        // Three's toon ramp replaces the cosine: full light down to dot(n, l) = 0.4, then 0.7 of it.
+        check("toon, light at 60 degrees still full", await measure(planeScene(toon, lightAt(Math.PI / 3))), 0.25);
+        check("toon, light at 78 degrees on the 0.7 step", await measure(planeScene(toon, lightAt(Math.acos(0.2)))),
+          0.25 * 0.7);
+
+        log("vertex colors");
+        const coloured = new THREE.PlaneGeometry(40, 40);
+        coloured.setAttribute("color", new THREE.Float32BufferAttribute(new Array(4 * 3).fill(0.5), 3));
+        const vertexScene = new THREE.Scene();
+        vertexScene.add(new THREE.Mesh(coloured, new THREE.MeshLambertMaterial({ color: linear(1), vertexColors: true })));
+        lightAt(0)(vertexScene);
+        vertexScene.updateMatrixWorld(true);
+        check("vertex colours multiply the colour", await measure(vertexScene), 0.125);
+
+        log("side");
+        const facingAway = side => {
+          const scene = new THREE.Scene();
+          const plane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshLambertMaterial({ color: linear(1), side }));
+          plane.rotation.y = Math.PI;
+          scene.add(plane);
+          lightAt(0)(scene);
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        check("front side seen from behind is culled", await measure(facingAway(THREE.FrontSide)), 0);
+        check("back side seen from behind is drawn", await measure(facingAway(THREE.BackSide)), 0.25);
+        check("double side seen from behind is drawn", await measure(facingAway(THREE.DoubleSide)), 0.25);
+
+        log("clipping");
+        const clippedMaterial = white();
+        clippedMaterial.clippingPlanes = [new THREE.Plane(new THREE.Vector3(1, 0, 0), -100)];
+        check("a clipping plane cuts the whole surface away", await measure(lit(clippedMaterial)), 0);
+
+        log("wireframe");
+        const wire = new THREE.MeshBasicMaterial({ color: linear(1), wireframe: true });
+        const wireScene = inFront(wire);
+        wireScene.children[1].position.set(13, 7, 1);
+        wireScene.updateMatrixWorld(true);
+        check("wireframe interior lets the lit plane show", await measure(wireScene), 0.25);
+
+        log("blending");
+        // Over an unlit plane: an unlit surface emits its colour here, so it would light a lit one as well.
+        const additiveScene = new THREE.Scene();
+        const additiveBack = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), behind);
+        additiveBack.position.z = -1;
+        additiveScene.add(additiveBack);
+        additiveScene.add(new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshBasicMaterial({
+          color: linear(0.25), blending: THREE.AdditiveBlending, transparent: true })));
+        additiveScene.updateMatrixWorld(true);
+        check("additive blending adds its colour", await measure(additiveScene), 0.75);
+        check("multiply blending filters what is behind", await measure(inFront(new THREE.MeshBasicMaterial({
+          color: linear(0.5), blending: THREE.MultiplyBlending, premultipliedAlpha: true, transparent: true }))), 0.125);
+
+        log("opacity rules");
+        const unlitBehind = front => {
+          const scene = new THREE.Scene();
+          const back = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), behind);
+          back.position.z = -1;
+          scene.add(back);
+          scene.add(new THREE.Mesh(new THREE.PlaneGeometry(40, 40), front));
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        check("opacity without transparent stays opaque", await measure(unlitBehind(
+          new THREE.MeshLambertMaterial({ opacity: 0.5 }))), 0);
+        check("alpha hash keeps half without transparent", await measure(unlitBehind(
+          new THREE.MeshLambertMaterial({ opacity: 0.5, alphaHash: true }))), 0.25);
+
+        log("shadow material");
+        const catcher = withPanel => {
+          const scene = new THREE.Scene();
+          const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ color: linear(0.5), opacity: 1 }));
+          floor.rotation.x = -Math.PI / 2;
+          scene.add(floor);
+          const light = new THREE.DirectionalLight(0xffffff, I);
+          light.position.set(0, 1, 0);
+          light.castShadow = true;
+          scene.add(light);
+          if (withPanel) {
+            const panel = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({ color: 0x000000 }));
+            panel.rotation.x = -Math.PI / 2;
+            panel.position.set(0, 1, 0);
+            scene.add(panel);
+          }
+          scene.updateMatrixWorld(true);
+          const tilted = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
+          tilted.position.set(0, 1.2, 5);
+          tilted.lookAt(0, 0, 0);
+          tilted.updateMatrixWorld(true);
+          return measureWith(scene, tilted);
+        };
+        check("shadow catcher shows its colour in shadow", await catcher(true), 0.5);
+        check("shadow catcher is invisible in the light", await catcher(false), 0);
+
+        // ---- physical layers ----
+        log("clearcoat");
+        const base = (1 / Math.PI + f * d * v + ess * ess * average / (1 - ems * ems * average) * ems * ems) * Math.PI / 4;
+        const coated = new THREE.MeshPhysicalMaterial({ color: linear(1), roughness: 1, metalness: 0, clearcoat: 1, clearcoatRoughness: 1 });
+        // The base under a coat of reflectance 0.04 head on, plus the coat's own GGX lobe at roughness one.
+        check("clearcoat over a rough dielectric", await measure(lit(coated, Math.PI / 4)),
+          base * 0.96 + 0.04 * 0.25 / Math.PI * Math.PI / 4);
+
+        log("sheen");
+        const sheen = new THREE.MeshPhysicalMaterial({ color: linear(0), roughness: 1, metalness: 0, sheen: 1, sheenColor: linear(1), sheenRoughness: 1 });
+        const charlie = 3 * Math.sqrt(0.0078125) / (2 * Math.PI) * 0.25;
+        const sheenA = -1.9362 + 1.0678 + 0.4573 - 0.8469 / 1.1, sheenB = -0.6014 + 0.5538 - 0.4670 - 0.1255 / 1.1;
+        const sheenEnergy = 1 - Math.exp(sheenA + sheenB);
+        const blackSpecular = 0.04 * 0.25 / Math.PI + ess * ess * average / (1 - ems * ems * average) * ems * ems;
+        check("sheen over a black base, head on", await measure(lit(sheen, Math.PI * 5)),
+          (blackSpecular * sheenEnergy + charlie) * Math.PI * 5);
+
+        // ---- maps ----
+        log("light map");
+        const lightMapped = new THREE.MeshLambertMaterial({ color: linear(1), lightMap: floatTexture1(1), lightMapIntensity: Math.PI / 4 });
+        check("light map lights what the camera sees", await measure(planeScene(lightMapped, () => {})), 0.25);
+
+        log("displacement");
+        const displaced = new THREE.MeshLambertMaterial({ color: linear(1), displacementMap: floatTexture1(1), displacementScale: 0.5 });
+        check("displacement moves the surface towards a point light", await measure(planeScene(displaced, s => {
+          const l = new THREE.PointLight(0xffffff, Math.PI, 0, 2);
+          l.position.set(0, 0, 2); s.add(l);
+        })), 1 / 2.25);
+
+        log("bump");
+        const bumped2 = white();
+        bumped2.bumpMap = floatTexture1(0.5);
+        check("flat bump map changes nothing", await measure(lit(bumped2)), 0.25);
+
+        log("env map");
+        const environmentTexture = floatTexture1(0.5);
+        environmentTexture.mapping = THREE.EquirectangularReflectionMapping;
+        check("basic material, env map multiplied in", await measure(planeScene(
+          new THREE.MeshBasicMaterial({ color: linear(1), envMap: environmentTexture }), () => {})), 0.5);
+        check("lambert with an env map mixed in fully", await measure(planeScene(
+          new THREE.MeshLambertMaterial({ color: linear(1), envMap: environmentTexture, combine: THREE.MixOperation, reflectivity: 1 }), () => {})), 0.5);
+        check("metal mirror reflects its own env map", await measure(planeScene(
+          new THREE.MeshStandardMaterial({ color: linear(1), metalness: 1, roughness: 0, envMap: environmentTexture }), () => {})), 0.5, 3);
+
+        // ---- debug materials ----
+        log("matcap, normal, depth");
+        check("matcap without a texture, head on", await measure(planeScene(new THREE.MeshMatcapMaterial({ color: linear(1) }), () => {})), 0.5);
+        check("normal material, facing the camera", await measure(planeScene(new THREE.MeshNormalMaterial(), () => {})), 0.5);
+        const shallow = new THREE.PerspectiveCamera(30, 1, 1, 4);
+        shallow.position.set(0, 0, 3);
+        shallow.updateMatrixWorld(true);
+        check("depth material between near 1 and far 4", await measureWith(planeScene(new THREE.MeshDepthMaterial(), () => {}), shallow),
+          1 - ((5 / 3 - 8 / 9) * 0.5 + 0.5));
+
+        // ---- the camera, the fog and the background ----
+        log("fog");
+        const foggy = fog => {
+          const scene = planeScene(new THREE.MeshBasicMaterial({ color: linear(0.5) }), () => {});
+          scene.fog = fog;
+          return scene;
+        };
+        check("linear fog halfway to its far distance", await measure(foggy(new THREE.Fog(0x000000, 0, 6))), 0.25);
+        check("exponential squared fog", await measure(foggy(new THREE.FogExp2(0x000000, 0.2))), 0.5 * Math.exp(-0.36));
+        check("settings fog over every surface", await measure(planeScene(new THREE.MeshBasicMaterial({ color: linear(0.5) }), () => {}),
+          { fog: { enabled: true, color: "#000000", near: 0, far: 6 } }), 0.25);
+
+        log("background");
+        const empty = new THREE.Scene();
+        check("background colour", await measure(empty, { background: { mode: "color", color: "#808080" } }), srgbToLinear(128 / 255));
+        check("transparent background is transparent", await measure(empty, { background: { mode: "transparent" }, readAlpha: true }), 0);
+        check("a surface over a transparent background is opaque", await measure(lit(white()), { background: { mode: "transparent" }, readAlpha: true }), 1);
+
+        log("near plane");
+        const clippedCamera = new THREE.PerspectiveCamera(30, 1, 3.5, 100);
+        clippedCamera.position.set(0, 0, 3);
+        clippedCamera.updateMatrixWorld(true);
+        check("a surface nearer than the near plane is clipped", await measureWith(lit(white()), clippedCamera), 0);
+
+        log("depth of field");
+        check("a surface in focus stays sharp", await measure(lit(white()),
+          { depthOfField: { enabled: true, focusDistance: 3, aperture: 1.4, blades: 6 } }), 0.25);
+
+        log("spot map");
+        check("a spot light's projected map tints it", await measure(planeScene(white(), s => {
+          const l = new THREE.SpotLight(0xffffff, pointIntensity, 0, Math.PI / 3, 0, 2);
+          l.position.set(0, 0, 2); l.target.position.set(0, 0, 0); l.castShadow = true;
+          l.map = floatTexture1(0.5);
+          s.add(l); s.add(l.target);
+        })), 0.125);
+
+        // ---- points, sprites and lines ----
+        log("points");
+        const pointScene = attenuation => {
+          const scene = new THREE.Scene();
+          const geometry = new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0], 3));
+          scene.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: linear(0.25), size: attenuation ? 10 : 200, sizeAttenuation: attenuation })));
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        check("a point a fixed number of pixels wide", await measure(pointScene(false)), 0.25);
+        check("a point sized by its distance", await measure(pointScene(true)), 0.25);
+
+        log("sprite");
+        const spriteScene = new THREE.Scene();
+        const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ color: linear(0.25) }));
+        sprite.scale.set(10, 10, 1);
+        spriteScene.add(sprite);
+        spriteScene.updateMatrixWorld(true);
+        check("a sprite facing the camera", await measure(spriteScene), 0.25);
+
+        log("line");
+        const lineScene = new THREE.Scene();
+        lineScene.add(new THREE.LineSegments(
+          new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute([-10, 0.01, 0, 10, 0.01, 0], 3)),
+          new THREE.LineBasicMaterial({ color: linear(1) })));
+        lineScene.updateMatrixWorld(true);
+        // A line one pixel wide crossing the six rows measured covers one of them, whatever its exact position.
+        check("a line is one pixel wide", await measure(lineScene, { samples: 1024 }), 1 / 6, 6);
+
+        // ---- shaders ----
+        log("shader material");
+        const shaderScene = material => planeScene(material, () => {});
+        check("shader material, uniform and varying", await measure(shaderScene(new THREE.ShaderMaterial({
+          uniforms: { tint: { value: linear(0.5) } },
+          vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: "uniform vec3 tint; varying vec2 vUv; void main() { gl_FragColor = vec4(tint * vUv.x, 1.0); }",
+        }))), 0.25);
+        check("shader material samples a texture", await measure(shaderScene(new THREE.ShaderMaterial({
+          uniforms: { map: { value: floatTexture1(0.25) } },
+          vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: "uniform sampler2D map; varying vec2 vUv; void main() { gl_FragColor = texture2D(map, vUv); }",
+        }))), 0.25);
+        // One pixel spans this much of the plane's UV at three units away, which is what dFdx has to find.
+        const pixelUv = 2 * 3 * Math.tan(Math.PI / 12) / SIZE / 40;
+        check("shader derivatives, dFdx across one pixel", await measure(shaderScene(new THREE.ShaderMaterial({
+          vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: "varying vec2 vUv; void main() { gl_FragColor = vec4(vec3(dFdx(vUv.x) * 300.0), 1.0); }",
+        }))), pixelUv * 300, 3);
+        check("raw GLSL 3 shader that discards everything", await measure(inFront(new THREE.RawShaderMaterial({
+          glslVersion: THREE.GLSL3,
+          vertexShader: "in vec3 position; uniform mat4 modelViewMatrix; uniform mat4 projectionMatrix;\nvoid main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: "precision highp float;\nout vec4 color;\nvoid main() { if (gl_FrontFacing || !gl_FrontFacing) discard; color = vec4(1.0); }",
+        }))), 0.25);
+
+        log("onBeforeCompile");
+        const patched = white();
+        patched.onBeforeCompile = shader => {
+          shader.fragmentShader = shader.fragmentShader.replace("#include <color_fragment>", "#include <color_fragment>\ndiffuseColor.rgb *= 0.5;");
+        };
+        check("onBeforeCompile halves the colour before lighting", await measure(lit(patched)), 0.125);
+
+        log("procedural sky");
+        const skyScene = plainScene();
+        skyScene.userData.cpuRenderer = { sky: {
+          fragmentShader: "varying vec3 vDirection; void main() { gl_FragColor = vec4(vec3(0.25), 1.0); }",
+          uniforms: {}, intensity: 1, background: true } };
+        check("a procedural sky lights the scene", await measure(skyScene), 0.25);
+
+        // ---- what was still missing ----
+        log("light probe");
+        const probeScene = plainScene();
+        const probe = new THREE.LightProbe();
+        // A uniform radiance of 0.25 in Three's SH3 basis: the constant term over its basis value.
+        probe.sh.coefficients[0].setScalar(0.25 / 0.282095);
+        probeScene.add(probe);
+        check("light probe of uniform radiance 0.25", await measure(probeScene), 0.25);
+
+        log("switch fallthrough");
+        check("a switch whose cases fall through", await measure(shaderScene(new THREE.ShaderMaterial({
+          uniforms: { mode: { value: 0 } },
+          vertexShader: "void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: "uniform int mode;\nvoid main() { float v = 0.0;\n"
+            + "switch (mode) { case 0: v += 0.125; case 1: v += 0.125; break; default: v = 1.0; }\n"
+            + "gl_FragColor = vec4(vec3(v), 1.0); }",
+        }))), 0.25);
+
+        log("after opaque");
+        const dimmed = white();
+        dimmed.onBeforeCompile = shader => {
+          shader.fragmentShader = shader.fragmentShader.replace("#include <dithering_fragment>",
+            "#include <dithering_fragment>\ngl_FragColor.rgb *= 0.5;");
+        };
+        check("a hook after opaque_fragment halves the lit colour", await measure(lit(dimmed)), 0.125);
+
+        log("fat line");
+        const { Line2 } = await import("three/examples/jsm/lines/Line2.js");
+        const { LineGeometry } = await import("three/examples/jsm/lines/LineGeometry.js");
+        const { LineMaterial } = await import("three/examples/jsm/lines/LineMaterial.js");
+        const fatScene = new THREE.Scene();
+        const fatGeometry = new LineGeometry();
+        fatGeometry.setPositions([-10, 0, 0, 10, 0, 0]);
+        const fat = new Line2(fatGeometry, new LineMaterial({ color: linear(0.25), linewidth: 16, resolution: new THREE.Vector2(SIZE, SIZE) }));
+        fat.computeLineDistances();
+        fatScene.add(fat);
+        fatScene.updateMatrixWorld(true);
+        check("a fat line sixteen pixels wide", await measure(fatScene), 0.25);
+
+        log("volumetric");
+        const { CpuVolumetricLight } = await import("@tinypoly/cpu-renderer/engine");
+        const glowScene = new THREE.Scene();
+        const glowLight = new THREE.PointLight(0xffffff, 1);
+        glowLight.position.set(0, 0, -2);
+        glowLight.userData.cpuRenderer = { volumetric: { density: 0.05 } };
+        glowScene.add(glowLight);
+        glowScene.updateMatrixWorld(true);
+        const { serializeScene } = await import("/dist/index.js");
+        const glowReference = new CpuVolumetricLight((await serializeScene(glowScene)).scene.lights);
+        const inverse = camera.projectionMatrixInverse, origin = camera.position.toArray();
+        let expected = 0;
+        for (let y = SIZE / 2 - 3; y < SIZE / 2 + 3; y++)
+          for (let x = SIZE / 2 - 3; x < SIZE / 2 + 3; x++) {
+            const point = new THREE.Vector3((x + 0.5) / SIZE * 2 - 1, 1 - (y + 0.5) / SIZE * 2, 0.5)
+              .applyMatrix4(inverse).applyMatrix4(camera.matrixWorld);
+            const direction = point.sub(camera.position).normalize().toArray();
+            expected += glowReference.sample(origin, direction, Infinity, () => true, 0.5)[0] / 36;
+          }
+        check("volumetric point light, against the CPU renderer", await measure(glowScene), expected, 5);
+
+        log("planar capture");
+        const water = reflectedMap => new THREE.ShaderMaterial({
+          uniforms: { reflectionMatrix: { value: new THREE.Matrix4() }, [reflectedMap]: { value: null } },
+          vertexShader: "uniform mat4 reflectionMatrix; varying vec4 vCoord;\n"
+            + "void main() { vCoord = reflectionMatrix * vec4(position, 1.0); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+          fragmentShader: `uniform sampler2D ${reflectedMap}; varying vec4 vCoord;\n`
+            + `void main() { gl_FragColor = vec4(texture2DProj(${reflectedMap}, vCoord).rgb, 1.0); }`,
+        });
+        const pool = (reflectedMap, withCeiling) => {
+          const scene = new THREE.Scene();
+          // A planar surface's local +Y is its normal, as the CPU renderer's extension defines it.
+          const surface = new THREE.Mesh(new THREE.PlaneGeometry(40, 40).rotateX(-Math.PI / 2), water(reflectedMap));
+          surface.material.userData.cpuRenderer = { planarCapture: true };
+          scene.add(surface);
+          if (withCeiling) {
+            const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(400, 400),
+              new THREE.MeshBasicMaterial({ color: linear(0.25), side: THREE.DoubleSide }));
+            ceiling.rotation.x = Math.PI / 2;
+            ceiling.position.y = 2;
+            scene.add(ceiling);
+          }
+          scene.updateMatrixWorld(true);
+          const above = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
+          above.position.set(0, 1.2, 5);
+          above.lookAt(0, 0, 0);
+          above.updateMatrixWorld(true);
+          return measureWith(scene, above, {},
+            { kind: "gradient", topColor: "#808080", bottomColor: "#808080", exponent: 1 });
+        };
+        check("planar capture reflects the ceiling", await pool("tReflectionMap", true), 0.25, 3);
+        check("planar capture reflects the environment", await pool("tEnvironmentReflectionMap", false),
+          srgbToLinear(128 / 255), 3);
+
+        log("second render");
+        // The accumulation buffer has to start from nothing every frame, or a second render() adds to the first.
+        const again = new GpuRenderer({
+          width: SIZE, height: SIZE, scene: lit(white()), camera,
+          settings: { samples: 64, globalIllumination: { bounces: 2 }, toneMapping: "linear", exposure: 1 },
+          environment: { kind: "gradient", topColor: "#000000", bottomColor: "#000000" },
+        });
+        await again.render();
+        const second = await again.render();
+        again.dispose();
+        check("a second render() starts from nothing", toLinear(second.data[(SIZE / 2 * SIZE + SIZE / 2) * 4] / 255), 0.25);
+
+        // ---- the denoiser ----
+        log("denoiser");
+        const noisySun = radianceUrl(64, 32, (x, y) => (x >= 48 && x < 50 && y >= 16 && y < 18 ? [32, 32, 32] : [0.05, 0.05, 0.05]));
+        const raw = await measureWith(plainScene(), camera, { samples: 8 }, { kind: "hdri", url: noisySun });
+        const smooth = await measureWith(plainScene(), camera, { samples: 8, globalIllumination: { denoise: true } },
+          { kind: "hdri", url: noisySun });
+        const converged = await measureWith(plainScene(), camera, { samples: 1024 }, { kind: "hdri", url: noisySun });
+        check("denoised mean matches the converged one", smooth.mean, converged.mean, 4);
+        lines.push(`denoiser at 8 samples: deviation ${raw.deviation.toFixed(4)} raw, ${smooth.deviation.toFixed(4)} denoised`);
+        check("denoising removes most of the noise", smooth.deviation < raw.deviation * 0.5 ? 1 : 0, 1);
+        check("a one pixel line stays one pixel wide, denoised", await measure(lineScene,
+          { samples: 1024, globalIllumination: { denoise: true } }), 1 / 6, 6);
+
+        const W = 64, H = 32;
+
+        // 1. A uniform sky: the plane faces an open hemisphere, so it receives pi times the radiance.
+        log("uniform sky");
+        const uniform = radianceUrl(W, H, () => [0.25, 0.25, 0.25]);
+        check("uniform hdri, unit albedo", (await measureEnvironment({ kind: "hdri", url: uniform })).mean, 0.25);
+
+        // 2. The same sky at half strength.
+        log("intensity");
+        check("uniform hdri at half intensity",
+          (await measureEnvironment({ kind: "hdri", url: uniform, intensity: 0.5 })).mean, 0.125);
+
+        // 3. A small bright block, which is what importance sampling exists for. It sits along +z, straight at the surface.
+        //    The expected irradiance is its radiance times the solid angle it covers.
+        log("sun");
+        const sunX = Math.round(0.75 * W), sunY = Math.round(0.5 * H), block = 2, radiance = 32;
+        const sun = radianceUrl(W, H, (x, y) =>
+          x >= sunX && x < sunX + block && y >= sunY && y < sunY + block ? [radiance, radiance, radiance] : [0, 0, 0]);
+        let solidAngle = 0;
+        for (let y = sunY; y < sunY + block; y++)
+          solidAngle += block * (2 * Math.PI / W) * (Math.PI / H) * Math.sin((y + 0.5) / H * Math.PI);
+        const sunResult = await measureEnvironment({ kind: "hdri", url: sun });
+        check("hdri with a small bright sun", sunResult.mean, radiance * solidAngle / Math.PI, 6);
+
+        // 4. Rotating the sky by half a turn puts that sun behind the surface, which then sees nothing.
+        log("rotation");
+        check("same sun rotated behind the surface",
+          (await measureEnvironment({ kind: "hdri", url: sun, rotation: 180 })).mean, 0, 3);
+
+        // 5. The noise the sun leaves at a low sample count says whether it is being aimed at or stumbled upon.
+        log("noise");
+        const few = await measureEnvironment({ kind: "hdri", url: sun, intensity: 1 }, 16);
+        lines.push(`sun at 16 samples: mean ${few.mean.toFixed(4)}, spatial deviation ${few.deviation.toFixed(4)}`);
+        lines.push(`sun at 512 samples: mean ${sunResult.mean.toFixed(4)}, spatial deviation ${sunResult.deviation.toFixed(4)}`);
+
+        // 6. A gradient environment still works, and is still the default.
+        log("gradient");
+        check("gradient environment, top colour only",
+          (await measureEnvironment({ kind: "gradient", topColor: "#ffffff", bottomColor: "#ffffff", exponent: 1 })).mean, 1.0, 3);
+        await post("/report", lines.join("\n"));
+      } catch (error) {
+        await post("/report", `EXC ${error.stack}`);
+      }
+    </script>
+  </body>
+</html>

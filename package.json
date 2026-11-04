@@ -1,0 +1,81 @@
+{
+  "name": "@tinypoly/gpu-renderer",
+  "version": "0.0.0",
+  "description": "WebGPU path tracer for Three.js scenes: BVH traversal, progressive accumulation and tone mapping in WGSL compute shaders.",
+  "keywords": [
+    "three",
+    "threejs",
+    "renderer",
+    "webgpu",
+    "wgsl",
+    "path-tracing",
+    "ray-tracing",
+    "global-illumination",
+    "compute-shader"
+  ],
+  "license": "MIT",
+  "author": "Danilo Gadelha",
+  "homepage": "https://github.com/tinypoly/gpu-renderer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tinypoly/gpu-renderer.git"
+  },
+  "bugs": "https://github.com/tinypoly/gpu-renderer/issues",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "src",
+    "!src/**/*.test.ts",
+    "ARCHITECTURE.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p example",
+    "lint": "eslint . --max-warnings 0",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "node scripts/verify.mjs",
+    "capture:scenes": "node scripts/capture-scenes.js",
+    "dev": "tsc -p tsconfig.build.json && vite --config example/vite.config.ts",
+    "build:example": "tsc -p tsconfig.build.json && vite build --config example/vite.config.ts",
+    "prepublishOnly": "pnpm run build && pnpm run lint && pnpm run typecheck && pnpm run test"
+  },
+  "dependencies": {
+    "@tinypoly/cpu-renderer": "^0.3.0",
+    "naga-wasm": "30.2.0"
+  },
+  "peerDependencies": {
+    "three": ">=0.185.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@stylistic/eslint-plugin": "^5.10.0",
+    "@types/node": "^24",
+    "@types/three": "^0.185.4",
+    "@webgpu/types": "^0.1.40",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
+    "three": "^0.185.1",
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.63.0",
+    "vite": "^8.1.4",
+    "vitest": "^4.1.10"
+  }
+}

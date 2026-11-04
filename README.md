@@ -231,7 +231,7 @@ light.userData.cpuRenderer = { volumetric: { density: 0.05 } };
 
 | Function | |
 | --- | --- |
-| `serializeScene(scene)` | Async. The snapshot `setScene` builds from a Three scene, to reuse across renderers, the CPU one included. |
+| `serializeScene(scene, options?)` | Async. The snapshot `setScene` builds from a Three scene, to reuse across renderers, the CPU one included. A snapshot only for this renderer can pass `{ mipmaps: false }`: it samples the base level of each texture, so the mip chains would be built for nothing. |
 | `serializeCamera(camera)` | A fixed `CameraState` snapshot of a Three camera, including zoom and view offsets. |
 | `sceneSignature(scene)` | A string that changes whenever something the renderer reads changes. Compare it before re-serializing an interactive scene. |
 | `isAbortError(error)` | Whether a `render()` rejection means the frame was replaced or cancelled rather than failed. |

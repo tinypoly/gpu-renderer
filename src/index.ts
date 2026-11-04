@@ -28,6 +28,9 @@ export { packGeometry } from "./geometry.js";
 export type { PackedGeometry } from "./geometry.js";
 export { buildBvh, MAX_BVH_DEPTH } from "./bvh.js";
 export type { PackedBvh } from "./bvh.js";
+// The BVH worker: what `createBvhWorker` has to return, and the worker this package starts by default.
+export { BVH_WORKER_MIN_TRIANGLES, createDefaultBvhWorker, respondToBvhRequest } from "./bvhBuilder.js";
+export type { BvhRequest, BvhResponse, BvhWorker, BvhWorkerFactory } from "./bvhBuilder.js";
 export { sceneByteLength } from "./sceneUpload.js";
 export type { SceneByteLength } from "./sceneUpload.js";
 export { LIGHT_KIND, packLights } from "./lights.js";

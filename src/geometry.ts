@@ -351,6 +351,76 @@ export function packGeometry(
     triangleMaterials.push(entry.index);
   };
 
+  /** Every vertex of a plain mesh, transformed once and shared by its groups. */
+  let plain: PlainVertices | null = null;
+
+  const writePlainTriangles = (mesh: SerializedMesh, start: number, end: number, mirrored: boolean, entry: Entry) => {
+    if (plain?.mesh !== mesh) plain = plainVertices(mesh);
+
+    const { world, normal, hasNormal, uv, color, valid } = plain;
+    const index = mesh.index;
+    const stride = entry.placement.varyingStride;
+    const corners = [0, 0, 0];
+
+    for (let v = start; v + 2 < end; v += 3) {
+      const a = index ? index[v] : v, b = index ? index[v + 1] : v + 1, c = index ? index[v + 2] : v + 2;
+
+      if (!valid(a) || !valid(b) || !valid(c)) continue;
+
+      corners[0] = a;
+      corners[1] = mirrored ? c : b;
+      corners[2] = mirrored ? b : c;
+
+      // Geometry without normals is shaded flat: the three corners share the face normal.
+      const flat = !hasNormal[a] || !hasNormal[b] || !hasNormal[c]
+        ? faceNormal(
+          Array.from(world.subarray(corners[0] * 3, corners[0] * 3 + 3)),
+          Array.from(world.subarray(corners[1] * 3, corners[1] * 3 + 3)),
+          Array.from(world.subarray(corners[2] * 3, corners[2] * 3 + 3)))
+        : null;
+
+      positions.reserve(9);
+      normals.reserve(9);
+      uvs.reserve(12);
+
+      if (anyVertexColors) colors.reserve(12);
+
+      for (const corner of corners) {
+        const p = corner * 3, q = corner * 4;
+
+        positions.data[positions.length++] = world[p];
+        positions.data[positions.length++] = world[p + 1];
+        positions.data[positions.length++] = world[p + 2];
+
+        if (flat) {
+          normals.data[normals.length++] = flat[0];
+          normals.data[normals.length++] = flat[1];
+          normals.data[normals.length++] = flat[2];
+        } else {
+          normals.data[normals.length++] = normal[p];
+          normals.data[normals.length++] = normal[p + 1];
+          normals.data[normals.length++] = normal[p + 2];
+        }
+
+        uvs.data[uvs.length++] = uv[q];
+        uvs.data[uvs.length++] = uv[q + 1];
+        uvs.data[uvs.length++] = uv[q + 2];
+        uvs.data[uvs.length++] = uv[q + 3];
+
+        if (anyVertexColors) {
+          colors.data[colors.length++] = color[q];
+          colors.data[colors.length++] = color[q + 1];
+          colors.data[colors.length++] = color[q + 2];
+          colors.data[colors.length++] = color[q + 3];
+        }
+      }
+
+      if (stride > 0) varyings.pad(3 * stride);
+
+      triangleMaterials.push(entry.index);
+    }
+  };
+
   for (const mesh of meshes) {
     const groups = mesh.groups.length
       ? mesh.groups
@@ -388,6 +458,13 @@ export function packGeometry(
         // Instanced geometry drawn by a shader (Line2, particles built in a vertex shader): the template runs once per
         // instance, reading the per-instance attributes at that instance.
         const instancing = vertexShader ? instancedAttributes(mesh) : null;
+
+        // The common case, a plain mesh, skips the general reader: each vertex is transformed once, straight into
+        // typed arrays, and each triangle is copied from them. What it writes is exactly what the reader would.
+        if (!vertexShader && !material?.maps?.displacementMap) {
+          writePlainTriangles(mesh, start, end, mirrored, entry);
+          continue;
+        }
 
         for (let instance = 0; instance < (instancing?.count ?? 1); instance++) {
           const reader = instancing ? new VertexReader(mesh, material, context, instancing.names, instance) : vertices;
@@ -456,6 +533,97 @@ export function packGeometry(
     materialCount: properties.length,
     extraWords: new Uint32Array(extra),
     cameraDependent,
+  };
+}
+
+/** A plain mesh's vertices in world space, read lazily: only the ones some triangle uses are transformed. */
+interface PlainVertices {
+  mesh: SerializedMesh;
+  world: Float32Array;
+  normal: Float32Array;
+  hasNormal: Uint8Array;
+  /** Four per vertex: the first UV set, then the second. */
+  uv: Float32Array;
+  /** Four per vertex, RGBA. */
+  color: Float32Array;
+  /** Whether the vertex exists and has a finite position, transforming it on first use. */
+  valid(index: number): boolean;
+}
+
+function plainVertices(mesh: SerializedMesh): PlainVertices {
+  const position = mesh.attributes.position;
+  const count = Math.floor(position.data.length / Math.max(1, position.itemSize));
+  const world = new Float32Array(count * 3);
+  const normal = new Float32Array(count * 3);
+  const hasNormal = new Uint8Array(count);
+  const uv = new Float32Array(count * 4);
+  const color = new Float32Array(count * 4);
+  // 0 not read yet, 1 usable, 2 refused.
+  const state = new Uint8Array(count);
+  const rotation = normalMatrix(mesh.matrixWorld);
+  const matrix = mesh.matrixWorld as number[];
+  const { normal: normals, uv: uv0, uv1, color: colors } = mesh.attributes;
+
+  /** Component `c` of a vertex, as the reader's `Array.from(subarray(...))[c]` would see it. */
+  const component = (attribute: SerializedMesh["attributes"][string], vertex: number, c: number): number | undefined => {
+    const at = vertex * attribute.itemSize + c;
+
+    return c < attribute.itemSize && at < attribute.data.length ? attribute.data[at] : undefined;
+  };
+
+  const read = (vertex: number): boolean => {
+    const x = component(position, vertex, 0), y = component(position, vertex, 1), z = component(position, vertex, 2);
+
+    if (x === undefined || y === undefined || z === undefined) return false;
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return false;
+
+    transformPoint(matrix, x, y, z, world, vertex * 3);
+
+    if (normals) {
+      const nx = component(normals, vertex, 0), ny = component(normals, vertex, 1), nz = component(normals, vertex, 2);
+
+      if (nx !== undefined && ny !== undefined && nz !== undefined) {
+        transformNormal(rotation, nx, ny, nz, normal, vertex * 3);
+        hasNormal[vertex] = 1;
+      }
+    }
+
+    // A missing second set falls back to the first, and a missing component to zero, as the pushed stream would.
+    const second = uv1 ?? uv0;
+
+    uv[vertex * 4] = uv0 ? component(uv0, vertex, 0) ?? 0 : 0;
+    uv[vertex * 4 + 1] = uv0 ? component(uv0, vertex, 1) ?? 0 : 0;
+    uv[vertex * 4 + 2] = second ? component(second, vertex, 0) ?? 0 : 0;
+    uv[vertex * 4 + 3] = second ? component(second, vertex, 1) ?? 0 : 0;
+
+    if (colors) {
+      const available = Math.max(0, Math.min(colors.itemSize, colors.data.length - vertex * colors.itemSize));
+
+      color[vertex * 4] = component(colors, vertex, 0) ?? 1;
+      color[vertex * 4 + 1] = component(colors, vertex, 1) ?? 1;
+      color[vertex * 4 + 2] = component(colors, vertex, 2) ?? 1;
+      color[vertex * 4 + 3] = available >= 4 ? component(colors, vertex, 3) ?? 0 : 1;
+    } else {
+      color.fill(1, vertex * 4, vertex * 4 + 4);
+    }
+
+    return true;
+  };
+
+  return {
+    mesh,
+    world,
+    normal,
+    hasNormal,
+    uv,
+    color,
+    valid(vertex: number) {
+      if (!(vertex >= 0 && vertex < count)) return false;
+
+      if (state[vertex] === 0) state[vertex] = read(vertex) ? 1 : 2;
+
+      return state[vertex] === 1;
+    },
   };
 }
 

@@ -21,7 +21,7 @@ It is the GPU sibling of [@tinypoly/cpu-renderer](https://github.com/tinypoly/cp
 - Adaptive sampling: pixels whose noise is gone stop taking paths, and the work they leave goes to the dark, glossy and out of focus areas that still need it.
 - A variance-guided denoiser (the spatial filter of SVGF, with diffuse and specular light filtered apart as NVIDIA's RELAX does): each signal is separated from its albedo, filtered by an edge-avoiding wavelet that stops at normals, depths and roughness and trusts each pixel as far as its own variance says, and multiplied back, so textures stay sharp, a sharp reflection stays sharp and flat areas keep their exact mean.
 - Progressive output: the canvas refines sample by sample, and the render can be paused, resumed and cancelled.
-- No worker pool and no `SharedArrayBuffer`: the scene lives on the device, so the page needs no cross-origin isolation.
+- No worker pool and no `SharedArrayBuffer`: the scene lives on the device, so the page needs no cross-origin isolation. A single worker builds the BVH of a large scene, so the page keeps responding while it is prepared.
 
 ## Install
 
@@ -86,7 +86,7 @@ const image = await renderer.render();
 
 ### `new GpuRenderer(options)`
 
-Every option has a setter of the same name.
+Every option has a setter of the same name, except `bvhWorker` and `createBvhWorker`, which are fixed for the renderer's life.
 
 | Option | Type | |
 | --- | --- | --- |
@@ -97,6 +97,8 @@ Every option has a setter of the same name.
 | `width`, `height` | `number` | Required. Image size in CSS pixels. |
 | `pixelRatio` | `number` | Defaults to 1. Pass `window.devicePixelRatio` for a sharp image on a high-density screen. |
 | `denoiser` | `Partial<DenoiserSettings>` | How the denoiser filters. Merged over `DEFAULT_DENOISER`. See [Denoiser](#denoiser). |
+| `bvhWorker` | `boolean` | Builds the BVH of a scene with at least `BVH_WORKER_MIN_TRIANGLES` (50 000) triangles in a Web Worker, so the page keeps responding. The tree, and so the image, is the same either way. Defaults to `true` where Web Workers exist or when `createBvhWorker` is given; `false` builds on the main thread. See [BVH worker](#bvh-worker). |
+| `createBvhWorker` | `() => BvhWorker` | Starts the BVH worker. Defaults to `createDefaultBvhWorker`. Passing one turns the worker on. |
 
 ### Methods
 
@@ -233,6 +235,8 @@ light.userData.cpuRenderer = { volumetric: { density: 0.05 } };
 | `serializeCamera(camera)` | A fixed `CameraState` snapshot of a Three camera, including zoom and view offsets. |
 | `sceneSignature(scene)` | A string that changes whenever something the renderer reads changes. Compare it before re-serializing an interactive scene. |
 | `isAbortError(error)` | Whether a `render()` rejection means the frame was replaced or cancelled rather than failed. |
+| `createDefaultBvhWorker()` | The BVH worker this package ships, started from `new URL("./bvhWorker.js", import.meta.url)`. |
+| `respondToBvhRequest(request)` | The worker's side of the exchange, for a worker of your own: returns the response and the buffers to transfer. |
 | `packGeometry`, `buildBvh`, `packLights`, `packTextures`, `sceneByteLength` | The scene packing, published because the sizes it produces are what a host checks against a device's limits before uploading. |
 
 ## Bundlers
@@ -245,6 +249,28 @@ export default defineConfig({
   optimizeDeps: { exclude: ["naga-wasm"] },
 });
 ```
+
+The BVH worker is started the same way, from `new URL("./bvhWorker.js", import.meta.url)` next to the package's own module, which the same bundlers emit as a separate chunk. Where yours does not, pass `createBvhWorker`, or `bvhWorker: false`; see [BVH worker](#bvh-worker).
+
+### BVH worker
+
+Splitting a large scene into its BVH takes about a second per million triangles, which would hold the page if it ran there. The renderer sends a copy of the positions to a Web Worker instead, starts it on the first scene large enough to need it, and keeps it until `dispose()`. A smaller scene is built on the main thread, where it takes less time than the trip to the worker and back.
+
+If the worker cannot start or fails to load, the renderer warns once in the console and builds every BVH on the main thread from then on: the image does not change, only the page holds while the scene is prepared.
+
+```ts
+// Off: every BVH on the main thread.
+new GpuRenderer({ width, height, scene, bvhWorker: false });
+
+// A worker of your own, when the bundler cannot follow the default one's URL.
+new GpuRenderer({
+  width, height, scene,
+  createBvhWorker: () => new Worker(new URL("@tinypoly/gpu-renderer/bvhWorker.js", import.meta.url),
+    { type: "module" }),
+});
+```
+
+Anything shaped like a Web Worker fits `BvhWorker`: `postMessage(request, transfer)`, `terminate()`, `onmessage` and `onerror`. A worker of your own answers each `BvhRequest` with `respondToBvhRequest(request)`, posting its `response` with its `transfer` list.
 
 ## Limits
 

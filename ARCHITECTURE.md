@@ -41,7 +41,7 @@ stay the algorithmic reference, line by line.
   answers both questions the integrator asks: pick a light by probability, and, given a triangle a bounce ray hit, how
   likely direct sampling was to have found it.
 - `environment.ts`: the surrounding image and the distribution that lets a shadow ray aim at its bright parts.
-- `shaderProgram.ts`, `sceneAssets.ts`: the GLSL translation, the procedural sky and the compute bakes (see below).
+- `shaderProgram.ts`, `sceneAssets.ts`, `skyBake.ts`: the GLSL translation, the procedural sky and the compute bakes (see below).
 - `planarCapture.ts`, `volumetric.ts`: the CPU renderer's planar captures and volumetric lights.
 - `sceneUpload.ts`: the uploads, and the joining of buffers described below.
 - `accumulator.ts`, `pathTracePass.ts`, `presentPass.ts`, `dispatchScheduler.ts`: the frame loop.
@@ -251,7 +251,10 @@ surface lit from behind is not shadowed by its own mesh, as Three's shadow map l
 
 A vertical gradient, an equirectangular `.hdr` image, or the scene's procedural sky (`userData.cpuRenderer.sky`), with a
 luminance distribution built over the image so a shadow ray can aim at a sun. `intensity` and `rotation` apply to the
-gradient and the image. A procedural sky is baked by the CPU renderer's interpreter, lights with its own `intensity`,
+gradient and the image. A procedural sky's shader is translated like any other and run on the device over the
+panorama, one invocation per texel, which is read back for the luminance distribution; the CPU renderer's interpreter
+bakes it only when the shader does not translate. The bake is kept while the shader and its uniforms stay the same,
+so a scene that changes anything else does not bake the sky again. The sky lights with its own `intensity`,
 ignores the rotation so its sun stays with its light, and paints the background without its intensity, with its
 `foregroundShader` evaluated per pixel over it.
 

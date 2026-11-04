@@ -178,6 +178,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private environment: RenderEnvironment;
   // Serializing walks the whole scene, so it is started by the setter and awaited by the frame that needs it.
   private scene: Promise<SerializedScene> = Promise.resolve(EMPTY_SCENE);
+  // The snapshot `setScene` was last handed, so handing the same one again keeps everything prepared for it.
+  private snapshot: SerializedScene | null = null;
+  // The last sky baked, which a scene with the same sky reuses instead of baking it again.
+  private skyBake: SceneAssets["skyBake"] = null;
   // A LightProbe's harmonics, which the snapshot does not carry: read from the live scene when there is one.
   private probe: number[] = new Array(27).fill(0);
   // A Three camera is kept by reference and read at every `render()`, as the CPU renderer does; a snapshot stays fixed.
@@ -332,13 +336,18 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
   /**
    * Takes a Three scene, serialized in the background, or the result of `serializeScene`. The live scene is not read
-   * again until this is called once more.
+   * again until this is called once more. Handing over the same snapshot again keeps what was prepared for it, its
+   * packed triangles, hierarchy and textures, so a new frame of an unchanged scene starts tracing at once.
    */
   setScene(scene: RenderScene | SerializedScene) {
-    this.probe = "isScene" in scene && scene.isScene ? lightProbes(scene as Scene) : new Array(27).fill(0);
-    this.scene = "isScene" in scene && scene.isScene
-      ? serializeLive(scene as Scene)
-      : Promise.resolve("meshes" in scene ? scene : (scene as { scene: SerializedScene }).scene);
+    const live = "isScene" in scene && scene.isScene;
+    const snapshot = live ? null : "meshes" in scene ? scene as SerializedScene : (scene as { scene: SerializedScene }).scene;
+
+    if (snapshot && snapshot === this.snapshot) return;
+
+    this.snapshot = snapshot;
+    this.probe = live ? lightProbes(scene as Scene) : new Array(27).fill(0);
+    this.scene = snapshot ? Promise.resolve(snapshot) : serializeLive(scene as Scene);
     this.sceneDirty = true;
     this.assets = null;
   }
@@ -516,9 +525,11 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     const width = this.renderWidth, height = this.renderHeight;
 
     this.check(revision);
-    this.assets ??= prepareSceneAssets(scene);
+    this.assets ??= prepareSceneAssets(scene, { device: gpu.device, sky: this.skyBake });
 
     const assets = await this.assets;
+
+    this.skyBake = assets.skyBake;
 
     this.check(revision);
     await this.prepare(gpu, revision, assets, camera, width, height, environment);

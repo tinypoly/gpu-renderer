@@ -176,7 +176,7 @@ The renderer never falls back on its own. Choosing another renderer when WebGPU 
 | `vignette` | `0` | `0` to `1`. |
 | `grain` | `0` | `0` to `1`. |
 
-`globalIllumination.denoise` (default `true`) turns the denoiser on: on the canvas at the end of every pass, and on the image `render()` resolves with. Switching it alone filters the finished image again without tracing.
+`globalIllumination.denoise` (default `true`) turns the denoiser on: on the canvas a few times a second while the frame traces, and on the image `render()` resolves with. Switching it alone filters the finished image again without tracing.
 
 ### Denoiser
 

@@ -46,24 +46,16 @@ fn nestedScramble(value: u32, seed: u32) -> u32 {
   return reverseBits(laineKarras(reverseBits(value), seed));
 }
 
-/** The first two Sobol dimensions, as fixed point fractions. */
+/**
+ * The first two Sobol dimensions, as fixed point fractions. The second is the index times Pascal's triangle mod 2,
+ * which is linear in the bits of the index, so it is read one byte at a time from the tables texturePack.ts writes
+ * instead of folded in one bit at a time: four reads where the scrambled index made it thirty two steps.
+ */
 fn sobol2(index: u32) -> vec2<u32> {
-  var second = 0u;
-  var direction = 0x80000000u;
-  var bits = index;
-
-  loop {
-    if (bits == 0u) {
-      break;
-    }
-
-    if ((bits & 1u) != 0u) {
-      second = second ^ direction;
-    }
-
-    bits = bits >> 1u;
-    direction = direction ^ (direction >> 1u);
-  }
+  let second = textures[SOBOL_TABLE + (index & 0xffu)]
+    ^ textures[SOBOL_TABLE + 256u + ((index >> 8u) & 0xffu)]
+    ^ textures[SOBOL_TABLE + 512u + ((index >> 16u) & 0xffu)]
+    ^ textures[SOBOL_TABLE + 768u + (index >> 24u)];
 
   return vec2<u32>(reverseBits(index), second);
 }

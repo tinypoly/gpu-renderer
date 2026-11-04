@@ -27,7 +27,8 @@ stay the algorithmic reference, line by line.
 
 - `device.ts`: adapter and device acquisition, requested limits, loss handling.
 - `camera.ts`: the camera's matrices. Every ray goes through the inverse of the camera's own projection.
-- `geometry.ts`, `bvh.ts`: flat triangle and attribute buffers, and the BVH built straight into 32 byte nodes. Packing
+- `geometry.ts`, `bvh.ts`: flat triangle and attribute buffers, and the BVH: built as a binary tree, then laid out in
+  64 byte nodes that each hold their two children's boxes, so one read tests both and a leaf is never read. Packing
   also builds what Three draws in screen space (points, lines, sprites, dashes) as triangles facing the camera, applies
   displacement maps, and runs vertex shaders. A plain mesh, with no vertex shader and no displacement, takes a faster
   path that transforms each vertex once into typed arrays and writes exactly what the general one would.
@@ -58,8 +59,10 @@ falling off a cliff when a lobe is added.
 
 **Arrays of the same kind share a binding.** A WebGPU device only has to offer eight storage buffers per shader stage,
 and the kernel wants eleven arrays. Normals and the UV sets go in one buffer, the per-triangle material indices and the
-hierarchy's triangle order in another, and the texture table sits in front of the texels it points at, with the uniform
-saying where each second half begins. Positions, materials, nodes, lights and the accumulation buffer keep their own.
+hierarchy's triangle order (both ways) in another, and the lookup tables and the texture table sit in front of the
+texels they point at, with the uniform saying where each second half begins. The positions are uploaded in the
+hierarchy's leaf order, so a leaf is one run of the buffer; anything that reads a triangle by its own number goes through
+the inverse order. Positions, materials, nodes, lights and the accumulation buffer keep their own.
 Merging costs a scene some headroom against `maxStorageBufferBindingSize`, which is why positions stay separate: they are
 the largest array and the hottest one.
 
@@ -110,7 +113,8 @@ variance; after 32 paths, a pixel whose standard error (over the square root of 
 error is once encoded) is under half an 8 bit step stops, provided its 3 x 3 neighbourhood has too. The neighbourhood is
 what keeps a rare bright path honest: a pixel judged alone would stop where it happened not to have seen one yet, and
 that area would converge too dark. Each traced row sets a flag, read back after the pass, and the next pass dispatches
-only the rows that still have work, until the budget is spent or a pixel reaches four times its share. Stopping on the
+only the rows that still have work, until the budget is spent or a pixel reaches four times its share. Before 32 paths
+no pixel can stop, so those passes take up to four paths a dispatch and read and write the accumulation once for them. Stopping on the
 samples themselves is a slight bias, the usual price of adaptive sampling.
 
 **The denoiser is the spatial filter of SVGF, with diffuse and specular light apart.** The temporal half of SVGF, and of
@@ -137,9 +141,20 @@ is a perfect history. What carries over from NRD's RELAX and REBLUR is splitting
   times that: a converged pixel keeps exactly what was traced. `DenoiserSettings` scales the mix, the reach, the
   luminance tolerance and the anti-firefly; changing it filters the finished accumulation again, without tracing.
 
-It runs in its own pipelines, outside the kernel's eight storage buffers, on the canvas at the end of every pass and on
-the image `render()` resolves with. The accumulation holds six vec4 per pixel for all of this, 96 bytes, and the filter
-five more buffers of 16: a 2000 x 1350 image takes some 460 MB on the device.
+It runs in its own pipelines, outside the kernel's eight storage buffers, on the canvas a few times a second while a
+frame traces (at the end of a pass, at most every 200 ms) and on the image `render()` resolves with. The accumulation
+holds six vec4 per pixel for all of this, 96 bytes, and the filter six more buffers of 16 and one of 4, the last two
+the guides each tap compares, worked out once per pixel: a 2000 x 1350 image takes some 530 MB on the device.
+
+**The kernel is bound by its size, not by its arithmetic.** Measured on an Apple GPU (`scripts/bench.html`, every
+build timed in turns against the other), the nodes that hold their children's boxes made whole renders 16 to 21 percent
+faster, but only once the traversal loop tested leaves in one place: with the leaf test written out wherever a leaf
+turned up, three times a traversal, the same layout was slower than the binary tree it replaced. Replacing the sampler's
+bit loop and the sRGB powers with tables gained only 3 to 5 percent. Every function call is inlined, so a traversal, a
+light sample or a shader is copied wherever it is called, and what each copy costs in registers is paid across the whole
+kernel. Fewer copies are not automatically better either: folding the closest and any hit searches into one call, or
+calling the direct light from one place, measured slower. Measure a kernel change; do not judge it by the work it seems
+to remove.
 
 ## Compatibility
 

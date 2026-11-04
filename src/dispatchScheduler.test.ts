@@ -106,3 +106,18 @@ it("never widens a band by more than one step at a time", () => {
   // watchdog gradually rather than on its first long submit.
   expect(scheduler.next(100000)).toBeLessThanOrEqual(32);
 });
+
+it("covers that many times fewer rows when a submit takes several paths per pixel", () => {
+  const scheduler = new DispatchScheduler({ maxRows: 1000, initialRows: 100, targetMs: 10, maxSamples: 4 });
+
+  // Ten rows a millisecond at one path each: a band of four paths per pixel should settle near a quarter as many rows.
+  for (let submit = 0; submit < 200; submit++) {
+    const rows = scheduler.next(1000, 4);
+
+    scheduler.record(rows * 4 / 10, rows, 4);
+  }
+
+  expect(scheduler.next(1000, 4)).toBeGreaterThan(15);
+  expect(scheduler.next(1000, 4)).toBeLessThan(35);
+  expect(scheduler.next(1000, 1)).toBeGreaterThan(60);
+});

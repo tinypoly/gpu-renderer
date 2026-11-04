@@ -50,8 +50,16 @@ export interface PackedLights {
   ambient: { sky: number[]; ground: number[]; axis: number[] };
   /** How often direct sampling picks the environment rather than a light. Zero when there is nothing to aim at. */
   environmentPick: number;
-  /** Words to append to the texture buffer: a spot light's map index and the matrix that projects it. */
+  /**
+   * Words to append to the texture buffer: a spot light's map index and the matrix that projects it, then the
+   * cumulative probability of every entry and the triangle of every emissive one, packed tight so the two searches the
+   * shader makes over them read four bytes a step instead of a whole entry.
+   */
   extraWords: Uint32Array;
+  /** Where the cumulative probabilities start in the texture buffer, one float per entry. */
+  cdfAt: number;
+  /** Where the emissive entries' triangles start in the texture buffer, one word per emissive entry. */
+  trianglesAt: number;
 }
 
 const luminance = (color: ArrayLike<number>) => 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
@@ -353,8 +361,18 @@ export function packLights(
   });
 
   const environmentPick = surrounding.length ? surrounding[0].weight / total : 0;
+  const base = options.extraBase ?? 0;
+  const cdfAt = base + extra.length;
+
+  for (let index = 0; index < candidates.length; index++) extra.push(words[index * LIGHT_WORDS + 1]);
+
+  const trianglesAt = base + extra.length;
+
+  for (let index = 0; index < areas.length; index++) extra.push(words[index * LIGHT_WORDS + 3]);
 
   return {
+    cdfAt,
+    trianglesAt,
     entries,
     count: candidates.length,
     areaCount: areas.length,

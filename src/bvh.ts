@@ -1,15 +1,20 @@
 /**
- * Binned SAH bounding volume hierarchy, built straight into the layout the shader reads: eight words per node, the
- * first four a minimum corner and a left child or leaf start, the last four a maximum corner and a right child or
- * triangle count, matching `struct BvhNode` in `wgsl/bvh.wgsl.ts`.
+ * Binned SAH bounding volume hierarchy. It is built as a binary tree of boxes, eight words a node, and then laid out
+ * the way the shader reads it: each node holds the boxes of its two children, so one read tells the traversal both
+ * what it may enter and where to go, and a leaf is tested without being read at all. That is sixteen words a node,
+ * matching `struct BvhNode` in `wgsl/common.wgsl.ts`: per child a minimum corner and a link, then a maximum corner and
+ * a triangle count. A link of zero or more is the node to go to; a negative one is a leaf, `-1 - start` into `order`.
  *
  * The bounds are computed from the same `Float32Array` the shader traverses, so every corner is already a float and
  * needs no widening. Building from double precision positions, as the CPU renderer does, would need each minimum
  * rounded down and each maximum rounded up before they reach the GPU.
  */
 
-/** Words per node in the packed buffer. */
-export const NODE_WORDS = 8;
+/** Words per node in the packed buffer: both children's corners, links and counts. */
+export const NODE_WORDS = 16;
+
+/** Words per node of the binary tree the builder works on: its own corners, and its children or its leaf. */
+const BINARY_WORDS = 8;
 
 /** Triangles a leaf may hold. */
 const MAX_LEAF_SIZE = 4;
@@ -27,7 +32,10 @@ const TRAVERSAL_COST = 0.125;
 export const MAX_BVH_DEPTH = 32;
 
 export interface PackedBvh {
-  /** `nodeCount * NODE_WORDS` words, read as floats for the corners and as signed integers for the links. */
+  /**
+   * `nodeCount * NODE_WORDS` words, read as floats for the corners and as signed integers for the links. Node zero
+   * holds the root's two children, or the root itself beside an empty child when the whole scene is one leaf.
+   */
   nodes: ArrayBuffer;
   nodeCount: number;
   /** Triangle indices in leaf order: a leaf covers `order[start] .. order[start + count - 1]`. */
@@ -66,15 +74,15 @@ export function buildBvh(positions: Float32Array, triangleCount: number): Packed
 
   const { min, max, centroid } = triangleBounds(positions, triangleCount);
   // The heuristic may split down to one triangle per leaf, so the pool starts at the common case and grows.
-  let nodes = new ArrayBuffer(Math.max(4, Math.ceil(triangleCount / 2)) * NODE_WORDS * 4);
+  let nodes = new ArrayBuffer(Math.max(4, Math.ceil(triangleCount / 2)) * BINARY_WORDS * 4);
   let floats = new Float32Array(nodes);
   let ints = new Int32Array(nodes);
 
   const reserve = (needed: number) => {
-    if (needed * NODE_WORDS * 4 <= nodes.byteLength) return;
+    if (needed * BINARY_WORDS * 4 <= nodes.byteLength) return;
 
-    const grown = new ArrayBuffer(Math.max(needed, Math.ceil(nodes.byteLength / (NODE_WORDS * 4) * 1.6))
-      * NODE_WORDS * 4);
+    const grown = new ArrayBuffer(Math.max(needed, Math.ceil(nodes.byteLength / (BINARY_WORDS * 4) * 1.6))
+      * BINARY_WORDS * 4);
 
     new Float32Array(grown).set(floats);
     nodes = grown;
@@ -132,7 +140,7 @@ export function buildBvh(positions: Float32Array, triangleCount: number): Packed
       if (value > cMaxZ) cMaxZ = value;
     }
 
-    const word = node * NODE_WORDS;
+    const word = node * BINARY_WORDS;
 
     floats[word] = minX;
     floats[word + 1] = minY;
@@ -180,7 +188,68 @@ export function buildBvh(positions: Float32Array, triangleCount: number): Packed
     top += 2;
   }
 
-  return { nodes: nodes.slice(0, nodeCount * NODE_WORDS * 4), nodeCount, order, maxDepth };
+  return { ...widen(floats, ints, nodeCount), order, maxDepth };
+}
+
+/**
+ * The binary tree laid out for the shader: one node per interior node of it, holding both children's boxes. Interior
+ * nodes are numbered depth first, left before right, so a node and the child it leads to tend to share a cache line.
+ */
+function widen(floats: Float32Array, ints: Int32Array, binaryCount: number): { nodes: ArrayBuffer; nodeCount: number } {
+  const leaf = (node: number) => ints[node * BINARY_WORDS + 3] < 0;
+  const rootLeaf = leaf(0);
+  // A full binary tree has one fewer interior node than leaves; a single leaf still needs a node to stand in.
+  const nodeCount = rootLeaf ? 1 : (binaryCount - 1) / 2;
+  const nodes = new ArrayBuffer(nodeCount * NODE_WORDS * 4);
+  const outFloats = new Float32Array(nodes);
+  const outInts = new Int32Array(nodes);
+  const index = new Int32Array(binaryCount);
+
+  const writeChild = (word: number, child: number) => {
+    const from = child * BINARY_WORDS;
+
+    for (let axis = 0; axis < 3; axis++) {
+      outFloats[word + axis] = floats[from + axis];
+      outFloats[word + 4 + axis] = floats[from + 4 + axis];
+    }
+
+    outInts[word + 3] = leaf(child) ? ints[from + 3] : index[child];
+    outInts[word + 7] = leaf(child) ? ints[from + 7] : 0;
+  };
+
+  if (rootLeaf) {
+    writeChild(0, 0);
+
+    // A box at the far corner of the float range, which no ray reaches, around a leaf of nothing.
+    for (let axis = 0; axis < 3; axis++) outFloats[8 + axis] = outFloats[12 + axis] = 3.4028234663852886e38;
+
+    outInts[11] = -1;
+    outInts[15] = 0;
+
+    return { nodes, nodeCount };
+  }
+
+  const interior: number[] = [];
+  const pending = [0];
+
+  while (pending.length) {
+    const node = pending.pop() as number;
+
+    index[node] = interior.length;
+    interior.push(node);
+
+    const left = ints[node * BINARY_WORDS + 3], right = ints[node * BINARY_WORDS + 7];
+
+    if (!leaf(right)) pending.push(right);
+    if (!leaf(left)) pending.push(left);
+  }
+
+  interior.forEach((node, at) => {
+    writeChild(at * NODE_WORDS, ints[node * BINARY_WORDS + 3]);
+    writeChild(at * NODE_WORDS + 8, ints[node * BINARY_WORDS + 7]);
+  });
+
+  return { nodes, nodeCount };
 }
 
 /** Surface area, the cost the split heuristic weighs each side by. Empty bounds cost nothing. */

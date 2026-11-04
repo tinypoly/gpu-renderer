@@ -173,8 +173,12 @@ fn onWireframe(triangle: u32, point: vec3<f32>) -> bool {
 
 /** Three's diffuseColor.a: opacity, the colour map's alpha, the alpha map's green and the vertex alpha. */
 fn materialAlpha(m: u32, triangle: u32, bary: vec2<f32>) -> f32 {
-  var alpha = materials[m].color.w * sampleMap(materials[m].map, triangle, bary).a
-    * sampleMap(materials[m].alphaMap, triangle, bary).g;
+  return materialAlphaFrom(m, triangle, bary, sampleMap(materials[m].map, triangle, bary));
+}
+
+/** The same, from the colour map's texel at this point. Multiplied in the order resolveSurface multiplies it. */
+fn materialAlphaFrom(m: u32, triangle: u32, bary: vec2<f32>, base: vec4<f32>) -> f32 {
+  var alpha = materials[m].color.w * base.a * sampleMap(materials[m].alphaMap, triangle, bary).g;
 
   if ((materials[m].flags & MATERIAL_VERTEX_COLORS) != 0u) {
     alpha = alpha * triangleColor(triangle, bary).a;
@@ -554,12 +558,31 @@ fn toonRamp(gradientMap: u32, cosine: f32) -> f32 {
   return sampleTextureRaw(gradientMap, vec2<f32>(coordinate, 0.0)).r;
 }
 
+/**
+ * Whether a material's coverage can be told from its maps alone, before the rest of the surface is read: no shader that
+ * might rewrite the alpha or discard, normal blending, and something that makes it partial at all.
+ */
+fn coverageFirst(m: u32) -> bool {
+  let flags = materials[m].flags;
+  let blending = materials[m].blending;
+
+  return materials[m].program == NO_PROGRAM
+    && (blending == BLEND_NORMAL || blending == BLEND_NONE)
+    && (materials[m].alphaTest > 0.0 || (flags & (MATERIAL_ALPHA_HASH | MATERIAL_TRANSPARENT)) != 0u);
+}
+
 /** Everything the lobes need about one point of one triangle. */
 fn resolveSurface(triangle: u32, bary: vec2<f32>, direction: vec3<f32>) -> Surface {
   let m = materialIndexOf(triangle);
+
+  return resolveSurfaceFrom(triangle, bary, direction, sampleMap(materials[m].map, triangle, bary));
+}
+
+/** The same, from the colour map's texel at this point, for a caller that already read it. */
+fn resolveSurfaceFrom(triangle: u32, bary: vec2<f32>, direction: vec3<f32>, base: vec4<f32>) -> Surface {
+  let m = materialIndexOf(triangle);
   let flags = materials[m].flags;
   let kind = materials[m].kind;
-  let base = sampleMap(materials[m].map, triangle, bary);
   let facing = interpolatedNormal(m, triangle, bary, direction);
   let view = -direction;
   var surface: Surface;

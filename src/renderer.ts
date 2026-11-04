@@ -8,7 +8,7 @@ import { DispatchScheduler } from "./dispatchScheduler.js";
 import { packGeometry } from "./geometry.js";
 import { packLights } from "./lights.js";
 import { NO_PROGRAM } from "./materialLayout.js";
-import { NO_TEXTURE, planTextures, writeTextures } from "./texturePack.js";
+import { NO_TEXTURE, planTextures, textureEntry, writeTextures } from "./texturePack.js";
 import { PathTracePass, type FrameUniforms } from "./pathTracePass.js";
 import { ImageResolvePass } from "./imageResolve.js";
 import { PresentPass } from "./presentPass.js";
@@ -129,6 +129,31 @@ const yieldToPage = () => new Promise<void>(resolve => setTimeout(resolve, 0));
  * Waiting for an animation frame after every band would leave the device idle for most of each one.
  */
 const SHOW_EVERY_MS = 16;
+
+/**
+ * Submits on the device at once. Two keep it busy: the next band is queued while the last one runs, and each submit
+ * still stays short enough for the watchdog on its own.
+ */
+const BANDS_IN_FLIGHT = 2;
+
+/** How often the canvas takes a freshly denoised image while a frame traces. */
+const DENOISE_EVERY_MS = 200;
+
+/** The most paths per pixel one dispatch takes, while no pixel can stop yet. */
+const BATCH_PATHS = 4;
+
+/**
+ * Paths per pixel the next pass takes. The first takes one, so the canvas shows something at once. Until adaptive
+ * sampling may stop a pixel, every pixel takes every path anyway, so a pass takes several and pays for reading and
+ * writing the accumulation once; from then on one at a time, so a pixel stops as soon as it has converged.
+ */
+function pathsPerDispatch(taken: number, until: number, adaptive: boolean): number {
+  if (taken === 0) return 1;
+
+  if (adaptive && taken >= until) return 1;
+
+  return Math.max(1, Math.min(BATCH_PATHS, until - taken));
+}
 
 const EMPTY_SCENE: SerializedScene = { meshes: [], lights: [], textures: [] };
 
@@ -252,7 +277,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.current = mergeSettings(DEFAULT_RENDER_SETTINGS, options.settings);
     this.denoiserSettings = mergeDenoiser(DEFAULT_DENOISER, options.denoiser);
     this.environment = DEFAULT_RENDER_ENVIRONMENT;
-    this.scheduler = new DispatchScheduler({ maxRows: this.renderHeight });
+    this.scheduler = new DispatchScheduler({ maxRows: this.renderHeight, maxSamples: BATCH_PATHS });
     this.setEnvironment(options.environment ?? DEFAULT_RENDER_ENVIRONMENT);
 
     if (options.scene) this.setScene(options.scene);
@@ -549,29 +574,57 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.emit("start", { width, height });
 
     const target = Math.max(1, Math.round(this.current.samples));
-    // Adaptive sampling: the frame has the work of `target` passes over the whole image to spend. Pixels that have
+    // Adaptive sampling: the frame has the work of `target` paths over the whole image to spend. Pixels that have
     // converged stop taking samples, and a row with none left stops being dispatched, so what they would have used goes
     // to the rows that still need it, up to a few times `target` paths in the noisiest pixels.
     const adaptive = target > ADAPTIVE_MIN;
-    const maxPasses = adaptive ? target * ADAPTIVE_REACH : target;
+    const maxPaths = adaptive ? target * ADAPTIVE_REACH : target;
+    // In rows times paths, the unit the scheduler measures work in.
     const budget = target * height;
     const accumulator = this.accumulator as Accumulator;
     let active: number[] = Array.from({ length: height }, (_, row) => row);
-    let spent = 0, band = 0, pass = 0;
+    // Paths every pixel still in the running has taken so far, which is also the next sample index.
+    let taken = 0;
+    let spent = 0, band = 0;
     let shown = performance.now();
+    let denoisedAt = -Infinity;
     const denoise = this.current.globalIllumination.denoise;
+    // Bands on the device, oldest first. The next one is encoded and queued while the last one runs, so the device
+    // never waits for the page to hear that a band finished.
+    const flight: { done: Promise<unknown>; submitted: number; rows: number; samples: number }[] = [];
+    let settledAt = 0;
+
+    const settle = async() => {
+      const oldest = flight.shift();
+
+      if (!oldest) return;
+
+      await oldest.done;
+
+      const now = performance.now();
+
+      // A band starts on the device when the one before it ends, or when it was submitted if the device was idle. The
+      // page may hear of that end late, which would make this band look shorter than it ran; since it was submitted it
+      // has waited for at most the bands ahead of it, so its share of that wait bounds it from below.
+      const ran = Math.max(now - Math.max(oldest.submitted, settledAt), (now - oldest.submitted) / BANDS_IN_FLIGHT);
+
+      this.scheduler.record(ran, oldest.rows, oldest.samples);
+      settledAt = now;
+    };
 
     this.denoised = false;
     this.finished = null;
 
     const matrices = cameraMatrices(camera, width, height);
+    const uniforms = this.frameUniforms(camera, width, height, assets);
 
     // Two over the projection's vertical scale and the height: one pixel's extent, per unit of depth in perspective.
     this.denoiseView = { pixelScale: 2 / (matrices.projection[5] * height), orthographic: matrices.orthographic };
 
-    while (pass < maxPasses && spent < budget && active.length) {
+    while (taken < maxPaths && spent < budget && active.length) {
       // Only a pass whose pixels may stop needs its rows flagged; before that every row is busy anyway.
-      const flagging = adaptive && pass >= ADAPTIVE_MIN;
+      const flagging = adaptive && taken >= ADAPTIVE_MIN;
+      const samples = pathsPerDispatch(taken, adaptive ? ADAPTIVE_MIN : target, adaptive);
 
       if (flagging) {
         const clear = gpu.device.createCommandEncoder();
@@ -588,17 +641,17 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
           this.check(revision);
 
-          const rows = this.scheduler.next(end - row);
+          const rows = this.scheduler.next(end - row, samples);
           const started = performance.now();
           const encoder = gpu.device.createCommandEncoder();
 
           this.emit("bucket", { worker: 0, bucket: { x: 0, y: row, width, height: rows, index: band++ }, width, height });
           this.pathTrace?.encode(encoder, {
-            ...this.frameUniforms(camera, width, height, assets),
+            ...uniforms,
             bandOrigin: [0, row],
             bandSize: [width, rows],
-            sampleIndex: pass,
-            sampleCount: 1,
+            sampleIndex: taken,
+            sampleCount: samples,
             adaptiveMin: adaptive ? ADAPTIVE_MIN : 0,
             adaptiveThreshold: ADAPTIVE_THRESHOLD,
           });
@@ -608,11 +661,12 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
           if (show) this.encodePresent(encoder, width, height);
 
           gpu.device.queue.submit([encoder.finish()]);
-          await gpu.device.queue.onSubmittedWorkDone();
+          flight.push({ done: gpu.device.queue.onSubmittedWorkDone(), submitted: performance.now(), rows, samples });
 
-          this.scheduler.record(performance.now() - started, rows);
+          while (flight.length >= BANDS_IN_FLIGHT) await settle();
+
           row += rows;
-          spent += rows;
+          spent += rows * samples;
           this.emit("progress", { completed: Math.min(spent, budget), total: budget, phase: "shade" });
 
           if (show) {
@@ -622,23 +676,34 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
         }
       }
 
-      pass++;
+      taken += samples;
       this.frameIndex++;
 
-      // The canvas shows the denoised image from the end of each pass on, and the bands of the next pass refine
-      // underneath it until it is denoised again.
-      if (denoise && this.canvas && this.context) {
+      // The rows this pass still traced in are copied out before anything else is queued, so they can be read while
+      // the device goes on with the denoiser.
+      const rowsRead = flagging ? this.activeRows(gpu, accumulator) : null;
+
+      // The canvas shows the denoised image, refreshed a few times a second while the bands refine underneath it:
+      // filtering the whole image after every pass would cost a cheap scene as much as tracing it.
+      if (denoise && this.canvas && this.context && performance.now() - denoisedAt >= DENOISE_EVERY_MS) {
         const encoder = gpu.device.createCommandEncoder();
 
         this.encodeDenoise(gpu, encoder, width, height);
         this.encodePresent(encoder, width, height);
         gpu.device.queue.submit([encoder.finish()]);
+        denoisedAt = performance.now();
       }
 
       this.emit("sample", { samples: Math.min(target, Math.round(spent / height)), target });
 
-      if (flagging) active = await this.activeRows(gpu, accumulator);
+      if (rowsRead) {
+        while (flight.length) await settle();
+
+        active = await rowsRead;
+      }
     }
+
+    while (flight.length) await settle();
 
     // Converged early, or spent: either way the image is as finished as this frame makes it.
     this.emit("progress", { completed: budget, total: budget, phase: "shade" });
@@ -741,7 +806,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
     this.accumulator ??= new Accumulator(gpu.device, width, height);
 
-    if (resized) this.scheduler = new DispatchScheduler({ maxRows: height });
+    if (resized) this.scheduler = new DispatchScheduler({ maxRows: height, maxSamples: BATCH_PATHS });
 
     this.pathTrace.setBindings(this.buffers, this.accumulator.buffer);
     this.configureCanvas(gpu, width, height);
@@ -820,7 +885,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.check(revision);
 
     const buffers = uploadScene(gpu.device, geometry, bvh, textures, lights, environment, cdf);
-    const textureOffsets = new Map([...textures.indexOf].map(([id, index]) => [id, textures.data[index * 16 + 2]]));
+
+    const textureOffsets = new Map([...textures.indexOf]
+      .map(([id, index]) => [id, textures.data[textureEntry(index) + 2]]));
+
     const packed: PackedSummary = { cameraDependent: geometry.cameraDependent, textureOffsets };
 
     if (buffers.bytes.largest > gpu.maxStorageBufferBindingSize) {
@@ -1004,12 +1072,15 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       triangleCount: buffers?.triangleCount ?? 0,
       lightCount: buffers?.lightCount ?? 0,
       areaLightCount: buffers?.areaLightCount ?? 0,
+      lightCdf: buffers?.lightCdf ?? 0,
+      lightTriangles: buffers?.lightTriangles ?? 0,
       clampIndirect: Math.max(0, this.current.globalIllumination.clamp),
       // The setting is the angular diameter a light covers, in degrees, as it is for the CPU renderer's shadow blur.
       shadowSpread: shadows.enabled ? Math.tan(Math.max(0, shadows.softness) * Math.PI / 360) : 0,
       shadowsEnabled: shadows.enabled,
       uvOffset: buffers?.uvOffset ?? 0,
       orderOffset: buffers?.orderOffset ?? 0,
+      leafOffset: buffers?.leafOffset ?? 0,
       colorOffset: buffers?.colorOffset ?? 0,
       hasColors: buffers?.hasColors ?? false,
       varyingOffset: buffers?.varyingOffset ?? 0,

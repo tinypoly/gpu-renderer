@@ -13,6 +13,8 @@ export interface DispatchSchedulerOptions {
   initialRows?: number;
   /** Rows in the whole image. */
   maxRows: number;
+  /** The most paths per pixel one submit may take, which is how far past the whole image a band may grow. */
+  maxSamples?: number;
 }
 
 /** The most one measurement may widen the band, so an unmeasured machine meets the watchdog gradually. */
@@ -24,20 +26,26 @@ export class DispatchScheduler {
   private readonly targetMs: number;
   private readonly initialRows: number;
   private readonly maxRows: number;
+  private readonly maxSamples: number;
+  /** The work of the next submit, in rows times paths per pixel. */
   private rows: number;
-  /** Rows a millisecond, as far as anything has shown. Zero until the first submit says something. */
+  /** Rows a millisecond, one path each, as far as anything has shown. Zero until the first submit says something. */
   private throughput = 0;
 
   constructor(options: DispatchSchedulerOptions) {
     this.targetMs = options.targetMs ?? 12;
     this.maxRows = Math.max(1, Math.floor(options.maxRows));
+    this.maxSamples = Math.max(1, Math.floor(options.maxSamples ?? 1));
     this.initialRows = Math.max(1, Math.min(this.maxRows, Math.floor(options.initialRows ?? 16)));
     this.rows = this.initialRows;
   }
 
-  /** Rows the next submit should cover, never more than what is left. */
-  next(remaining: number): number {
-    return Math.max(1, Math.min(Math.floor(this.rows), Math.floor(remaining)));
+  /**
+   * Rows the next submit should cover, never more than what is left. A submit that takes several paths per pixel
+   * covers that many times fewer rows, so it still takes about the target time.
+   */
+  next(remaining: number, samples = 1): number {
+    return Math.max(1, Math.min(Math.floor(this.rows / Math.max(1, samples)), Math.floor(remaining)));
   }
 
   /**
@@ -52,15 +60,16 @@ export class DispatchScheduler {
    * The rate is measured from the rows actually submitted rather than from the current guess, so one band clamped by
    * what was left of the image does not stop the next one from growing.
    */
-  record(durationMs: number, rows: number) {
+  record(durationMs: number, rows: number, samples = 1) {
     if (!Number.isFinite(durationMs) || durationMs <= 0 || rows <= 0) return;
 
-    const observed = rows / durationMs;
+    const work = rows * Math.max(1, samples);
+    const observed = work / durationMs;
 
     // Good news is believed at once, since it can only mean the band was cheaper than the clock suggested. Bad news
     // is taken gradually, so one submit that happened to land behind something else does not collapse the band.
     this.throughput = observed > this.throughput ? observed : this.throughput * DECAY + observed * (1 - DECAY);
-    this.rows = Math.max(1, Math.min(this.maxRows, rows * GROW, this.targetMs * this.throughput));
+    this.rows = Math.max(1, Math.min(this.maxRows * this.maxSamples, work * GROW, this.targetMs * this.throughput));
   }
 
   /** Back to the unmeasured band, for a new scene or a new size. */

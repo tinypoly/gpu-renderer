@@ -2,6 +2,7 @@ import { clipToWorld, transform4, worldToClip, type CameraMatrices } from "./cam
 import {
   isMaterialVisible,
   MATERIAL_KIND,
+  MATERIAL_UNLIT_LIGHT,
   materialProperties,
   NO_PLACEMENT,
   NO_PROGRAM,
@@ -525,9 +526,12 @@ export function packGeometry(
     materials: new Uint32Array(triangleMaterials),
     triangleCount: triangleMaterials.length,
     materialColors: new Float32Array(properties.flatMap(m => [...m.color, m.opacity])),
-    // Only a lit or plainly emissive surface is a light: a shader's colour is not known until it runs.
+    // Only a lit or plainly emissive surface is a light: a shader's colour is not known until it runs. An unlit
+    // material of a fixed colour emits that colour, so it is one too.
     materialEmissive: new Float32Array(properties.flatMap(m =>
-      m.kind === MATERIAL_KIND.shader ? [0, 0, 0, 0] : [...m.emissive, m.emissiveIntensity])),
+      m.kind === MATERIAL_KIND.shader ? [0, 0, 0, 0]
+        : (m.flags & MATERIAL_UNLIT_LIGHT) !== 0 ? [...m.color, 1]
+          : [...m.emissive, m.emissiveIntensity])),
     materialProperties: properties,
     materialPlacements: entries.map(entry => entry.placement),
     materialCount: properties.length,

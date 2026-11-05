@@ -18,6 +18,7 @@ It is the GPU sibling of [@tinypoly/cpu-renderer](https://github.com/tinypoly/cp
 - Perspective and orthographic cameras, any projection Three builds; meshes, lines (`Line`, `LineSegments`, `LineLoop`), dashed lines, fat lines (`Line2`), sprites and `PointsMaterial`.
 - Your custom `ShaderMaterial` GLSL, `RawShaderMaterial` and `onBeforeCompile` hooks: fragment shaders are translated to WGSL by [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga) and run in the kernel, with real derivatives; vertex shaders run on the CPU renderer's interpreter.
 - HDR, gradient or procedural sky environments, light probes, depth of field with polygonal bokeh, fog, volumetric lights, vignette and grain, and ACES, AgX or Neutral tone mapping.
+- What a photograph adds, on by default: subsurface scattering, volumes of fog and smoke, aerial perspective, a lens's bloom, aperture rays, chromatic aberration and distortion, a camera's white balance and exposure triangle.
 - Adaptive sampling: pixels whose noise is gone stop taking paths, and the work they leave goes to the dark, glossy and out of focus areas that still need it.
 - A variance-guided denoiser (the spatial filter of SVGF, with diffuse and specular light filtered apart as NVIDIA's RELAX does): each signal is separated from its albedo, filtered by an edge-avoiding wavelet that stops at normals, depths and roughness and trusts each pixel as far as its own variance says, and multiplied back, so textures stay sharp, a sharp reflection stays sharp and flat areas keep their exact mean.
 - Progressive output: the canvas refines sample by sample, and the render can be paused, resumed and cancelled.
@@ -152,20 +153,23 @@ The renderer never falls back on its own. Choosing another renderer when WebGPU 
 
 ### Settings
 
-`RenderSettings`, grouped by feature, the CPU renderer's own. Defaults are `DEFAULT_RENDER_SETTINGS`; `mergeSettings(base, input)` applies a partial `RenderSettingsInput` the way `setSettings` does. A path tracer reads some of them differently:
+`GpuRenderSettings`: the CPU renderer's `RenderSettings`, grouped by feature, with the [groups only this renderer reads](#what-a-photograph-adds) beside them in the same object, which the CPU renderer leaves alone. Defaults are `DEFAULT_GPU_RENDER_SETTINGS`, the CPU renderer's own with what a photograph has turned on; `mergeGpuSettings(base, input)` applies a partial `GpuRenderSettingsInput` the way `setSettings` does. A path tracer reads some of the shared ones differently:
 
 | Field | Default | |
 | --- | --- | --- |
 | `renderScale` | `1` | Multiplier on the image size. |
 | `samples` | `4` | **Paths per pixel**, on average: one number does the antialiasing and the global illumination in a path tracer, and a few hundred is a clean image. Above 32, a pixel that has converged stops early and the noisiest ones take up to four times as many. |
-| `toneMapping` | `"aces"` | `"aces"`, `"agx"`, `"neutral"` or `"linear"`. |
+| `toneMapping` | `"agx"` | `"aces"`, `"agx"`, `"neutral"` or `"linear"`. AgX rolls highlights off as film does; the CPU renderer defaults to ACES. |
 | `exposure` | `1` | |
 | `background.mode` | `"environment"` | `"environment"`, `"color"` or `"transparent"`, which makes the image's alpha the coverage of every pixel. |
 | `background.color` | `"#1a1a1a"` | Used by `mode: "color"`. |
 | `shadows.enabled` | `true` | Whether Three's lights are occlusion tested. Emissive geometry always is. |
 | `shadows.softness` | `1` | Angular diameter of the lights in degrees. `0` gives hard shadows. |
-| `globalIllumination.bounces` | `3` | How far a path goes. Glass wants four or more. |
-| `globalIllumination.clamp` | `0` | Maximum luminance one indirect contribution may add, which trades a little bias for fewer fireflies. `0` disables clamping. |
+| `globalIllumination.bounces` | `12` | How far a path goes: enough for light to fill a room. The roulette below keeps it affordable. |
+| `globalIllumination.clamp` | `10` | Maximum luminance one indirect contribution may add, which trades a little bias for fewer fireflies, as Cycles' indirect light clamp does. `0` disables clamping. |
+| `globalIllumination.russianRoulette` | `true` | Ends a path that carries little light by chance, weighting the survivors up so the mean stays exact. |
+| `globalIllumination.rouletteStart` | `3` | Bounces every path takes before the roulette may end it. |
+| `globalIllumination.lightTree` | `true` | Picks the light to aim at by what it delivers to the shaded point (power, distance, facing) through a tree over the scene's lights, rather than by power alone: a small lamp near a surface gets the samples it needs. |
 | `depthOfField.enabled` | `false` | |
 | `depthOfField.focusDistance` | `10` | World units. |
 | `depthOfField.aperture` | `2.8` | f-number. |
@@ -175,6 +179,36 @@ The renderer never falls back on its own. Choosing another renderer when WebGPU 
 | `fog.near`, `fog.far` | `10`, `60` | View depth. |
 | `vignette` | `0` | `0` to `1`. |
 | `grain` | `0` | `0` to `1`. |
+
+#### What a photograph adds
+
+Groups only this renderer reads, all on by default except the physical exposure, which needs a scene lit in physical units. Changing the lens, the camera's white balance or exposure, the bloom or the glare shows the finished image again without tracing it.
+
+| Field | Default | |
+| --- | --- | --- |
+| `bloom.enabled` | `true` | The halo a lens and sensor scatter around bright light. Energy conserving and without a threshold: it only shows where something is far brighter than its surroundings. |
+| `bloom.intensity` | `0.04` | Share of the light the halo takes, `0` to `1`. |
+| `bloom.radius` | `0.65` | How far it reaches, `0` to `1`. |
+| `glare.enabled` | `true` | The rays a bright light throws through the aperture's blades. Energy conserving like the bloom. |
+| `glare.intensity` | `0.06` | Share of the light the rays take, `0` to `1`. |
+| `glare.blades` | `6` | Blades of the aperture: an even count makes as many rays, an odd count twice as many. |
+| `glare.length`, `glare.rotation` | `0.25`, `15` | How far the rays reach, as a share of the half diagonal, and the aperture's turn in degrees. |
+| `lens.chromaticAberration` | `0.2` | Lateral colour fringes towards the corners, `0` to `1`. |
+| `lens.distortion` | `0` | Radial distortion of the camera rays: positive is barrel, negative pincushion. |
+| `camera.whiteBalance` | `6500` | Kelvin the camera takes as white; `6500` is neutral, lower cools the image. |
+| `camera.physicalExposure` | `false` | Exposes from `iso`, `shutterSpeed` and `depthOfField.aperture`, with `exposure` as compensation. |
+| `camera.iso`, `camera.shutterSpeed` | `100`, `1/125` | Seconds for the shutter. |
+| `atmosphere.enabled` | `true` | Aerial perspective: the air fades distant surfaces towards the light it scatters, from the surroundings and the brightest directional light. Scenes in metres. |
+| `atmosphere.visibility` | `20000` | Scene units at which a dark object keeps 2 percent contrast (Koschmieder): 20 km is a clear day. |
+| `atmosphere.haze` | `0.6` | `0` clean air, blue (Rayleigh); `1` haze, grey and bright towards the sun (Mie). |
+| `atmosphere.color` | `""` | The air's glow as `#rrggbb`; empty takes the surroundings' average. |
+| `subsurface.enabled` | `true` | Materials with a [`subsurface`](#object-options) medium scatter light inside. |
+| `volumes.enabled` | `true` | Meshes with a [`volume`](#object-options) are filled with their medium; off leaves them out. |
+| `bevel.enabled` | `true` | Materials with a [`bevel`](#object-options) radius round their edges at shading time. |
+
+```ts
+renderer.setSettings({ glare: { blades: 7 }, camera: { whiteBalance: 3200 }, atmosphere: { visibility: 3000 } });
+```
 
 `globalIllumination.denoise` (default `true`) turns the denoiser on: on the canvas a few times a second while the frame traces, and on the image `render()` resolves with. Switching it alone filters the finished image again without tracing.
 
@@ -189,6 +223,8 @@ A variance-guided wavelet filter, the spatial half of SVGF, with the diffuse and
 | `edge` | `2` | How large a luminance difference still counts as noise, in standard deviations of the pixel's own noise. Lower keeps more detail and removes less noise. |
 | `onlyNoisy` | `true` | Leaves the pixels that have converged as they were traced, and filters only where noise is still visible. |
 | `antiFirefly` | `true` | Before filtering, clamps a pixel brighter than every one of its eight neighbours to the brightest of them, in each signal. |
+| `subsurface` | `1` | How far the diffuse filter lets go of its normal and depth tests over a material that scatters light inside, `0` to `1`: such light leaves the surface after wandering under it. |
+| `mirrorRadius` | `3` | The smallest footprint a smooth reflection (roughness under 0.3) is filtered over, in pixels, by taps that see the reflected thing at the same distance, which keeps its edges. `0` leaves a mirror alone. |
 
 A denoiser trades noise for detail. What it smooths most is what its guides cannot see: the relief of a lacquer, an out of focus area. With `onlyNoisy` it leaves alone whatever has already converged, so more samples always mean less filtering.
 
@@ -225,6 +261,18 @@ The renderer reads the CPU renderer's optional settings from `userData.cpuRender
 
 ```ts
 light.userData.cpuRenderer = { volumetric: { density: 0.05 } };
+```
+
+Two more on materials, which only this renderer reads:
+
+- **`subsurface`** (standard and physical materials): light enters the material and leaves it somewhere else, by a random walk inside it, as skin, wax, marble and milk do. `true` takes Blender's defaults. The material's colour, maps included, is what the medium reflects in all; `radius` is how far red, green and blue travel inside, as multiples of `scale` in scene units; `weight` is the share of the diffuse layer that scatters inside; `anisotropy` the phase function's.
+- **`bevel`** (lit materials): a radius in scene units, over which the shading normal turns from one face to the next, as Cycles' bevel node rounds edges without changing the geometry. Sharp CG corners catch light like real, slightly rounded ones. The normal map still applies.
+- **`volume`** (any material): the mesh only bounds a medium, which scatters and absorbs light in the space it encloses: fog, smoke, a beam of sunlight through dust, murky water. Its surface is invisible. `density` is per scene unit, `color` what each scattering keeps (white for fog, dark for soot), `anisotropy` how forward it scatters (about `0.7` for haze). The mesh has to be closed, with its normals out; the camera may stand inside one, and objects inside are lit through it.
+
+```ts
+skin.userData.cpuRenderer = { subsurface: { radius: [1, 0.4, 0.25], scale: 0.01 } };
+table.userData.cpuRenderer = { bevel: 0.003 };
+haze.material.userData.cpuRenderer = { volume: { density: 0.05, color: "#ffffff", anisotropy: 0.6 } };
 ```
 
 ### Helpers

@@ -99,6 +99,10 @@ const MATERIAL_OBJECT_NORMAL_MAP: u32 = 256u;
 const MATERIAL_PATCHED: u32 = 512u;
 const MATERIAL_ALPHA_HASH: u32 = 2048u;
 const MATERIAL_SPECULAR: u32 = 4096u;
+// The mesh only bounds a medium: its surface is invisible and the space inside scatters light.
+const MATERIAL_VOLUME: u32 = 8192u;
+// An unlit material of a fixed colour, which direct sampling aims at: it emits what it shows.
+const MATERIAL_UNLIT_LIGHT: u32 = 16384u;
 
 const KIND_STANDARD: u32 = ${MATERIAL_KIND.standard}u;
 const KIND_PHYSICAL: u32 = ${MATERIAL_KIND.physical}u;

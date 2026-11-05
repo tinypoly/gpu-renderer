@@ -199,10 +199,16 @@
 
       const SCENES = { spheres, foliage, emissive };
 
+      // The same work for every build: the roulette from the first bounce and no lens effects, which a build from
+      // before they existed ignores and does not have.
       const settings = denoise => ({
         samples: SAMPLES,
         toneMapping: "aces",
-        globalIllumination: { bounces: 4, denoise },
+        globalIllumination: { bounces: 4, denoise, rouletteStart: 0, clamp: 0 },
+        bloom: { enabled: false },
+        glare: { enabled: false },
+        lens: { chromaticAberration: 0 },
+        atmosphere: { enabled: false },
       });
 
       const environment = { kind: "gradient", topColor: "#6d87a8", bottomColor: "#2a2620" };

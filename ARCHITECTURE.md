@@ -146,6 +146,57 @@ frame traces (at the end of a pass, at most every 200 ms) and on the image `rend
 holds six vec4 per pixel for all of this, 96 bytes, and the filter six more buffers of 16 and one of 4, the last two
 the guides each tap compares, worked out once per pixel: a 2000 x 1350 image takes some 530 MB on the device.
 
+**Light inside materials and volumes is a walk, compiled in only where a scene has it.** Both are media the path
+crosses instead of surfaces it bounces off, and both are written into the bounce loop rather than as loops of their
+own, so the one traversal call in the loop serves them.
+
+- **Subsurface scattering** is a random walk, as in Cycles. A vertex on such a material takes the walk instead of its
+  surface lobes by chance, in proportion to the light each accounts for, so neither is weighted against the other; the
+  lobes it keeps lose that share of the diffuse layer. Inside, each colour has its own mean free path (`radius`) and the
+  single scattering albedo that the material's colour asks for (van de Hulst's relation, inverted); distances are drawn
+  for a colour picked by what the path still carries of it and weighed over all three (spectral MIS). Where the walk
+  reaches a surface it leaves through a white Lambert surface facing out, which takes direct light there.
+- **Volumes** are homogeneous media bounded by an invisible mesh. A medium of one grey density lets the distance be
+  drawn after the segment is traced: the next hit is found, then a collision before it is drawn, and either way the
+  weight is one. A collision is a vertex whose lobe is the phase function (Henyey-Greenstein), with light sampled from
+  there. Shadow rays fade through every boundary they cross, and through the volume they start in; a light that casts no
+  shadow still fades, since the medium is not geometry. Whether the camera stands inside one is found on the CPU, by the
+  parity of a ray's crossings, once per frame.
+- `SUBSURFACE_WALK` and `VOLUMES` are WGSL constants the pipeline is compiled with, true only for a scene with such a
+  material. Carrying the walk's code in every scene measured 2 to 5 percent slower on scenes that never run it (see
+  the next decision); folded away, a plain scene renders the same image as before, byte for byte.
+- The snapshot has no field for either medium, so `serializeLive` marks the material's name while the CPU renderer
+  serializes it, as it already renames a shader material's type, and attaches the medium after. A snapshot built
+  elsewhere can carry `subsurface` or `volume` on its materials itself.
+
+**The lens and the sensor are a pass of their own, after the radiance.** Bloom (Jimenez's 13 tap pyramid, folded
+back with a tent), the aperture's rays (gathered along each ray from a quarter sized level), lateral chromatic
+aberration and the white balance (a von Kries scaling in Bradford's cone space, exactly the identity at 6500 K) work on
+linear light between the denoiser and the display transform, into a buffer the presentation and the image resolve read
+in its place. Bloom and rays only move light, with weights that sum to one, so a flat image keeps its mean. Aerial
+perspective is not part of it: it needs each sample's distance, so the kernel lays it over the camera's first surface,
+as it lays Three's fog, with the extinction Koschmieder's law gives each colour and the glow of the surroundings and of
+the brightest directional light scattered by the air's phase function. Lens distortion bends the camera rays, so it
+needs no resampling.
+
+**Lights are picked through a tree, by what they can deliver to the shaded point.** Picking by power alone sends a
+small lamp beside a surface as few samples as its power earns against a large panel across the room, and its light
+then arrives through bounce rays as fireflies. The lights that sit in the scene (emissive triangles, point, spot and
+rectangular lights) lead the light buffer and are bound by a tree built on the CPU (`lightTree.ts`): each node keeps
+its box, its power and a cone of the directions its lights face, and the kernel walks down choosing a child by its
+importance from the point, power over squared distance times how well the cone and the receiving normal face each other,
+widened by the angle the box takes (Conty Estevez and Kulla, 2018, without the splitting). The same walk, taken up from
+a leaf, gives the chance a bounce ray's light was picked from the vertex it left, so the heuristic stays exact. The
+directional lights and the environment follow, picked as before by the irradiance they deliver; the share between the
+two groups is what the old distribution gave them. The nodes live in the texture buffer's extra words, sixteen a node,
+because the kernel's eight storage bindings are taken.
+
+**Bevel rounds edges at shading time, by one probe a sample.** As Cycles' bevel node, but stochastic: a point on a disk
+of the radius around the shaded point, across an axis picked along the normal half the time and each tangent a
+quarter, and a short ray along it that finds the same material there. Its normal turns the shading normal by as much
+as it differs from the normal here, which keeps a normal map, and the pixel's samples average the turn into a rounded
+edge. It costs a traversal a vertex on such materials, so `BEVEL` is compiled in only for a scene that has one.
+
 **The kernel is bound by its size, not by its arithmetic.** Measured on an Apple GPU (`scripts/bench.html`, every
 build timed in turns against the other), the nodes that hold their children's boxes made whole renders 16 to 21 percent
 faster, but only once the traversal loop tested leaves in one place: with the leaf test written out wherever a leaf
@@ -256,7 +307,7 @@ it over one pixel.
 | `SpotLight` | Cone and penumbra as Three computes them, and its projected `map` |
 | `RectAreaLight` | A real area light, sampled over its rectangle, so its penumbra is traced rather than approximated |
 | `AmbientLight`, `HemisphereLight` | See the divergence below |
-| Emissive geometry | Any triangle whose material emits, weighted by area and power |
+| Emissive geometry | Any triangle whose material emits, picked through the light tree by what it delivers to the shaded point |
 
 `light.castShadow` gates the occlusion ray, as does `settings.shadows.enabled`. A `RectAreaLight` always occludes,
 because Three has no shadow switch for one and an area light that cast none would look broken once traced. A toon
@@ -286,7 +337,10 @@ covers every surface instead.
 
 Read: `samples`, `renderScale`, `exposure`, `toneMapping`, `vignette`, `grain`, `background`, `fog`, `depthOfField`
 (the CPU renderer's 35 mm lens, `focusDistance`, `aperture` as an f-number, `blades` for polygonal bokeh),
-`globalIllumination.bounces`, `globalIllumination.clamp`, `shadows.enabled`, `shadows.softness`.
+`globalIllumination.bounces`, `globalIllumination.clamp`, `shadows.enabled`, `shadows.softness`, and the groups only this
+renderer has: `globalIllumination.russianRoulette` and `rouletteStart`, `bloom`, `glare`, `lens`, `camera`,
+`atmosphere`, `subsurface` and `volumes`. Its defaults differ from the CPU renderer's in `toneMapping` (AgX),
+`globalIllumination.bounces` (12) and `globalIllumination.clamp` (10).
 
 Ignored: `tileSize`, `ambientOcclusion`, and everything else under `globalIllumination` (`enabled`, `samples`,
 `intensity`, `cache`, `cacheSpacing`, `denoise`).
@@ -322,7 +376,9 @@ Ignored: `tileSize`, `ambientOcclusion`, and everything else under `globalIllumi
 - **Transparency is stochastic.** A surface with an opacity below one lets that share of rays straight through, which is
   what makes a cutout cast a cutout shadow, and what makes the result converge rather than composite.
 - **Unlit surfaces emit.** A basic material, a shader material, a sprite: whatever colour Three would draw, the surface
-  radiates, so it also lights its surroundings (found by bounce rays, not aimed at).
+  radiates, so it also lights its surroundings. An opaque `MeshBasicMaterial` of a fixed colour (normal blending, no
+  alpha, light or environment map) is aimed at as a light, its colour times its map and vertex colours read at the
+  sampled point; anything else unlit is only found by bounce rays, since what it shows is not known until it runs.
 - Global illumination is always on. There is no flag for it: tracing paths is what this renderer does.
 - **Glass refracts** where Three's transmission samples a blurred copy of the opaque scene behind it. A volume bends what
   is behind it and reflects its surroundings properly; a thin wall is exact. Neither is what Three draws.

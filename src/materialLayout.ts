@@ -1,4 +1,5 @@
 import { layoutStruct, writeStruct, type StructField } from "./structLayout.js";
+import { bevelOf, subsurfaceOf, volumeOf } from "./subsurface.js";
 import { NO_TEXTURE } from "./texturePack.js";
 import type { SerializedMaterial, UniformValue } from "./upstream.js";
 
@@ -59,6 +60,20 @@ export interface MaterialProperties {
   combine: number;
   side: number;
   blending: number;
+  /**
+   * Share of the diffuse layer that scatters light inside the material, from `userData.cpuRenderer.subsurface`; zero
+   * for none. Physical and standard materials only.
+   */
+  subsurface: number;
+  /** Mean free path of red, green and blue inside the material, in world units. */
+  subsurfaceRadius: number[];
+  subsurfaceAnisotropy: number;
+  /** The medium a volume's boundary encloses: its single scattering albedo, density per scene unit and anisotropy. */
+  volumeAlbedo: number[];
+  volumeDensity: number;
+  volumeAnisotropy: number;
+  /** The radius over which edges are rounded at shading time, in scene units; zero leaves them sharp. */
+  bevel: number;
   /** An index into the texture table per slot, or `NO_TEXTURE`. */
   maps: Record<MaterialMap, number>;
 }
@@ -137,6 +152,18 @@ export const MATERIAL_ALPHA_HASH = 2048;
 /** A physical material, whose specular colour and intensity reach the lobe and whose grazing reflectance follows them. */
 export const MATERIAL_SPECULAR = 4096;
 
+/**
+ * The mesh only bounds a medium, from `userData.cpuRenderer.volume`: its surface is invisible and the space inside
+ * scatters light.
+ */
+export const MATERIAL_VOLUME = 8192;
+
+/**
+ * An unlit material whose colour is known without running anything: opaque, normal blending, no light map, environment
+ * map, alpha map or shader. What it shows is what it emits, so direct sampling can aim at it like an emissive one.
+ */
+export const MATERIAL_UNLIT_LIGHT = 16384;
+
 /** What a material's `program` reads as when it has no shader. */
 export const NO_PROGRAM = 0xffffffff;
 
@@ -186,6 +213,11 @@ const FIELDS: StructField[] = [
   { name: "dielectric", type: "f32" },
   { name: "afterProgram", type: "u32", doc: "What a hook does after <opaque_fragment>, or NO_PROGRAM." },
   { name: "afterData", type: "u32" },
+  { name: "subsurface", type: "vec4f", doc: "rgb is the mean free path of each colour inside, w the share of the diffuse layer." },
+  { name: "subsurfaceAnisotropy", type: "f32" },
+  { name: "volume", type: "vec4f", doc: "rgb is the medium's single scattering albedo, w its density per scene unit." },
+  { name: "volumeAnisotropy", type: "f32" },
+  { name: "bevel", type: "f32", doc: "The radius edges are rounded over at shading time; zero leaves them sharp." },
   { name: "normalRow0", type: "vec4f", doc: "The mesh's world normal matrix, for an object space normal map." },
   { name: "normalRow1", type: "vec4f" },
   { name: "normalRow2", type: "vec4f" },
@@ -263,6 +295,8 @@ export function materialProperties(
   const sheen = physical ? Math.max(0, number(values.sheen, 0)) : 0;
   const anisotropy = physical ? number(values.anisotropy, 0) : 0;
   const thickness = vector(values.iridescenceThicknessRange, [100, 400], 2);
+  const medium = pbr ? subsurfaceOf(material) : null;
+  const volume = volumeOf(material);
 
   const maps = Object.fromEntries(MATERIAL_MAPS.map(slot => {
     const id = material?.maps?.[slot];
@@ -285,7 +319,12 @@ export function materialProperties(
     | (number(values.normalMapType, 0) === 1 ? MATERIAL_OBJECT_NORMAL_MAP : 0)
     | (shader?.patched ? MATERIAL_PATCHED : 0)
     | (flag(values.alphaHash, false) ? MATERIAL_ALPHA_HASH : 0)
-    | (physical ? MATERIAL_SPECULAR : 0);
+    | (physical ? MATERIAL_SPECULAR : 0)
+    | (volume ? MATERIAL_VOLUME : 0)
+    | (type === "MeshBasicMaterial" && !shader && !transparent && !flag(values.alphaHash, false)
+      && !flag(values.wireframe, false) && number(values.blending, 1) === 1 && number(values.opacity, 1) >= 1
+      && number(values.alphaTest, 0) <= 0 && maps.alphaMap === NO_TEXTURE && maps.envMap === NO_TEXTURE
+      && maps.lightMap === NO_TEXTURE && !volume ? MATERIAL_UNLIT_LIGHT : 0);
 
   return {
     kind,
@@ -330,6 +369,13 @@ export function materialProperties(
     combine: number(values.combine, 0),
     side: number(values.side, 0),
     blending: number(values.blending, 1),
+    subsurface: medium?.weight ?? 0,
+    subsurfaceRadius: medium?.radius ?? [1, 1, 1],
+    subsurfaceAnisotropy: medium?.anisotropy ?? 0,
+    volumeAlbedo: volume?.albedo ?? [1, 1, 1],
+    volumeDensity: volume?.density ?? 0,
+    volumeAnisotropy: volume?.anisotropy ?? 0,
+    bevel: LIT.has(type) ? bevelOf(material) : 0,
     maps,
   };
 }
@@ -400,6 +446,11 @@ export function writeMaterial(
     dielectric: p.dielectric,
     afterProgram: placement.afterProgram,
     afterData: placement.afterData,
+    subsurface: [...p.subsurfaceRadius, p.subsurface],
+    subsurfaceAnisotropy: p.subsurfaceAnisotropy,
+    volume: [...p.volumeAlbedo, p.volumeDensity],
+    volumeAnisotropy: p.volumeAnisotropy,
+    bevel: p.bevel,
     normalRow0: [n[0], n[3], n[6], 0],
     normalRow1: [n[1], n[4], n[7], 0],
     normalRow2: [n[2], n[5], n[8], 0],

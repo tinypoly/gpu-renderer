@@ -237,3 +237,18 @@ it("keeps an ambient light out of the sampled buffer, having nothing to aim a sh
 
   expect(lights.count).toBe(0);
 });
+
+it("puts the lights that sit in the scene before the ones outside it, and closes their share exactly", () => {
+  const panel = geometry([{ legs: 1, material: 0 }], [[1, 1, 1, 1]]);
+  const sun = light({ type: "DirectionalLight", intensity: 2, position: [0, 1, 0] });
+  const bulb = light({ type: "PointLight", intensity: 3, position: [0, 1, 0] });
+  const packed = packLights(panel, [sun, bulb]);
+  const floats = new Float32Array(packed.entries);
+  const words = new Uint32Array(packed.entries);
+
+  expect(packed.localCount).toBe(2);
+  expect(words[1 * LIGHT_WORDS]).toBe(LIGHT_KIND.point);
+  expect(words[2 * LIGHT_WORDS]).toBe(LIGHT_KIND.directional);
+  expect(packed.localPick).toBe(floats[1 * LIGHT_WORDS + 1]);
+  expect(packed.treeAt).toBeGreaterThan(0);
+});

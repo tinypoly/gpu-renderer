@@ -62,6 +62,8 @@ struct Surface {
   lightMap: vec3<f32>,
   blending: u32,
   material: u32,
+  // Share of the diffuse layer that scatters inside the material instead of at its surface.
+  subsurface: f32,
 };
 
 /** Barycentric weights of the two trailing vertices, for a point drawn uniformly over a triangle's area. */
@@ -114,6 +116,18 @@ fn isCulled(material: u32, triangle: u32, direction: vec3<f32>) -> bool {
 /** What the triangle radiates at this point, its emissive map included so direct and indirect light agree on it. */
 fn emissionAt(triangle: u32, bary: vec2<f32>) -> vec3<f32> {
   let m = materialIndexOf(triangle);
+
+  // An unlit material emits its colour as the camera would see it, so a bounce ray finds what a light sample counted.
+  if ((materials[m].flags & MATERIAL_UNLIT_LIGHT) != 0u) {
+    var color = materials[m].color.rgb * sampleMap(materials[m].map, triangle, bary).rgb;
+
+    if ((materials[m].flags & MATERIAL_VERTEX_COLORS) != 0u) {
+      color = color * triangleColor(triangle, bary).rgb;
+    }
+
+    return color;
+  }
+
   let map = sampleMap(materials[m].emissiveMap, triangle, bary);
 
   return materials[m].emissive.rgb * materials[m].emissive.w * map.rgb;
@@ -611,7 +625,12 @@ fn resolveSurfaceFrom(triangle: u32, bary: vec2<f32>, direction: vec3<f32>, base
 
   var roughness = materials[m].specular.w * sampleMap(materials[m].roughnessMap, triangle, bary).g;
   var metalness = materials[m].metalness * sampleMap(materials[m].metalnessMap, triangle, bary).b;
-  var emissive = emissionAt(triangle, bary);
+  var emissive = vec3<f32>(0.0);
+
+  // An unlit light's colour is added as what it shows, below; emissionAt gives the same colour to light samples.
+  if ((flags & MATERIAL_UNLIT_LIGHT) == 0u) {
+    emissive = emissionAt(triangle, bary);
+  }
 
   surface.opacity = 1.0;
 
@@ -658,6 +677,7 @@ fn resolveSurfaceFrom(triangle: u32, bary: vec2<f32>, direction: vec3<f32>, base
   surface.ior = max(materials[m].ior, 1.0);
   surface.thickness = materials[m].thickness * sampleMap(materials[m].thicknessMap, triangle, bary).g;
   surface.dispersion = materials[m].dispersion;
+  surface.subsurface = select(0.0, materials[m].subsurface.w, frame.subsurfaceEnabled != 0u);
   surface.absorption = absorptionOf(m);
   surface.shininess = materials[m].shininess;
   surface.specularStrength = sampleMap(materials[m].specularMap, triangle, bary).r;

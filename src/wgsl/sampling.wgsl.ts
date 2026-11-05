@@ -21,6 +21,31 @@ fn cosineDirection(normal: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
   return normalize(orthonormalBasis(normal) * local);
 }
 
+/** A direction scattered from forward by the Henyey-Greenstein phase function, which its own sampling cancels. */
+fn sampleHenyeyGreenstein(forward: vec3<f32>, g: f32, u: vec2<f32>) -> vec3<f32> {
+  var cosine = 1.0 - 2.0 * u.x;
+
+  if (abs(g) > 1e-3) {
+    let s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+    cosine = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+  }
+
+  let sine = sqrt(max(0.0, 1.0 - cosine * cosine));
+  let angle = 2.0 * PI * u.y;
+
+  return normalize(orthonormalBasis(forward) * vec3<f32>(sine * cos(angle), sine * sin(angle), cosine));
+}
+
+/**
+ * The Henyey-Greenstein phase function, per steradian, for a turn whose cosine is given from the direction of travel:
+ * the density sampleHenyeyGreenstein draws with.
+ */
+fn henyeyGreenstein(cosine: f32, g: f32) -> f32 {
+  let denominator = 1.0 + g * g - 2.0 * g * cosine;
+
+  return (1.0 - g * g) / (4.0 * PI * denominator * sqrt(max(denominator, 1e-12)));
+}
+
 /** The unit normal of the triangle's plane; which side it faces does not matter, every emitter is two sided. */
 fn triangleNormal(triangle: u32) -> vec3<f32> {
   let a = triangleVertex(triangle, 0u);

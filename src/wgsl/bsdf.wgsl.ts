@@ -175,6 +175,12 @@ fn coatTransmittance(surface: Surface, view: vec3<f32>) -> f32 {
   return 1.0 - surface.clearcoat * schlick3(vec3<f32>(0.04), 1.0, nv).x;
 }
 
+/**
+ * A point inside a volume, where light scatters by the medium's phase function instead of off a surface. Only the
+ * integrator makes one: its normal faces back along the ray, its albedo is the medium's, its anisotropy the phase's.
+ */
+const KIND_VOLUME: u32 = 100u;
+
 /** How often each lobe is chosen, as (diffuse, specular, clearcoat): by how much of the reflection each accounts for. */
 fn lobeWeights(surface: Surface, view: vec3<f32>) -> vec3<f32> {
   let nv = max(dot(surface.normal, view), 1e-4);
@@ -192,7 +198,8 @@ fn lobeWeights(surface: Surface, view: vec3<f32>) -> vec3<f32> {
 
   let base = coatTransmittance(surface, view);
   // The floors keep every lobe reachable: the diffuse one also carries the sheen and the multiple scattering term.
-  let diffuse = (luminanceOf(surface.albedo * (1.0 - surface.metalness)) + max3(surface.sheenColor)) * base + 0.02;
+  let diffuse = (luminanceOf(surface.albedo * ((1.0 - surface.metalness) * (1.0 - surface.subsurface)))
+    + max3(surface.sheenColor)) * base + 0.02;
   let specular = luminanceOf(schlick3(surface.specularColor, surface.specularF90, nv)
     * (1.0 - surface.metalness) + surface.albedo * surface.metalness) * base + 0.05;
   let coat = select(0.0, (1.0 - base) + 0.02, surface.clearcoat > 0.0);
@@ -235,7 +242,8 @@ fn physicalValue(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> vec3<f3
     let average = f0 + (vec3<f32>(1.0) - f0) * 0.047619;
     let multiple = essV * essL * average / (vec3<f32>(1.0) - emsV * emsL * average + 1e-7) * (emsV * emsL);
 
-    var diffuse = surface.albedo * (1.0 - surface.metalness) / PI;
+    // What scatters inside the material leaves it elsewhere, by the random walk, not from this point.
+    var diffuse = surface.albedo * ((1.0 - surface.metalness) * (1.0 - surface.subsurface)) / PI;
     var specular = single + multiple;
 
     // Three's sheen: its lobe sits on top and takes back the energy it reflects from the layers below.
@@ -343,6 +351,16 @@ fn evaluateBsdf(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> BsdfEval
 
   let nl = dot(normal, light);
   let nv = dot(normal, view);
+
+  // In a medium every direction is open: the phase function stands for the lobes, and samples itself exactly.
+  if (surface.kind == KIND_VOLUME) {
+    let phase = henyeyGreenstein(dot(-view, light), surface.anisotropy);
+
+    result.value = surface.albedo * phase;
+    result.pdf = phase;
+
+    return result;
+  }
 
   if (nv <= 0.0) {
     return result;
@@ -507,6 +525,15 @@ fn sampleBsdf(surface: Surface, view: vec3<f32>, lobe: f32, u: vec2<f32>) -> Bsd
   result.pdf = 0.0;
   result.diffuse = true;
 
+  if (surface.kind == KIND_VOLUME) {
+    result.direction = sampleHenyeyGreenstein(-view, surface.anisotropy, u);
+    result.weight = surface.albedo;
+    result.pdf = henyeyGreenstein(dot(-view, result.direction), surface.anisotropy);
+    result.valid = true;
+
+    return result;
+  }
+
   if (dot(normal, view) <= 0.0) {
     return result;
   }
@@ -574,6 +601,11 @@ fn diffuseValue(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> vec3<f32
     return surface.albedo / PI * toonRamp(surface.gradientMap, nl);
   }
 
+  // Light scattered in a medium is all diffuse, as the denoiser sees it.
+  if (surface.kind == KIND_VOLUME) {
+    return surface.albedo * henyeyGreenstein(dot(-view, light), surface.anisotropy);
+  }
+
   if (nl <= 0.0) {
     return vec3<f32>(0.0);
   }
@@ -582,7 +614,7 @@ fn diffuseValue(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> vec3<f32
     return surface.albedo / PI * nl;
   }
 
-  var diffuse = surface.albedo * (1.0 - surface.metalness) / PI;
+  var diffuse = surface.albedo * ((1.0 - surface.metalness) * (1.0 - surface.subsurface)) / PI;
 
   if (any(surface.sheenColor > vec3<f32>(0.0))) {
     diffuse = diffuse * (1.0 - max3(surface.sheenColor)

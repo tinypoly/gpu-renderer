@@ -21,6 +21,19 @@ export { attachCanvas } from "./canvas.js";
 export { DEFAULT_DENOISER } from "./denoise.js";
 export type { DenoiserSettings } from "./denoise.js";
 
+// The settings only this renderer reads, beside the CPU renderer's, and the defaults it renders with.
+export {
+  DEFAULT_GPU_RENDER_SETTINGS,
+  effectiveExposure,
+  mergeGpuSettings,
+  physicalExposure,
+  whiteBalanceMatrix,
+} from "./settings.js";
+
+export type { GpuRenderSettings, GpuRenderSettingsInput } from "./settings.js";
+export { subsurfaceMedium } from "./subsurface.js";
+export type { SubsurfaceInput, SubsurfaceMaterial, SubsurfaceMedium } from "./subsurface.js";
+
 export type { Bucket, Listener } from "./upstream.js";
 
 // Scene packing, published because the sizes it produces are what a host checks against a device's limits.

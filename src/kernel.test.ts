@@ -5,6 +5,7 @@ import { compileShaderPrograms } from "./shaderProgram.js";
 import { DENOISE_WGSL } from "./denoise.js";
 import { PRESENT_WGSL } from "./wgsl/present.wgsl.js";
 import { IMAGE_RESOLVE_WGSL } from "./imageResolve.js";
+import { LENS_WGSL } from "./wgsl/lens.wgsl.js";
 import type { SerializedMaterial, SerializedScene } from "./upstream.js";
 
 /**
@@ -23,6 +24,13 @@ it("validates the path tracing kernel without any shader", () => {
   expect(() => check(pathTraceSource(null))).not.toThrow();
 });
 
+it("validates the kernel without the subsurface walk or volumes, as a plain scene compiles it", () => {
+  expect(() => check(pathTraceSource(null, false, false, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, false, true))).not.toThrow();
+  expect(() => check(pathTraceSource(null, true, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, true))).not.toThrow();
+});
+
 it("validates the presentation pass", () => {
   expect(() => check(PRESENT_WGSL)).not.toThrow();
 });
@@ -33,6 +41,10 @@ it("validates the pass that resolves the finished image to bytes", () => {
 
 it("validates the denoiser", () => {
   expect(() => check(DENOISE_WGSL)).not.toThrow();
+});
+
+it("validates the lens pass", () => {
+  expect(() => check(LENS_WGSL)).not.toThrow();
 });
 
 const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];

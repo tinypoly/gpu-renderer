@@ -23,8 +23,12 @@ export type FrameUniforms = Record<keyof typeof FRAME_LAYOUT.offsets & string, n
  * declarations. The scene's translated shaders sit between the texture code they call and the surface code that calls
  * them.
  */
-export function pathTraceSource(programs: ShaderPrograms | null = null): string {
-  return COMMON_WGSL + RANDOM_WGSL + BVH_WGSL + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL
+export function pathTraceSource(
+  programs: ShaderPrograms | null = null, subsurface = true, volumes = true, bevel = true): string {
+  // The random walk inside materials and the media inside volumes are compiled in only for a scene that has them: the
+  // kernel is bound by its size, and either would cost every other scene a few percent for code that never runs.
+  return `const SUBSURFACE_WALK: bool = ${subsurface};\nconst VOLUMES: bool = ${volumes};\nconst BEVEL: bool = ${bevel};\n`
+    + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL
     + programsWgsl(programs) + ENVIRONMENT_WGSL + SURFACE_WGSL + BSDF_WGSL + LIGHTS_WGSL + PATH_TRACE_WGSL;
 }
 
@@ -37,26 +41,31 @@ export class PathTracePass {
   private readonly uniforms: GPUBuffer;
   private readonly values = new ArrayBuffer(FRAME_BYTES);
   private bindGroup: GPUBindGroup | null = null;
-  private programKey = "";
+  private programKey = "|false|false|false";
 
   constructor(private readonly device: GPUDevice) {
-    this.pipeline = this.build(null);
+    this.pipeline = this.build(null, false, false, false);
     this.uniforms = device.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
 
-  /** Recompiles the kernel when the scene's shaders changed; the same set of programs keeps the pipeline it has. */
-  setPrograms(programs: ShaderPrograms | null) {
-    const key = programs?.key ?? "";
+  /**
+   * Recompiles the kernel when the scene's shaders changed, or whether it has a material that scatters light inside;
+   * the same set keeps the pipeline it has.
+   */
+  setPrograms(programs: ShaderPrograms | null, subsurface = false, volumes = false, bevel = false) {
+    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}`;
 
     if (key === this.programKey) return;
 
     this.programKey = key;
-    this.pipeline = this.build(programs);
+    this.pipeline = this.build(programs, subsurface, volumes, bevel);
     this.bindGroup = null;
   }
 
-  private build(programs: ShaderPrograms | null): GPUComputePipeline {
-    const module = createShaderModule(this.device, "path trace", pathTraceSource(programs));
+  private build(programs: ShaderPrograms | null, subsurface: boolean, volumes: boolean,
+    bevel: boolean): GPUComputePipeline {
+    const module = createShaderModule(this.device, "path trace",
+      pathTraceSource(programs, subsurface, volumes, bevel));
 
     return this.device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
   }

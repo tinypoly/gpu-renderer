@@ -98,12 +98,14 @@ fn clampIndirect(contribution: vec3<f32>) -> vec3<f32> {
  * How much of the emission a bounce ray found the renderer keeps. Direct sampling had its own chance at this triangle,
  * and the heuristic splits the two so neither counts it twice.
  */
-fn emissionWeight(hit: Hit, direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect: bool) -> f32 {
+fn emissionWeight(hit: Hit, direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect: bool, scatteredAt: vec3<f32>,
+  normal: vec3<f32>) -> f32 {
   if (frame.areaLightCount == 0u) {
     return 1.0;
   }
 
-  let areaPdf = lightPdfOfTriangle(hit.triangle);
+  // From the vertex the bounce left, which is where direct sampling would have picked it from.
+  let areaPdf = lightPdfOfTriangle(hit.triangle, scatteredAt, normal);
 
   if (areaPdf <= 0.0) {
     return 1.0;
@@ -122,6 +124,18 @@ fn emissionWeight(hit: Hit, direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect:
   return misWeight(bsdfPdf, areaPdf * hit.distance * hit.distance / cosLight);
 }
 
+/**
+ * The normal the light tree weighs lights by, or none where light from behind the surface counts too: a point in a
+ * volume, a toon ramp read all round, a clearcoat that may face what its base turns from, and transmission.
+ */
+fn treeNormal(surface: Surface) -> vec3<f32> {
+  if (surface.kind == KIND_VOLUME || surface.kind == KIND_TOON || surface.clearcoat > 0.0 || surface.transmission > 0.0) {
+    return vec3<f32>(0.0);
+  }
+
+  return surface.normal;
+}
+
 /** One shadow ray from the surface towards a light, weighted against the chance the bounce would have found it too. */
 fn directLight(
   surface: Surface,
@@ -130,10 +144,11 @@ fn directLight(
   pick: f32,
   u: vec2<f32>,
   rng: ptr<function, PathSampler>,
-  diffusePart: ptr<function, vec3<f32>>) -> vec3<f32> {
+  diffusePart: ptr<function, vec3<f32>>,
+  medium: f32) -> vec3<f32> {
   *diffusePart = vec3<f32>(0.0);
 
-  let chosen = sampleLight(position, pick, u);
+  let chosen = sampleLight(position, treeNormal(surface), pick, u);
 
   if (!chosen.valid) {
     return vec3<f32>(0.0);
@@ -153,7 +168,7 @@ fn directLight(
   let toon = surface.kind == KIND_TOON;
   // Three's shadow map leaves a toon mesh's own far side unshadowed; tracing through the mesh would not.
   let skip = select(NO_MATERIAL, surface.material, toon && dot(surface.normal, chosen.direction) < 0.1);
-  let through = lightTransmittance(position, chosen, rng, skip);
+  let through = lightTransmittance(position, chosen, rng, skip, medium);
 
   if (all(through <= vec3<f32>(0.0))) {
     return vec3<f32>(0.0);
@@ -191,6 +206,142 @@ fn diffuseGuide(surface: Surface) -> vec3<f32> {
   return surface.albedo * (1.0 - surface.metalness) * (1.0 - clamp(surface.transmission, 0.0, 1.0));
 }
 
+/**
+ * How often a vertex on a material that scatters inside takes the walk into it instead of its surface lobes: by the
+ * share of the light each accounts for, as lobeWeights chooses between lobes. Never all of the time, so the specular
+ * layer on top stays reachable.
+ */
+fn subsurfaceChance(surface: Surface, view: vec3<f32>) -> f32 {
+  if (surface.subsurface <= 0.0 || (surface.flags & MATERIAL_PBR) == 0u) {
+    return 0.0;
+  }
+
+  let diffuse = luminanceOf(surface.albedo * (1.0 - surface.metalness)) * coatTransmittance(surface, view);
+  let inside = diffuse * surface.subsurface;
+  let outside = diffuse * (1.0 - surface.subsurface) + luminanceOf(specularAlbedo(surface, view)) + 0.02;
+
+  return clamp(inside / max(inside + outside, 1e-6), 0.0, 0.95);
+}
+
+/**
+ * The single scattering albedo that gives this multiple scattering albedo in a semi-infinite medium: van de Hulst's
+ * relation, inverted as Cycles inverts it for its random walk. What the material's colour says it reflects in all
+ * is what light keeps at each scattering inside it.
+ */
+fn subsurfaceAlbedo(albedo: vec3<f32>) -> vec3<f32> {
+  let a = clamp(albedo, vec3<f32>(0.0), vec3<f32>(0.999));
+  let s = 4.09712 + 4.20863 * a - sqrt(9.59217 + 41.6808 * a + 17.7126 * a * a);
+
+  return vec3<f32>(1.0) - s * s;
+}
+
+/**
+ * How far the walk goes before it next scatters, drawn for one colour picked in proportion to what the path still
+ * carries of it. choice keeps those odds, which the next step weighs its distance by over all three colours, so each
+ * colour keeps its own mean free path and the estimate stays exact (spectral MIS, as Cycles' random walk does it).
+ */
+fn walkDistance(throughput: vec3<f32>, sigma: vec3<f32>, u: vec2<f32>, choice: ptr<function, vec3<f32>>) -> f32 {
+  let weights = max(throughput, vec3<f32>(0.0));
+  let total = weights.x + weights.y + weights.z;
+  let odds = select(vec3<f32>(1.0 / 3.0), weights / total, total > 0.0);
+  let chosen = select(select(sigma.z, sigma.y, u.x < odds.x + odds.y), sigma.x, u.x < odds.x);
+
+  *choice = odds;
+
+  return -log(max(1.0 - u.y, 1e-12)) / chosen;
+}
+
+/**
+ * Where a walk leaves the material: a white Lambert surface facing out, as Cycles leaves its random walk. The colour
+ * was taken inside, scattering by scattering, so nothing tints the light again on the way out.
+ */
+fn subsurfaceExit(m: u32, triangle: u32, bary: vec2<f32>, direction: vec3<f32>) -> Surface {
+  var surface: Surface;
+  // Turned to face against the reversed ray: outwards, the side the walk is leaving through.
+  let out = interpolatedNormal(m, triangle, bary, -direction);
+
+  surface.normal = out;
+  surface.facing = out;
+  surface.albedo = vec3<f32>(1.0);
+  surface.flags = MATERIAL_LIT;
+  surface.kind = KIND_LAMBERT;
+  surface.opacity = 1.0;
+  surface.alpha = 1.0;
+  surface.blending = BLEND_NORMAL;
+  surface.material = m;
+  surface.roughness = 1.0;
+  surface.ior = 1.5;
+  surface.specularF90 = 1.0;
+  surface.envMap = NO_TEXTURE;
+  surface.envMapIntensity = 1.0;
+  surface.gradientMap = NO_TEXTURE;
+
+  return surface;
+}
+
+/** A point inside a volume where the light scatters: the medium's phase function in place of a surface's lobes. */
+fn volumePoint(direction: vec3<f32>, albedo: vec3<f32>, anisotropy: f32) -> Surface {
+  var surface: Surface;
+
+  surface.normal = -direction;
+  surface.facing = -direction;
+  surface.albedo = albedo;
+  surface.flags = MATERIAL_LIT;
+  surface.kind = KIND_VOLUME;
+  surface.anisotropy = anisotropy;
+  surface.opacity = 1.0;
+  surface.alpha = 1.0;
+  surface.blending = BLEND_NORMAL;
+  surface.material = NO_MATERIAL;
+  surface.roughness = 1.0;
+  surface.ior = 1.0;
+  surface.specularF90 = 1.0;
+  surface.envMap = NO_TEXTURE;
+  surface.envMapIntensity = 1.0;
+  surface.gradientMap = NO_TEXTURE;
+
+  return surface;
+}
+
+/**
+ * The shading normal with the edges near it rounded, as Cycles' bevel node rounds them, by one probe a sample. A
+ * point is drawn on a disk of the bevel radius around the shaded point, across an axis picked along the normal half
+ * the time and along each tangent a quarter; a short ray along that axis through it finds the surface of the same
+ * material there, and that surface's normal turns this one by as much as it differs from the normal here. Over the
+ * samples a pixel takes, the normal blends from one face to the next within the radius of every edge, so a box reads
+ * as a machined one. A probe that finds nothing, or a normal turned away from the view, leaves the normal as it was.
+ */
+fn bevelNormal(m: u32, point: vec3<f32>, surface: Surface, view: vec3<f32>, radius: f32, u: vec2<f32>,
+  v: vec2<f32>) -> vec3<f32> {
+  let basis = orthonormalBasis(surface.facing);
+  var axis = basis[2];
+  var first = basis[0];
+  var second = basis[1];
+
+  if (v.x >= 0.5) {
+    axis = select(basis[1], basis[0], v.x < 0.75);
+    first = select(basis[2], basis[1], v.x < 0.75);
+    second = select(basis[0], basis[2], v.x < 0.75);
+  }
+
+  let reach = radius * sqrt(u.x);
+  let angle = 2.0 * PI * u.y;
+  let across = point + first * (reach * cos(angle)) + second * (reach * sin(angle));
+  // Along the axis one way or the other at random, from the far edge of the radius across it.
+  let way = select(-1.0, 1.0, v.y < 0.5);
+  let hit = traceScene(across - axis * (radius * way), axis * way, 2.0 * radius);
+
+  if (hit.triangle == NO_HIT || materialIndexOf(hit.triangle) != m) {
+    return surface.normal;
+  }
+
+  // The authored normal there, turned the way this side's own is: the facing normal is the authored one, or its reverse.
+  let there = authoredNormal(hit.triangle, vec2<f32>(hit.u, hit.v)) * select(-1.0, 1.0, surface.front);
+  let turned = normalize(surface.normal + there - surface.facing);
+
+  return select(surface.normal, turned, dot(turned, view) > 0.0 && all(turned == turned));
+}
+
 struct PathResult {
   radiance: vec3<f32>,
   alpha: f32,
@@ -206,10 +357,15 @@ struct PathResult {
   guideDistance: f32,
   roughness: f32,
   specularDistance: f32,
+  // How much of the first surface scatters light inside, which the denoiser relaxes its tests over.
+  subsurface: f32,
 };
 
 /** How many surfaces a path may pass through without scattering (cutouts, culled faces, glass) before it gives up. */
 const MAX_STEPS: u32 = 64u;
+
+/** Scatterings one walk inside a material may take; the roulette ends most walks well before. */
+const MAX_WALK: u32 = 128u;
 
 fn traceRadiance(
   rayOrigin: vec3<f32>, rayDirection: vec3<f32>, rayLength: f32, rng: ptr<function, PathSampler>) -> PathResult {
@@ -230,6 +386,9 @@ fn traceRadiance(
   var bounce = 0u;
   // The vertex the path last scattered at took all of its direct light by sampling lights: a toon surface.
   var lightsOwnDirect = false;
+  // Where the path last scattered and the normal the light tree weighed lights by there, for the heuristic's other half.
+  var lastPosition = rayOrigin;
+  var lastNormal = vec3<f32>(0.0);
   // That vertex's own environment map, which a ray escaping from it sees instead of the scene's.
   var escapeMap = NO_TEXTURE;
   var escapeIntensity = 1.0;
@@ -240,6 +399,12 @@ fn traceRadiance(
   var fogAmount = 0.0;
   var fogStart = vec3<f32>(0.0);
   var fogThroughput = vec3<f32>(0.0);
+  // The air between the camera and the first surface it sees: aerial perspective.
+  var hazed = false;
+  var hazeDistance = 0.0;
+  var hazeStart = vec3<f32>(0.0);
+  var hazeThroughput = vec3<f32>(0.0);
+  var hazeDirection = vec3<f32>(0.0);
   // A built-in material's hooks after <opaque_fragment> edit the colour the camera sees of it, which is everything the
   // path gathers from that surface on.
   var afterMaterial = NO_MATERIAL;
@@ -257,6 +422,7 @@ fn traceRadiance(
   var guideNormal = vec3<f32>(0.0);
   var guideDistance = 1e6;
   var guideRoughness = 1.0;
+  var guideSubsurface = 0.0;
   // Where the path first scattered, which decides which of the two signals the rest of it feeds.
   var split = false;
   var splitBase = vec3<f32>(0.0);
@@ -265,9 +431,101 @@ fn traceRadiance(
   var splitDiffuse = true;
   var waitingForSpecular = false;
   var specularDistance = 1e6;
+  // Inside a material that scatters light, between two scatterings: its extinction and single scattering albedo per
+  // colour, its anisotropy, the odds each colour had when the current step's distance was drawn, and the steps so far.
+  var inMedium = false;
+  var sigma = vec3<f32>(0.0);
+  var walkAlbedo = vec3<f32>(0.0);
+  var walkG = 0.0;
+  var walkOdds = vec3<f32>(0.0);
+  var walkSteps = 0u;
+  // Inside a volume: its density per unit of distance, what it keeps at each scattering and its anisotropy. A camera
+  // inside one starts there.
+  var inVolume = false;
+  var volumeDensity = 0.0;
+  var volumeAlbedo = vec3<f32>(0.0);
+  var volumeG = 0.0;
 
-  for (var step = 0u; step < MAX_STEPS; step = step + 1u) {
+  if (VOLUMES && frame.cameraVolume != NO_MATERIAL && frame.volumesEnabled != 0u) {
+    inVolume = true;
+    volumeDensity = materials[frame.cameraVolume].volume.w;
+    volumeAlbedo = materials[frame.cameraVolume].volume.rgb;
+    volumeG = materials[frame.cameraVolume].volumeAnisotropy;
+  }
+
+  for (var step = 0u; step < MAX_STEPS + MAX_WALK; step = step + 1u) {
     let hit = traceScene(origin, direction, limit);
+
+    // Every vertex draws the same dimensions in the same order, whatever the path then does with them.
+    let coverage = sample2D(rng);
+    let pick = sample2D(rng);
+    let lightSample = sample2D(rng);
+    let lobe = sample2D(rng);
+    let bounceSample = sample2D(rng);
+    var mediumSample = vec2<f32>(0.0);
+    var bevelSample = vec4<f32>(0.0);
+
+    if (VOLUMES) {
+      mediumSample = sample2D(rng);
+    }
+
+    if (BEVEL) {
+      bevelSample = vec4<f32>(sample2D(rng), sample2D(rng));
+    }
+
+    // The walk left the material here, and the surface below is its way out rather than what the material shows.
+    var exiting = false;
+
+    if (SUBSURFACE_WALK && inMedium) {
+      if (hit.triangle == NO_HIT) {
+        // Nothing within the drawn distance: the light scatters there, keeping each colour's share of the medium.
+        let travelled = exp(-sigma * limit);
+        let density = dot(walkOdds, sigma * travelled);
+
+        throughput = throughput * sigma * walkAlbedo * travelled / max(density, 1e-20);
+        walkSteps = walkSteps + 1u;
+
+        let survival = max3(throughput);
+
+        if (walkSteps >= MAX_WALK || survival <= 0.0) {
+          break;
+        }
+
+        if (survival < 0.2) {
+          if (coverage.x > survival) {
+            break;
+          }
+
+          throughput = throughput / survival;
+        }
+
+        origin = origin + direction * limit;
+        direction = sampleHenyeyGreenstein(direction, walkG, lobe);
+        limit = walkDistance(throughput, sigma, pick, &walkOdds);
+        continue;
+      }
+
+      // The walk reached the surface before scattering again: the chance of travelling that far, per colour.
+      let travelled = exp(-sigma * hit.distance);
+
+      throughput = throughput * travelled / max(dot(walkOdds, travelled), 1e-20);
+      inMedium = false;
+      exiting = true;
+    }
+
+    // Inside a volume, the medium may stop the ray before whatever it hit. The distance is drawn now that the segment's
+    // length is known, which a homogeneous medium allows; one grey density makes the weight of either outcome one.
+    var scatterAt = -1.0;
+
+    if (VOLUMES && inVolume && !exiting) {
+      let free = -log(max(1.0 - mediumSample.x, 1e-12)) / max(volumeDensity, 1e-12);
+
+      if (free < select(hit.distance, limit, hit.triangle == NO_HIT)) {
+        scatterAt = free;
+      }
+    }
+
+    let scattering = scatterAt >= 0.0;
 
     // The specular continuation's first hit: how far the reflection the denoiser filters actually is.
     if (waitingForSpecular) {
@@ -275,7 +533,7 @@ fn traceRadiance(
       waitingForSpecular = false;
     }
 
-    if (hit.triangle == NO_HIT) {
+    if (hit.triangle == NO_HIT && !scattering) {
       if (primary) {
         // A transparent background leaves the pixel empty, which its alpha says.
         if (frame.background.w != 2.0) {
@@ -299,18 +557,45 @@ fn traceRadiance(
       break;
     }
 
-    throughput = throughput * exp(-absorption * hit.distance);
+    let travel = select(hit.distance, scatterAt, scattering);
+
+    throughput = throughput * exp(-absorption * travel);
 
     let bary = vec2<f32>(hit.u, hit.v);
-    let point = origin + direction * hit.distance;
-    let m = materialIndexOf(hit.triangle);
+    let point = origin + direction * travel;
+    var m = 0u;
 
-    // Every vertex draws the same dimensions in the same order, whatever the path then does with them.
-    let coverage = sample2D(rng);
-    let pick = sample2D(rng);
-    let lightSample = sample2D(rng);
-    let lobe = sample2D(rng);
-    let bounceSample = sample2D(rng);
+    if (!scattering) {
+      m = materialIndexOf(hit.triangle);
+    }
+
+    var surface: Surface;
+
+    if (SUBSURFACE_WALK && exiting) {
+      surface = subsurfaceExit(m, hit.triangle, bary, direction);
+      // Seen from outside, along its normal: the side the light leaves through.
+      direction = -surface.normal;
+    } else if (VOLUMES && scattering) {
+      surface = volumePoint(direction, volumeAlbedo, volumeG);
+    } else {
+
+    // A volume's boundary is not a surface: the ray goes in or out, and the medium is what it meets.
+    if (VOLUMES && (materials[m].flags & MATERIAL_VOLUME) != 0u) {
+      if (dot(authoredNormal(hit.triangle, bary), direction) < 0.0) {
+        if (frame.volumesEnabled != 0u) {
+          inVolume = true;
+          volumeDensity = materials[m].volume.w;
+          volumeAlbedo = materials[m].volume.rgb;
+          volumeG = materials[m].volumeAnisotropy;
+        }
+      } else {
+        inVolume = false;
+      }
+
+      origin = point + direction * RAY_EPSILON;
+      limit = select(1e30, limit - hit.distance, straight);
+      continue;
+    }
 
     // Three culls the side a material does not draw. Only the camera's rays are culled: a mesh still casts shadows and
     // holds light in from both sides.
@@ -344,7 +629,12 @@ fn traceRadiance(
       }
     }
 
-    let surface = resolveSurfaceFrom(hit.triangle, bary, direction, base);
+    surface = resolveSurfaceFrom(hit.triangle, bary, direction, base);
+
+    if (BEVEL && frame.bevelEnabled != 0u && materials[m].bevel > 0.0) {
+      surface.normal = bevelNormal(m, point, surface, -direction, materials[m].bevel, bevelSample.xy, bevelSample.zw);
+    }
+    }
 
     // Blending other than normal: the surface adds its light to, or filters, whatever is behind it, and the path goes on.
     if (surface.blending == BLEND_ADDITIVE || surface.blending == BLEND_MULTIPLY || surface.blending == BLEND_SUBTRACTIVE) {
@@ -358,7 +648,7 @@ fn traceRadiance(
         if ((surface.flags & MATERIAL_LIT) != 0u) {
           var unused: vec3<f32>;
           added = added + directLight(surface, point + surface.normal * RAY_EPSILON, -direction, pick.x, lightSample, rng,
-            &unused);
+            &unused, select(0.0, volumeDensity, inVolume));
         }
 
         radiance = radiance + throughput * added * strength;
@@ -410,6 +700,7 @@ fn traceRadiance(
       guideNormal = surface.normal;
       guideDistance = length(point - rayOrigin);
       guideRoughness = surface.roughness;
+      guideSubsurface = select(0.0, surface.subsurface, SUBSURFACE_WALK);
 
       if (surface.kind == KIND_PHONG) {
         // Phong's exponent as the roughness of the GGX lobe that is about as wide.
@@ -420,7 +711,7 @@ fn traceRadiance(
     if (primary) {
       alpha = 1.0;
 
-      if (!fogged && afterMaterial == NO_MATERIAL && materials[m].afterProgram != NO_PROGRAM) {
+      if (!scattering && !fogged && afterMaterial == NO_MATERIAL && materials[m].afterProgram != NO_PROGRAM) {
         afterMaterial = m;
         afterTriangle = hit.triangle;
         afterBary = bary;
@@ -444,11 +735,20 @@ fn traceRadiance(
         }
       }
 
+      if (!hazed && frame.atmosphereColor.w > 0.0) {
+        hazed = true;
+        // From the eye, where the camera ray only starts on the near plane; an orthographic view has no eye.
+        hazeDistance = length(point - select(frame.cameraToWorld[3].xyz, rayOrigin, frame.cameraKind == 1u));
+        hazeStart = radiance;
+        hazeThroughput = throughput;
+        hazeDirection = direction;
+      }
+
       radiance = radiance + throughput * surface.lightMap;
     }
 
     if (any(surface.emissive > vec3<f32>(0.0))) {
-      let contribution = throughput * surface.emissive * emissionWeight(hit, direction, bsdfPdf, lightsOwnDirect);
+      let contribution = throughput * surface.emissive * emissionWeight(hit, direction, bsdfPdf, lightsOwnDirect, lastPosition, lastNormal);
 
       // Seen by the camera or one bounce away this is direct light and stays exact; deeper it may be clamped.
       radiance = radiance + select(contribution, clampIndirect(contribution), bounce > 1u);
@@ -535,15 +835,56 @@ fn traceRadiance(
         bounce = bounce + 1u;
       }
     } else {
+      // Light that enters the material: a random walk inside it from here, in place of the share of the diffuse
+      // layer that scatters inside. Chosen by chance, so neither branch is weighted against the other.
+      var chance = 0.0;
+
+      if (SUBSURFACE_WALK) {
+        chance = subsurfaceChance(surface, view);
+      }
+
+      if (SUBSURFACE_WALK && lobe.x < chance) {
+        let medium = materials[surface.material].subsurface;
+
+        throughput = throughput
+          * ((1.0 - surface.metalness) * surface.subsurface * coatTransmittance(surface, view) / chance);
+        sigma = vec3<f32>(1.0) / max(medium.rgb, vec3<f32>(1e-6));
+        walkAlbedo = subsurfaceAlbedo(surface.albedo);
+        walkG = materials[surface.material].subsurfaceAnisotropy;
+        walkSteps = 0u;
+
+        // Light that scattered inside is diffuse light, which is the signal it feeds.
+        if (!split) {
+          split = true;
+          splitBase = radiance;
+          splitDiffuse = true;
+        }
+
+        inMedium = true;
+        primary = false;
+        straight = false;
+        bsdfPdf = 0.0;
+        lightsOwnDirect = false;
+        escapeMap = NO_TEXTURE;
+        bounce = bounce + 1u;
+        direction = cosineDirection(-surface.facing, bounceSample);
+        origin = point - surface.facing * RAY_EPSILON;
+        limit = walkDistance(throughput, sigma, pick, &walkOdds);
+        continue;
+      }
+
+      throughput = throughput / (1.0 - chance);
+
       let position = point + surface.normal * RAY_EPSILON;
       var directDiffuse: vec3<f32>;
-      let direct = throughput * directLight(surface, position, view, pick.x, lightSample, rng, &directDiffuse);
+      let direct = throughput * directLight(surface, position, view, pick.x, lightSample, rng, &directDiffuse,
+        select(0.0, volumeDensity, inVolume));
       let added = select(direct, clampIndirect(direct), bounce > 0u);
       let before = radiance;
 
       radiance = radiance + added;
 
-      let scattered = sampleBsdf(surface, view, lobe.x, bounceSample);
+      let scattered = sampleBsdf(surface, view, (lobe.x - chance) / (1.0 - chance), bounceSample);
 
       // The first scatter splits the path: its direct light by lobe, and everything after it by the lobe it chose.
       if (!split) {
@@ -562,6 +903,8 @@ fn traceRadiance(
 
       throughput = throughput * scattered.weight;
       bsdfPdf = scattered.pdf;
+      lastPosition = position;
+      lastNormal = treeNormal(surface);
       lightsOwnDirect = surface.kind == KIND_TOON;
       escapeMap = surface.envMap;
       escapeIntensity = surface.envMapIntensity;
@@ -579,7 +922,7 @@ fn traceRadiance(
       break;
     }
 
-    if (survival < 0.2) {
+    if (survival < frame.rouletteThreshold && bounce >= frame.rouletteStart) {
       if (pick.y > survival) {
         break;
       }
@@ -623,6 +966,21 @@ fn traceRadiance(
     diffuse = fogStart + (diffuse - fogStart) * (1.0 - fogAmount) + fog;
   }
 
+  // The air takes its share of what lies behind it and adds the light it scatters towards the camera; the background,
+  // which already is the sky, is left as it is.
+  if (hazed) {
+    let through = exp(-frame.atmosphereExtinction.rgb * hazeDistance);
+    // The sun lights the air by the phase function of what fills it: Rayleigh's for clean air, a forward lobe for haze
+    // (Henyey-Greenstein at 0.76), which is what makes the air glow towards the sun.
+    let turn = dot(hazeDirection, frame.atmosphereSun.xyz);
+    let phase = mix(3.0 / (16.0 * PI) * (1.0 + turn * turn), henyeyGreenstein(turn, 0.76), frame.atmosphereExtinction.w);
+    let air = frame.atmosphereColor.rgb + frame.atmosphereSunColor.rgb * phase;
+    let glow = air * hazeThroughput * (vec3<f32>(1.0) - through);
+
+    radiance = hazeStart + (radiance - hazeStart) * through + glow;
+    diffuse = hazeStart + (diffuse - hazeStart) * through + glow;
+  }
+
   var result: PathResult;
   result.radiance = radiance;
   result.alpha = alpha;
@@ -634,6 +992,7 @@ fn traceRadiance(
   result.guideDistance = guideDistance;
   result.roughness = guideRoughness;
   result.specularDistance = specularDistance;
+  result.subsurface = guideSubsurface;
 
   return result;
 }
@@ -659,7 +1018,17 @@ fn lensPoint(u: vec2<f32>) -> vec2<f32> {
  */
 fn cameraRay(pixel: vec2<u32>, jitter: vec2<f32>, lens: vec2<f32>) -> array<vec4<f32>, 2> {
   let uv = (vec2<f32>(pixel) + jitter) / vec2<f32>(frame.resolution);
-  let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  var ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+  // A lens's radial distortion: the pixel sees the scene at a radius scaled by the square of its own, which is one at
+  // the corners. Positive reaches further out at the edges (barrel), negative less far (pincushion).
+  if (frame.lensDistortion != 0.0) {
+    let aspect = f32(frame.resolution.x) / f32(frame.resolution.y);
+    let radius2 = (ndc.x * ndc.x * aspect * aspect + ndc.y * ndc.y) / (aspect * aspect + 1.0);
+
+    ndc = ndc * (1.0 + frame.lensDistortion * radius2);
+  }
+
   let ray = ndcRay(ndc);
 
   if (frame.lens.x <= 0.0 || frame.cameraKind == 1u) {
@@ -979,6 +1348,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var distanceSum = 0.0;
   var roughnessSum = 0.0;
   var specularDistanceSum = 0.0;
+  var subsurfaceSum = 0.0;
 
   for (var s = 0u; s < frame.sampleCount; s = s + 1u) {
     var rng = makeSampler(pixel, frame.sampleIndex + s);
@@ -1012,6 +1382,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     distanceSum = distanceSum + result.guideDistance;
     roughnessSum = roughnessSum + result.roughness;
     specularDistanceSum = specularDistanceSum + result.specularDistance;
+    subsurfaceSum = subsurfaceSum + result.subsurface;
 
     alpha = alpha + sampleAlpha;
     depthSum = depthSum + windowDepth(ray[0].xyz + ray[1].xyz * min(result.depth, 1e20), result.depth);
@@ -1026,7 +1397,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   accumulation[2u * pc + index] = accumulation[2u * pc + index] + vec4<f32>(diffuseAlbedoSum, roughnessSum);
   accumulation[3u * pc + index] = accumulation[3u * pc + index] + vec4<f32>(normalSum, distanceSum);
   accumulation[4u * pc + index] = accumulation[4u * pc + index] + vec4<f32>(diffuseSum, specularDistanceSum);
-  accumulation[5u * pc + index] = accumulation[5u * pc + index] + vec4<f32>(specularAlbedoSum, 0.0);
+  accumulation[5u * pc + index] = accumulation[5u * pc + index] + vec4<f32>(specularAlbedoSum, subsurfaceSum);
   // This row still has work: every pixel that traced writes the same value, so the race is harmless.
   accumulation[6u * pc + pixel.y] = vec4<f32>(1.0);
 }

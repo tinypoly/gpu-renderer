@@ -53,6 +53,10 @@ export interface SceneBuffers {
   lightTree: number;
   lightLeaves: number;
   lightList: number;
+  /** The windows the sky is sampled through: see lights.ts. */
+  portals: number;
+  portalCount: number;
+  portalList: number;
   /** Radiance an ambient or hemisphere light adds, which no shadow ray can reach. */
   ambient: PackedLights["ambient"];
   /** Where the surrounding image and its distributions ended up, for the frame uniform. */
@@ -208,6 +212,9 @@ export function uploadScene(
     lightTree: lights.treeAt,
     lightLeaves: lights.leavesAt,
     lightList: lights.listAt,
+    portals: lights.portalTreeAt,
+    portalCount: lights.portalCount,
+    portalList: lights.portalListAt,
     ambient: lights.ambient,
     environment: {
       texture: environment ? textures.indexOf.get(environment.texture.id) ?? NO_TEXTURE : NO_TEXTURE,

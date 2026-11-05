@@ -42,7 +42,9 @@ fn backgroundRadiance(direction: vec3<f32>) -> vec3<f32> {
     return frame.background.rgb;
   }
 
-  // A procedural sky paints the background without the strength it lights with, and its foreground over it.
+  // A procedural sky paints the background with the strength it lights with, and its foreground over it. The CPU
+  // renderer leaves that strength out of what the camera sees, which a renderer exposing for the light cannot: the sky
+  // that lights a wall five times brighter than itself would show as a dark band behind it.
   if (frame.skyProgram != NO_PROGRAM || frame.skyIntensity > 0.0) {
     if (frame.skyBackground == 0u) {
       return vec3<f32>(0.0);
@@ -54,10 +56,10 @@ fn backgroundRadiance(direction: vec3<f32>) -> vec3<f32> {
       input.direction = direction;
       input.diffuseColor = vec4<f32>(1.0);
 
-      return runProgram(frame.skyProgram, input).color.rgb;
+      return runProgram(frame.skyProgram, input).color.rgb * frame.skyIntensity;
     }
 
-    return environmentRadiance(direction) / frame.skyIntensity;
+    return environmentRadiance(direction);
   }
 
   return environmentRadiance(direction);
@@ -67,7 +69,7 @@ fn backgroundRadiance(direction: vec3<f32>) -> vec3<f32> {
  * How much of the sky a bounce ray that escaped keeps. Direct sampling aims at the bright parts of an image too, so the
  * two share it; when direct sampling took all of it, as it does from a toon surface, the bounce keeps none.
  */
-fn escapeWeight(direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect: bool) -> f32 {
+fn escapeWeight(direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect: bool, scatteredAt: vec3<f32>) -> f32 {
   if (frame.environmentPick <= 0.0) {
     return 1.0;
   }
@@ -80,7 +82,8 @@ fn escapeWeight(direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect: bool) -> f3
     return 1.0;
   }
 
-  return misWeight(bsdfPdf, frame.environmentPick * environmentPdf(direction));
+  // The sky was aimed at from the vertex the bounce left, through its windows as well when that vertex is inside.
+  return misWeight(bsdfPdf, frame.environmentPick * skyPdf(scatteredAt, direction, portalChance(scatteredAt)));
 }
 
 /** Scales a contribution down to the luminance ceiling, which trades a little bias for the fireflies it removes. */
@@ -548,7 +551,7 @@ fn traceRadiance(
         if (escapeMap != NO_TEXTURE) {
           sky = sky + sampleEquirect(escapeMap, direction).rgb * escapeIntensity;
         } else {
-          sky = sky + environmentRadiance(direction) * escapeWeight(direction, bsdfPdf, lightsOwnDirect);
+          sky = sky + environmentRadiance(direction) * escapeWeight(direction, bsdfPdf, lightsOwnDirect, lastPosition);
         }
 
         let contribution = throughput * sky;
@@ -703,8 +706,14 @@ fn traceRadiance(
       depth = length(point - rayOrigin);
     }
 
+    // A window the camera ray goes straight through is not what the camera sees: what lies behind it is, so the
+    // denoiser takes its guides there, and the air its distance. Glass has next to no diffuse colour and one flat
+    // normal, which would leave everything seen through it unfiltered. The window's own guides stand until then, for
+    // the paths that reflect off it instead.
+    let window = surface.transmission > 0.0 && surface.thickness <= 0.0;
+
     if (straight && !guided) {
-      guided = true;
+      guided = !window;
       diffuseAlbedo = diffuseGuide(surface);
       specularAlbedoGuide = select(specularAlbedo(surface, -direction), vec3<f32>(1.0), (surface.flags & MATERIAL_LIT) == 0u);
       guideNormal = surface.normal;
@@ -745,7 +754,7 @@ fn traceRadiance(
         }
       }
 
-      if (!hazed && frame.atmosphereColor.w > 0.0) {
+      if (!hazed && !window && frame.atmosphereColor.w > 0.0) {
         hazed = true;
         // From the eye, where the camera ray only starts on the near plane; an orthographic view has no eye.
         hazeDistance = length(point - select(frame.cameraToWorld[3].xyz, rayOrigin, frame.cameraKind == 1u));
@@ -765,7 +774,11 @@ fn traceRadiance(
     }
 
     // Three does not light a basic, points, line or sprite material, so nothing carries on from one.
-    if ((surface.flags & MATERIAL_LIT) == 0u || bounce >= frame.bounces) {
+    // Past the last bounce a path still crosses a window straight on, which scatters nothing, to find the sky behind
+    // it: cut there, the daylight a room gets through its glazing would go missing from every last bounce.
+    let spent = bounce >= frame.bounces;
+
+    if ((surface.flags & MATERIAL_LIT) == 0u || (spent && !window)) {
       break;
     }
 
@@ -788,8 +801,105 @@ fn traceRadiance(
     var nextOrigin = point + direction * RAY_EPSILON;
 
     // Transmission replaces part of the diffuse layer, so that share of the time the surface is a dielectric instead.
-    // Choosing it in proportion to its weight leaves both halves unweighted, and only the opaque half aims at a light.
-    if (surface.transmission > 0.0 && lobe.y < surface.transmission) {
+    // Choosing it in proportion to its weight leaves both halves unweighted. The opaque half aims at a light; on a
+    // window that lets only part of the light through, it does so on every path, weighed by its share, rather than on
+    // the paths that chose it: a sunlit pane seen against a dim room would otherwise be lit on one path in five and
+    // dark on the rest, which is the grain glass shows.
+    let dielectric = surface.transmission > 0.0 && lobe.y < surface.transmission;
+    let windowLight = window && !spent && surface.transmission < 1.0 && surface.subsurface <= 0.0;
+
+    if (!dielectric || windowLight) {
+      var chance = 0.0;
+
+      if (!dielectric) {
+        // Light that enters the material: a random walk inside it from here, in place of the share of the diffuse
+        // layer that scatters inside. Chosen by chance, so neither branch is weighted against the other.
+        // The window's opaque share is a surface like any other, which a spent path stops at.
+        if (spent) {
+          break;
+        }
+
+        if (SUBSURFACE_WALK) {
+          chance = subsurfaceChance(surface, view);
+        }
+
+        if (SUBSURFACE_WALK && lobe.x < chance) {
+          let medium = materials[surface.material].subsurface;
+
+          throughput = throughput
+            * ((1.0 - surface.metalness) * surface.subsurface * coatTransmittance(surface, view) / chance);
+          sigma = vec3<f32>(1.0) / max(medium.rgb, vec3<f32>(1e-6));
+          walkAlbedo = subsurfaceAlbedo(surface.albedo);
+          walkG = materials[surface.material].subsurfaceAnisotropy;
+          walkSteps = 0u;
+
+          // Light that scattered inside is diffuse light, which is the signal it feeds.
+          if (!split) {
+            split = true;
+            splitBase = radiance;
+            splitDiffuse = true;
+          }
+
+          inMedium = true;
+          primary = false;
+          straight = false;
+          bsdfPdf = 0.0;
+          lightsOwnDirect = false;
+          escapeMap = NO_TEXTURE;
+          bounce = bounce + 1u;
+          direction = cosineDirection(-surface.facing, bounceSample);
+          origin = point - surface.facing * RAY_EPSILON;
+          limit = walkDistance(throughput, sigma, pick, &walkOdds);
+          continue;
+        }
+
+        throughput = throughput / (1.0 - chance);
+      }
+
+      let position = point + surface.normal * RAY_EPSILON;
+      var directDiffuse: vec3<f32>;
+      let lit = select(throughput, throughput * (1.0 - surface.transmission), windowLight);
+      let direct = lit * directLight(surface, position, view, pick.x, lightSample, rng, &directDiffuse,
+        select(0.0, volumeDensity, inVolume));
+      let added = select(direct, clampIndirect(direct), bounce > 0u);
+      let before = radiance;
+
+      radiance = radiance + added;
+
+      if (!dielectric) {
+        let scattered = sampleBsdf(surface, view, (lobe.x - chance) / (1.0 - chance), bounceSample);
+
+        // The first scatter splits the path: its direct light by lobe, and everything after it by the lobe it chose.
+        if (!split) {
+          split = true;
+          splitBase = before;
+          splitDirect = added;
+          splitDirectDiffuse = lit * directDiffuse * select(1.0, luminanceOf(added) / max(luminanceOf(direct), 1e-20),
+            bounce > 0u);
+          splitDiffuse = !scattered.valid || scattered.diffuse;
+          waitingForSpecular = scattered.valid && !scattered.diffuse;
+        }
+
+        if (!scattered.valid) {
+          break;
+        }
+
+        throughput = throughput * scattered.weight;
+        bsdfPdf = scattered.pdf;
+        lastPosition = position;
+        lastNormal = treeNormal(surface);
+        lightsOwnDirect = surface.kind == KIND_TOON;
+        escapeMap = surface.envMap;
+        escapeIntensity = surface.envMapIntensity;
+        next = scattered.direction;
+        nextOrigin = position;
+        primary = false;
+        straight = false;
+        bounce = bounce + 1u;
+      }
+    }
+
+    if (dielectric) {
       var ior = surface.ior;
 
       // Three's dispersion: each colour refracts with its own index, spread around the material's. The path picks one
@@ -809,7 +919,8 @@ fn traceRadiance(
 
       let crossing = sampleDielectric(surface, view, ior, lobe.y / surface.transmission, bounceSample);
 
-      if (!crossing.valid) {
+      // A reflection off the glass is a scattering, which a spent path no longer has.
+      if (!crossing.valid || (spent && !crossing.straight)) {
         break;
       }
 
@@ -844,85 +955,6 @@ fn traceRadiance(
       if (!primary) {
         bounce = bounce + 1u;
       }
-    } else {
-      // Light that enters the material: a random walk inside it from here, in place of the share of the diffuse
-      // layer that scatters inside. Chosen by chance, so neither branch is weighted against the other.
-      var chance = 0.0;
-
-      if (SUBSURFACE_WALK) {
-        chance = subsurfaceChance(surface, view);
-      }
-
-      if (SUBSURFACE_WALK && lobe.x < chance) {
-        let medium = materials[surface.material].subsurface;
-
-        throughput = throughput
-          * ((1.0 - surface.metalness) * surface.subsurface * coatTransmittance(surface, view) / chance);
-        sigma = vec3<f32>(1.0) / max(medium.rgb, vec3<f32>(1e-6));
-        walkAlbedo = subsurfaceAlbedo(surface.albedo);
-        walkG = materials[surface.material].subsurfaceAnisotropy;
-        walkSteps = 0u;
-
-        // Light that scattered inside is diffuse light, which is the signal it feeds.
-        if (!split) {
-          split = true;
-          splitBase = radiance;
-          splitDiffuse = true;
-        }
-
-        inMedium = true;
-        primary = false;
-        straight = false;
-        bsdfPdf = 0.0;
-        lightsOwnDirect = false;
-        escapeMap = NO_TEXTURE;
-        bounce = bounce + 1u;
-        direction = cosineDirection(-surface.facing, bounceSample);
-        origin = point - surface.facing * RAY_EPSILON;
-        limit = walkDistance(throughput, sigma, pick, &walkOdds);
-        continue;
-      }
-
-      throughput = throughput / (1.0 - chance);
-
-      let position = point + surface.normal * RAY_EPSILON;
-      var directDiffuse: vec3<f32>;
-      let direct = throughput * directLight(surface, position, view, pick.x, lightSample, rng, &directDiffuse,
-        select(0.0, volumeDensity, inVolume));
-      let added = select(direct, clampIndirect(direct), bounce > 0u);
-      let before = radiance;
-
-      radiance = radiance + added;
-
-      let scattered = sampleBsdf(surface, view, (lobe.x - chance) / (1.0 - chance), bounceSample);
-
-      // The first scatter splits the path: its direct light by lobe, and everything after it by the lobe it chose.
-      if (!split) {
-        split = true;
-        splitBase = before;
-        splitDirect = added;
-        splitDirectDiffuse = throughput * directDiffuse * select(1.0, luminanceOf(added) / max(luminanceOf(direct), 1e-20),
-          bounce > 0u);
-        splitDiffuse = !scattered.valid || scattered.diffuse;
-        waitingForSpecular = scattered.valid && !scattered.diffuse;
-      }
-
-      if (!scattered.valid) {
-        break;
-      }
-
-      throughput = throughput * scattered.weight;
-      bsdfPdf = scattered.pdf;
-      lastPosition = position;
-      lastNormal = treeNormal(surface);
-      lightsOwnDirect = surface.kind == KIND_TOON;
-      escapeMap = surface.envMap;
-      escapeIntensity = surface.envMapIntensity;
-      next = scattered.direction;
-      nextOrigin = position;
-      primary = false;
-      straight = false;
-      bounce = bounce + 1u;
     }
 
     // A path that carries almost nothing is ended by chance rather than by a cut, which keeps the estimate unbiased.

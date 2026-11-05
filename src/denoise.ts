@@ -1,10 +1,20 @@
 import { createShaderModule } from "./shaderModule.js";
 
+/**
+ * Which denoiser filters the image: `"oidn"`, Intel's Open Image Denoise, a neural network that keeps texture and fine
+ * detail, or `"svgf"`, the edge-aware wavelet filter, faster and with the controls below.
+ */
+export type DenoiserAlgorithm = "oidn" | "svgf";
+
 /** How the denoiser filters. Every field is optional where it is taken, and falls back to `DEFAULT_DENOISER`. */
 export interface DenoiserSettings {
+  /** The denoiser that runs; OIDN falls back to SVGF where its network cannot load. */
+  algorithm: DenoiserAlgorithm;
+  /** Where OIDN's weights are fetched from; empty takes the ones shipped with the package. */
+  oidnWeights: string;
   /** How much of the filtered image replaces the traced one, from 0 (none) to 1. */
   strength: number;
-  /** Wavelet passes, 1 to 5: how far the filter reaches, from 2 to 62 pixels. */
+  /** SVGF only from here: wavelet passes, 1 to 5, how far the filter reaches, from 2 to 62 pixels. */
   passes: number;
   /**
    * How large a luminance difference between two pixels still counts as noise, in standard deviations of the pixel's
@@ -28,6 +38,8 @@ export interface DenoiserSettings {
 }
 
 export const DEFAULT_DENOISER: Readonly<DenoiserSettings> = Object.freeze({
+  algorithm: "oidn",
+  oidnWeights: "",
   strength: 1,
   passes: 3,
   edge: 2,
@@ -42,6 +54,8 @@ export function mergeDenoiser(base: DenoiserSettings, input: Partial<DenoiserSet
   const merged = { ...base, ...Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined)) };
 
   return {
+    algorithm: merged.algorithm === "svgf" ? "svgf" : "oidn",
+    oidnWeights: typeof merged.oidnWeights === "string" ? merged.oidnWeights : "",
     strength: Math.min(1, Math.max(0, Number(merged.strength) || 0)),
     passes: Math.min(5, Math.max(1, Math.round(Number(merged.passes) || 1))),
     edge: Math.max(0.01, Number(merged.edge) || DEFAULT_DENOISER.edge),

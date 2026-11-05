@@ -117,7 +117,18 @@ only the rows that still have work, until the budget is spent or a pixel reaches
 no pixel can stop, so those passes take up to four paths a dispatch and read and write the accumulation once for them. Stopping on the
 samples themselves is a slight bias, the usual price of adaptive sampling.
 
-**The denoiser is the spatial filter of SVGF, with diffuse and specular light apart.** The temporal half of SVGF, and of
+**OIDN is the default denoiser, and SVGF the one it falls back to.** A hand-made filter can only smooth what its guides
+say is flat, so at a few samples per pixel it either leaves grain or blurs texture; OIDN's network learned what a
+converged path traced image looks like, and at sixteen samples it leaves the example scenes about as clean as SVGF leaves
+them at two hundred. It runs through oidn-webgpu on the renderer's own device, buffer to buffer: a meter takes the mean
+of the logarithms of the luminance, as the lens pass does, and the colour is handed over scaled to middle grey, since the
+network was trained on exposed images and its CPU path exposes them itself; the albedo is the diffuse and the specular
+one together, so a mirror is not taken for black, and the background gives its own colour as albedo. The output is
+scaled back and mixed with the traced image by `strength`. The network takes longer than a pass, so while a frame
+traces it runs beside the bands, one image at a time, and the canvas takes each result as it lands. The device asks for
+`shader-f16` where the adapter has it, which the network runs about twice as fast with.
+
+**The SVGF denoiser is SVGF's spatial filter alone, with diffuse and specular light apart.** The temporal half of SVGF, and of
 NVIDIA's NRD, has nothing to do here: the image does not move while it converges, and the accumulation buffer already
 is a perfect history. What carries over from NRD's RELAX and REBLUR is splitting the signal.
 
@@ -190,6 +201,22 @@ a leaf, gives the chance a bounce ray's light was picked from the vertex it left
 directional lights and the environment follow, picked as before by the irradiance they deliver; the share between the
 two groups is what the old distribution gave them. The nodes live in the texture buffer's extra words, sixteen a node,
 because the kernel's eight storage bindings are taken.
+
+**Inside a room, the sky is also sampled through its windows.** From a point indoors almost every direction drawn by
+the sky's brightness hits a wall, and daylight arrives through glass as noise. The triangles of every thin transmissive
+material are portals, as in Cycles: from a point with something above it, a probe ray straight up, half of the sky's
+samples go through a window, the other half by brightness. The windows sit in a tree of their own, built as the light
+tree is, with each window's area as its power and no orientation, so a point aims at the windows near it rather than at
+every one in the building alike. The density is the mixture of both, the portal half summed over every window triangle
+the direction crosses, which the ray finds by walking that tree by its boxes, and a bounce ray that
+escapes is weighed against the same mixture from the vertex it left, which asks the probe again: the choice depends on
+the point alone, so the heuristic stays exact. Outdoors the probe misses and nothing changes. `PORTALS` is compiled in
+only for a scene with thin glass.
+
+**Automatic exposure is a meter on the device.** One workgroup of the lens pass reads a 64 by 36 grid of the image,
+weighs it towards the centre and takes the mean of the logarithms of its luminance, so a bright window or the sky cannot
+darken the rest; the exposure that brings that mean to eighteen percent grey multiplies the graded image, and nothing is
+read back to the page. The compensation goes through the presentation pass as the exposure did.
 
 **Bevel rounds edges at shading time, by one probe a sample.** As Cycles' bevel node, but stochastic: a point on a disk
 of the radius around the shaded point, across an axis picked along the normal half the time and each tangent a
@@ -321,8 +348,9 @@ gradient and the image. A procedural sky's shader is translated like any other a
 panorama, one invocation per texel, which is read back for the luminance distribution; the CPU renderer's interpreter
 bakes it only when the shader does not translate. The bake is kept while the shader and its uniforms stay the same,
 so a scene that changes anything else does not bake the sky again. The sky lights with its own `intensity`,
-ignores the rotation so its sun stays with its light, and paints the background without its intensity, with its
-`foregroundShader` evaluated per pixel over it.
+ignores the rotation so its sun stays with its light, and paints the background with that same intensity, unlike
+the CPU renderer: the camera sees the sky that lights the scene, which an exposure metered on the light needs. Its
+`foregroundShader` is evaluated per pixel over it.
 
 `settings.background` decides what the camera sees where nothing is in the way: the environment, a colour, or nothing,
 in which case the image's alpha is the coverage of every pixel and the canvas is configured premultiplied. The

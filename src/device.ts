@@ -63,10 +63,19 @@ export async function requestRenderDevice(options: RenderDeviceOptions = {}): Pr
   if (!adapter)
     throw new Error("GPU renderer: no WebGPU adapter was available.");
 
+  // Half floats and the adapter's widest workgroups are what the OIDN denoiser runs fastest with; the path tracer
+  // needs neither, and an adapter without them still gets a device.
+  const requiredFeatures: GPUFeatureName[] = adapter.features.has("shader-f16") ? ["shader-f16"] : [];
+
   const device = await adapter.requestDevice({
+    requiredFeatures,
     requiredLimits: {
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxBufferSize: adapter.limits.maxBufferSize,
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension,
+      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
     },
   });
 

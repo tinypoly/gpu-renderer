@@ -14,6 +14,9 @@ importers:
       naga-wasm:
         specifier: 30.2.0
         version: 30.2.0
+      oidn-webgpu:
+        specifier: 0.6.0
+        version: 0.6.0
     devDependencies:
       '@eslint/js':
         specifier: ^10.0.1
@@ -295,6 +298,9 @@ packages:
 
   '@oxc-project/types@0.150.0':
     resolution: {integrity: sha512-rDS5/31E9HfPl/CIzGrn0DOlvBbXFseQ5URJ9sYMfstbKLD/c6Gm9vmRzRGDdAXyOIL4zmO37lc9RIwYqVruZw==}
+
+  '@petamoriken/float16@3.9.3':
+    resolution: {integrity: sha512-8awtpHXCx/bNpFt4mt2xdkgtgVvKqty8VbjHI/WWWQuEw+KLzFot3f4+LkQY9YmOtq7A5GdOnqoIC8Pdygjk2g==}
 
   '@rolldown/binding-android-arm-eabi@1.2.9':
     resolution: {integrity: sha512-tNISae1QEf/vkb3xkRcjV5SEdzPE97We5IVaa2Z8jSszQPZ8U60B/YCYpw4QI7VidYsBtKavczXf+DyDs9WGxw==}
@@ -845,6 +851,9 @@ packages:
     resolution: {integrity: sha512-XrsrhT5sybtKI6wakr2SPOlGZWWYbUXZ7a0jT8/QOeAPau+1X/bSegNe5YR75oJmEZQbKningirmGOEJCIk61Q==}
     engines: {node: '>=12.20.0'}
 
+  oidn-webgpu@0.6.0:
+    resolution: {integrity: sha512-d7pxvTvaJhzcKaVxKCueBLOmeinaTbNuf2qiXIV29LZgoaXpkZ86M9V9PplOnltPqTUfZ0MAx4Bn0Z+sPVfFUw==}
+
   optionator@0.9.4:
     resolution: {integrity: sha512-6IpQ7mKUxRcZNLIObR0hz7lxsapSSIYNZJwXPGeF0mTVqGKFIXj1DQcMoT22S3ROcLyY/rz0PWaWZ9ayWmad9g==}
     engines: {node: '>= 0.8.0'}
@@ -1230,6 +1239,8 @@ snapshots:
   '@keyv/serialize@1.1.1': {}
 
   '@oxc-project/types@0.150.0': {}
+
+  '@petamoriken/float16@3.9.3': {}
 
   '@rolldown/binding-android-arm-eabi@1.2.9':
     optional: true
@@ -1763,6 +1774,10 @@ snapshots:
   natural-compare@1.4.0: {}
 
   obug@2.2.1: {}
+
+  oidn-webgpu@0.6.0:
+    dependencies:
+      '@petamoriken/float16': 3.9.3
 
   optionator@0.9.4:
     dependencies:

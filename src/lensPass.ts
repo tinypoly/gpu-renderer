@@ -27,6 +27,8 @@ export interface LensEffects {
   glareAngle: number;
   /** A linear sRGB matrix, row by row, or `null` for a neutral white balance. */
   whiteBalance: number[] | null;
+  /** Whether the image is metered and exposed to middle grey before the display transform. */
+  autoExposure: boolean;
 }
 
 /** The lens effects these settings ask for, or `null` when they ask for none and the pass can be skipped. */
@@ -38,7 +40,9 @@ export function lensEffects(settings: GpuRenderSettings): LensEffects | null {
   const neutral = !Number.isFinite(camera.whiteBalance) || camera.whiteBalance === NEUTRAL_WHITE_BALANCE;
   const blades = Math.min(16, Math.max(3, Math.round(Number(glare.blades) || 6)));
 
-  if (intensity <= 0 && streaks <= 0 && aberration <= 0 && neutral) return null;
+  const autoExposure = camera.autoExposure === true;
+
+  if (intensity <= 0 && streaks <= 0 && aberration <= 0 && neutral && !autoExposure) return null;
 
   return {
     bloom: intensity,
@@ -50,6 +54,7 @@ export function lensEffects(settings: GpuRenderSettings): LensEffects | null {
     glareLength: Math.min(1, Math.max(0, Number(glare.length) || 0)),
     glareAngle: (Number(glare.rotation) || 0) * Math.PI / 180,
     whiteBalance: neutral ? null : whiteBalanceMatrix(camera.whiteBalance),
+    autoExposure,
   };
 }
 
@@ -93,6 +98,8 @@ export class LensPass {
   private readonly upsample: GPUComputePipeline;
   private readonly composite: GPUComputePipeline;
   private readonly streaks: GPUComputePipeline;
+  private readonly meter: GPUComputePipeline;
+  private readonly metered: GPUBuffer;
   /** One uniform buffer per dispatch, so every one of them keeps its own values until the queue runs it. */
   private readonly uniforms: GPUBuffer[] = [];
   private readonly values = new ArrayBuffer(UNIFORM_BYTES);
@@ -116,6 +123,7 @@ export class LensPass {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: storage("storage") },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: storage("storage") },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: storage("storage") },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: storage("storage") },
       ],
     });
 
@@ -126,6 +134,8 @@ export class LensPass {
     this.upsample = pipeline("upsample");
     this.composite = pipeline("composite");
     this.streaks = pipeline("streaks");
+    this.meter = pipeline("meter");
+    this.metered = device.createBuffer({ label: "lens meter", size: 16, usage: GPUBufferUsage.STORAGE });
   }
 
   /** The graded image of the last `encode`, one vec4 of linear colour per pixel. */
@@ -201,6 +211,7 @@ export class LensPass {
       integers[32] = streak.width;
       integers[33] = streak.height;
       floats[34] = effects.glareAngle;
+      floats[35] = effects.autoExposure ? 1 : 0;
       for (let row = 0; row < 3; row++) for (let column = 0; column < 3; column++)
         floats[20 + row * 4 + column] = white[row * 3 + column];
       fill();
@@ -222,6 +233,7 @@ export class LensPass {
           { binding: 4, resource: { buffer: this.up as GPUBuffer } },
           { binding: 5, resource: { buffer: this.graded as GPUBuffer } },
           { binding: 6, resource: { buffer: this.streaked as GPUBuffer } },
+          { binding: 7, resource: { buffer: this.metered } },
         ],
       }));
       pass.dispatchWorkgroups(Math.ceil(target.width / WORKGROUP), Math.ceil(target.height / WORKGROUP));
@@ -278,6 +290,9 @@ export class LensPass {
       }
     }
 
+    // The meter is one workgroup, whatever the size: dispatched as a single tile of the grid it reads.
+    if (effects.autoExposure) dispatch(this.meter, { width: 1, height: 1 }, () => {});
+
     dispatch(this.composite, { width, height }, () => {});
 
     return this.graded as GPUBuffer;
@@ -293,6 +308,7 @@ export class LensPass {
 
   destroy() {
     this.destroyBuffers();
+    this.metered.destroy();
     for (const buffer of this.uniforms) buffer.destroy();
     this.uniforms.length = 0;
   }

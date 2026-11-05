@@ -46,7 +46,8 @@ struct Lens {
   // The size of the level the rays are gathered at, and the angle of the first ray, in radians.
   streakSize: vec2<u32>,
   glareAngle: f32,
-  pad0: f32,
+  // Whether the camera meters the image and exposes it to middle grey, which the meter pass works out.
+  autoExposure: f32,
 };
 
 const PI: f32 = 3.14159265358979;
@@ -61,6 +62,108 @@ const STREAK_TAPS: i32 = 24;
 @group(0) @binding(4) var<storage, read_write> up: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> graded: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read_write> streaked: array<vec4<f32>>;
+// What the camera's meter read: the exposure that brings the image's average to middle grey, in x.
+@group(0) @binding(7) var<storage, read_write> metered: array<vec4<f32>>;
+
+/** What a light meter calibrates to: an average scene reflects about eighteen percent. */
+const MIDDLE_GREY: f32 = 0.18;
+const METER_GRID: vec2<u32> = vec2<u32>(64u, 36u);
+const METER_THREADS: u32 = 256u;
+
+/**
+ * How far above middle grey the meter lets the bright end of the image land: three stops, where AgX still shows
+ * detail, three and a half under where it reaches white.
+ */
+const HIGHLIGHT_CEILING: f32 = 8.0;
+/** The share of the metered points that counts as the bright end: the light through a window, not a lamp's own pixels. */
+const HIGHLIGHT_SHARE: f32 = 0.03;
+/** Half stops of luminance, from 2^-16 to 2^16, which the bright end is found in. */
+const METER_BINS: u32 = 64u;
+
+var<workgroup> meterSums: array<vec2<f32>, 256>;
+var<workgroup> meterHistogram: array<atomic<u32>, 64>;
+
+/**
+ * The camera's meter: the image's average luminance over a grid of points, taken as the mean of the logarithms so that
+ * a bright window or a patch of sky cannot darken everything else, weighed towards the centre as a camera's
+ * centre-weighted metering is. What no path has reached yet, or is black, does not count. One workgroup reads the
+ * grid and sums it in shared memory.
+ *
+ * Then it guards the highlights, as a camera's matrix metering does: the average alone takes a dim attic with a shaft
+ * of sun in it to middle grey and burns the shaft out, where a photographer keeps the room dim. The brightest few
+ * percent of the points, found in a histogram of half stops, may land no more than {@link HIGHLIGHT_CEILING} times
+ * brighter; an even scene, whose bright end is close to its average, is left as the average says.
+ */
+@compute @workgroup_size(256, 1, 1)
+fn meter(@builtin(local_invocation_index) thread: u32) {
+  var sum = vec2<f32>(0.0);
+  let count = METER_GRID.x * METER_GRID.y;
+
+  if (thread < METER_BINS) {
+    atomicStore(&meterHistogram[thread], 0u);
+  }
+
+  workgroupBarrier();
+
+  for (var k = thread; k < count; k = k + METER_THREADS) {
+    let cell = vec2<f32>(f32(k % METER_GRID.x), f32(k / METER_GRID.x)) + 0.5;
+    let uv = cell / vec2<f32>(METER_GRID);
+    let luminance = dot(imageTexel(i32(uv.x * f32(lens.resolution.x)), i32(uv.y * f32(lens.resolution.y))),
+      vec3<f32>(0.2126, 0.7152, 0.0722));
+    let away = (uv - 0.5) * 2.0;
+    let weight = select(0.0, 1.0 - 0.6 * min(dot(away, away) * 0.5, 1.0), luminance > 0.0);
+
+    sum = sum + vec2<f32>(log(max(luminance, 1e-6)) * weight, weight);
+
+    if (luminance > 0.0) {
+      let bin = u32(clamp((log2(luminance) + 16.0) * 2.0, 0.0, f32(METER_BINS - 1u)));
+
+      atomicAdd(&meterHistogram[bin], 1u);
+    }
+  }
+
+  meterSums[thread] = sum;
+  workgroupBarrier();
+
+  for (var stride = METER_THREADS / 2u; stride > 0u; stride = stride / 2u) {
+    if (thread < stride) {
+      meterSums[thread] = meterSums[thread] + meterSums[thread + stride];
+    }
+
+    workgroupBarrier();
+  }
+
+  if (thread == 0u) {
+    let total = meterSums[0];
+    let average = select(MIDDLE_GREY, exp(total.x / max(total.y, 1e-6)), total.y > 0.0);
+    var exposure = MIDDLE_GREY / average;
+
+    // From the top down, the first half stop by which the bright share is reached; its upper edge is that end.
+    var points = 0u;
+
+    for (var bin = 0u; bin < METER_BINS; bin = bin + 1u) {
+      points = points + atomicLoad(&meterHistogram[bin]);
+    }
+
+    var above = 0u;
+    var bright = 0.0;
+
+    for (var bin = i32(METER_BINS) - 1; bin >= 0 && points > 0u; bin = bin - 1) {
+      above = above + atomicLoad(&meterHistogram[u32(bin)]);
+
+      if (f32(above) >= HIGHLIGHT_SHARE * f32(points)) {
+        bright = exp2(f32(bin + 1) * 0.5 - 16.0);
+        break;
+      }
+    }
+
+    if (bright > 0.0) {
+      exposure = min(exposure, HIGHLIGHT_CEILING * MIDDLE_GREY / bright);
+    }
+
+    metered[0] = vec4<f32>(clamp(exposure, 1e-4, 1e4), average, bright, 0.0);
+  }
+}
 
 /** The image's own texel: its mean so far, or nothing where no path has landed yet. */
 fn imageTexel(x: i32, y: i32) -> vec3<f32> {
@@ -291,6 +394,10 @@ fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
 
   if (lens.glare > 0.0) {
     color = mix(color, streakBilinear(position * vec2<f32>(lens.streakSize) / size), lens.glare);
+  }
+
+  if (lens.autoExposure > 0.0) {
+    color = color * metered[0].x;
   }
 
   let balanced = vec3<f32>(dot(lens.white0.xyz, color), dot(lens.white1.xyz, color), dot(lens.white2.xyz, color));

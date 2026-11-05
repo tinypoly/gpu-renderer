@@ -38,6 +38,7 @@
     "!dist/**/*.test.*",
     "src",
     "!src/**/*.test.ts",
+    "weights",
     "ARCHITECTURE.md"
   ],
   "engines": {
@@ -59,7 +60,8 @@
   },
   "dependencies": {
     "@tinypoly/cpu-renderer": "^0.3.1",
-    "naga-wasm": "30.2.0"
+    "naga-wasm": "30.2.0",
+    "oidn-webgpu": "0.6.0"
   },
   "peerDependencies": {
     "three": ">=0.185.0"

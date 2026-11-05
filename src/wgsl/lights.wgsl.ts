@@ -64,8 +64,8 @@ const NO_LIGHT: u32 = 0xffffffffu;
  * angle the node's box takes from the point (Conty Estevez and Kulla's importance). A point inside the box rules
  * nothing out. A zero normal is a receiver that takes light from everywhere, such as a point in a volume.
  */
-fn lightNodeImportance(node: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
-  let at = frame.lightTree + node * TREE_NODE_WORDS;
+fn lightNodeImportance(tree: u32, node: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
+  let at = tree + node * TREE_NODE_WORDS;
   let low = extraVec4(at);
   let high = extraVec4(at + 4u);
 
@@ -125,13 +125,13 @@ fn lightNodeImportance(node: u32, position: vec3<f32>, normal: vec3<f32>) -> f32
   return low.w * orientation * facing / distance2;
 }
 
-/** The chance of stepping from a node of the tree to each of its children, from this point. */
-fn lightChildOdds(left: u32, right: u32, position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+/** The chance of stepping from a node of a tree (the lights' or the windows') to each of its children, from here. */
+fn lightChildOdds(tree: u32, left: u32, right: u32, position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
   var importance = vec2<f32>(0.0);
 
   // One loop over the two children, so the importance is written into the kernel once per walk.
   for (var k = 0u; k < 2u; k = k + 1u) {
-    importance[k] = lightNodeImportance(select(right, left, k == 0u), position, normal);
+    importance[k] = lightNodeImportance(tree, select(right, left, k == 0u), position, normal);
   }
 
   let total = importance.x + importance.y;
@@ -139,20 +139,23 @@ fn lightChildOdds(left: u32, right: u32, position: vec3<f32>, normal: vec3<f32>)
   return select(importance / total, vec2<f32>(0.0), total <= 0.0);
 }
 
-/** A light picked down the tree by importance from this point, with the chance of picking it; NO_LIGHT for none. */
-fn sampleLightTree(position: vec3<f32>, normal: vec3<f32>, u: f32, pdf: ptr<function, f32>,
+/**
+ * An entry picked down a tree by importance from this point, with the chance of picking it; NO_LIGHT for none. The
+ * tree is the lights' or the windows', given by where its nodes and its leaves' list start.
+ */
+fn sampleLightTree(tree: u32, list: u32, position: vec3<f32>, normal: vec3<f32>, u: f32, pdf: ptr<function, f32>,
   density: ptr<function, f32>) -> u32 {
   var node = 0u;
   var chance = 1.0;
   var x = u;
 
   for (var depth = 0u; depth < 64u; depth = depth + 1u) {
-    let at = frame.lightTree + node * TREE_NODE_WORDS;
+    let at = tree + node * TREE_NODE_WORDS;
     let first = textures[at + 12u];
 
     // A leaf lists its lights, too close together to tell apart from here: one is picked by its share of the power.
     if ((first & TREE_LEAF) != 0u) {
-      let start = frame.lightList + (first & ~TREE_LEAF) * TREE_ENTRY_WORDS;
+      let start = list + (first & ~TREE_LEAF) * TREE_ENTRY_WORDS;
       let count = textures[at + 13u];
       var slot = start + (count - 1u) * TREE_ENTRY_WORDS;
 
@@ -170,7 +173,7 @@ fn sampleLightTree(position: vec3<f32>, normal: vec3<f32>, u: f32, pdf: ptr<func
     }
 
     let second = textures[at + 13u];
-    let odds = lightChildOdds(first, second, position, normal);
+    let odds = lightChildOdds(tree, first, second, position, normal);
 
     if (odds.x + odds.y <= 0.0) {
       return NO_LIGHT;
@@ -208,7 +211,7 @@ fn lightTreePdf(index: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
 
     let at = frame.lightTree + parent * TREE_NODE_WORDS;
     let first = textures[at + 12u];
-    let odds = lightChildOdds(first, textures[at + 13u], position, normal);
+    let odds = lightChildOdds(frame.lightTree, first, textures[at + 13u], position, normal);
 
     chance = chance * select(odds.y, odds.x, node == first);
     node = parent;
@@ -250,6 +253,119 @@ fn lightPdfOfTriangle(triangle: u32, position: vec3<f32>, normal: vec3<f32>) -> 
   }
 
   return 0.0;
+}
+
+/** Share of the sky's samples aimed through the windows, from a point inside a room. */
+const PORTAL_SHARE: f32 = 0.5;
+
+/**
+ * How often the sky is aimed at through the windows from this point: from inside a room, where something stands above
+ * it, half the time; outside never, where the open sky is better found by its brightness. A function of the point alone,
+ * so the heuristic can ask it again when a bounce ray escapes.
+ */
+fn portalChance(position: vec3<f32>) -> f32 {
+  if (!PORTALS || frame.portalCount == 0u) {
+    return 0.0;
+  }
+
+  return select(0.0, PORTAL_SHARE, traceAny(position, vec3<f32>(0.0, 1.0, 0.0), 1e30) != NO_HIT);
+}
+
+/** Window subtrees a ray's walk through the windows' tree keeps waiting. */
+const PORTAL_STACK: u32 = 32u;
+
+/**
+ * The solid angle density with which aiming through the windows produces this direction: over every window triangle
+ * it crosses, the chance the tree picks that window from here times the area density of a point on it, over the area
+ * it shows from here. The ray walks the tree as it would a hierarchy, by the nodes' boxes, carrying the chance of
+ * reaching each node, so the windows it misses cost a box test and the ones it crosses no walk back up.
+ */
+fn portalPdf(position: vec3<f32>, direction: vec3<f32>) -> f32 {
+  var nodes: array<u32, PORTAL_STACK>;
+  var chances: array<f32, PORTAL_STACK>;
+  var top = 1u;
+  let inverse = 1.0 / direction;
+  var pdf = 0.0;
+
+  nodes[0] = 0u;
+  chances[0] = 1.0;
+
+  loop {
+    if (top == 0u) {
+      break;
+    }
+
+    top = top - 1u;
+
+    let node = nodes[top];
+    let chance = chances[top];
+    let at = frame.portals + node * TREE_NODE_WORDS;
+
+    if (enterBox(extraVec4(at).xyz, extraVec4(at + 4u).xyz, position, inverse, 1e30) >= 1e30) {
+      continue;
+    }
+
+    let first = textures[at + 12u];
+    let second = textures[at + 13u];
+
+    if ((first & TREE_LEAF) != 0u) {
+      let start = frame.portalList + (first & ~TREE_LEAF) * TREE_ENTRY_WORDS;
+
+      for (var j = 0u; j < second; j = j + 1u) {
+        let slot = start + j * TREE_ENTRY_WORDS;
+        let triangle = textures[slot];
+        let t = intersectTriangle(leafOf(triangle), position, direction).x;
+
+        if (t > 0.0) {
+          let cosine = abs(dot(triangleNormal(triangle), direction));
+
+          pdf = pdf + chance * extraFloat(slot + 1u) * extraFloat(slot + 2u) * t * t / max(cosine, 1e-6);
+        }
+      }
+
+      continue;
+    }
+
+    let odds = lightChildOdds(frame.portals, first, second, position, vec3<f32>(0.0));
+
+    for (var k = 0u; k < 2u; k = k + 1u) {
+      if (odds[k] > 0.0 && top < PORTAL_STACK) {
+        nodes[top] = select(second, first, k == 0u);
+        chances[top] = chance * odds[k];
+        top = top + 1u;
+      }
+    }
+  }
+
+  return pdf;
+}
+
+/** A direction through a point on a window the tree picks from here, or none from a point on the window itself. */
+fn samplePortal(position: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
+  var chance = 0.0;
+  var density = 0.0;
+  let triangle = sampleLightTree(frame.portals, frame.portalList, position, vec3<f32>(0.0), u.x, &chance, &density);
+
+  if (triangle == NO_LIGHT) {
+    return vec3<f32>(0.0);
+  }
+
+  // The tree spent the sample walking down; a fresh one places the point, which the pick does not depend on.
+  let point = trianglePointAt(triangle, triangleBarycentric(vec2<f32>(fract(u.x * 4096.0), u.y)));
+  let offset = point - position;
+
+  return select(vec3<f32>(0.0), normalize(offset), dot(offset, offset) > 1e-12);
+}
+
+/** The density of the sky's sampling from this point for this direction: by brightness, through windows, or both. */
+fn skyPdf(position: vec3<f32>, direction: vec3<f32>, share: f32) -> f32 {
+  var pdf = (1.0 - share) * environmentPdf(direction);
+
+  if (share > 0.0) {
+    pdf = pdf + share * portalPdf(position, direction);
+  }
+
+  return pdf;
 }
 
 /** The power heuristic: how much of a contribution the strategy that produced it keeps, against the other one. */
@@ -307,7 +423,7 @@ fn sampleLight(position: vec3<f32>, normal: vec3<f32>, pick: f32, u: vec2<f32>) 
   if (frame.lightTree != 0u && pick < frame.localLightPick) {
     var chance = 0.0;
     var density = 1.0;
-    let index = sampleLightTree(position, normal, pick / frame.localLightPick, &chance, &density);
+    let index = sampleLightTree(frame.lightTree, frame.lightList, position, normal, pick / frame.localLightPick, &chance, &density);
 
     if (index == NO_LIGHT || chance <= 0.0) {
       return noLight();
@@ -356,17 +472,31 @@ fn sampleLightEntry(light: Light, pdf: f32, position: vec3<f32>, u: vec2<f32>) -
   sample.misPdf = 0.0;
 
   if (light.kind == LIGHT_ENVIRONMENT) {
-    let drawn = sampleEnvironmentDirection(u);
+    // From inside a room, part of the time through a window: daylight comes in there or not at all.
+    let share = portalChance(position);
+    var direction = vec3<f32>(0.0);
 
-    if (drawn.pdf <= 0.0) {
+    if (u.x < share) {
+      direction = samplePortal(position, vec2<f32>(u.x / share, u.y));
+    } else {
+      let drawn = sampleEnvironmentDirection(vec2<f32>(min((u.x - share) / (1.0 - share), 0.99999994), u.y));
+
+      if (drawn.pdf > 0.0) {
+        direction = drawn.direction;
+      }
+    }
+
+    let mixed = skyPdf(position, direction, share);
+
+    if (all(direction == vec3<f32>(0.0)) || mixed <= 0.0) {
       return noLight();
     }
 
-    let density = pdf * drawn.pdf;
+    let density = pdf * mixed;
 
-    sample.direction = drawn.direction;
+    sample.direction = direction;
     sample.distance = 1e30;
-    sample.value = environmentRadiance(drawn.direction) / density;
+    sample.value = environmentRadiance(direction) / density;
     // A bounce ray that escapes finds the same light, so the two strategies share it.
     sample.misPdf = density;
 

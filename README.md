@@ -20,7 +20,7 @@ It is the GPU sibling of [@tinypoly/cpu-renderer](https://github.com/tinypoly/cp
 - HDR, gradient or procedural sky environments, light probes, depth of field with polygonal bokeh, fog, volumetric lights, vignette and grain, and ACES, AgX or Neutral tone mapping.
 - What a photograph adds, on by default: subsurface scattering, volumes of fog and smoke, aerial perspective, a lens's bloom, aperture rays, chromatic aberration and distortion, a camera's white balance and exposure triangle.
 - Adaptive sampling: pixels whose noise is gone stop taking paths, and the work they leave goes to the dark, glossy and out of focus areas that still need it.
-- A variance-guided denoiser (the spatial filter of SVGF, with diffuse and specular light filtered apart as NVIDIA's RELAX does): each signal is separated from its albedo, filtered by an edge-avoiding wavelet that stops at normals, depths and roughness and trusts each pixel as far as its own variance says, and multiplied back, so textures stay sharp, a sharp reflection stays sharp and flat areas keep their exact mean.
+- Intel's Open Image Denoise on the device, by default, and a variance-guided denoiser (the spatial filter of SVGF, with diffuse and specular light filtered apart as NVIDIA's RELAX does): each signal is separated from its albedo, filtered by an edge-avoiding wavelet that stops at normals, depths and roughness and trusts each pixel as far as its own variance says, and multiplied back, so textures stay sharp, a sharp reflection stays sharp and flat areas keep their exact mean.
 - Progressive output: the canvas refines sample by sample, and the render can be paused, resumed and cancelled.
 - No worker pool and no `SharedArrayBuffer`: the scene lives on the device, so the page needs no cross-origin isolation. A single worker builds the BVH of a large scene, so the page keeps responding while it is prepared.
 
@@ -169,6 +169,7 @@ The renderer never falls back on its own. Choosing another renderer when WebGPU 
 | `globalIllumination.clamp` | `10` | Maximum luminance one indirect contribution may add, which trades a little bias for fewer fireflies, as Cycles' indirect light clamp does. `0` disables clamping. |
 | `globalIllumination.russianRoulette` | `true` | Ends a path that carries little light by chance, weighting the survivors up so the mean stays exact. |
 | `globalIllumination.rouletteStart` | `1` | Bounces every path takes before the roulette may end it. Past them a path carries on with the chance its own throughput gives, as in PBRT. |
+| `globalIllumination.portals` | `true` | Inside a room (something above the point), aims at the sky through the windows (every thin transmissive material, the ones near the point most) as well as by its brightness, as Cycles' portals do: daylight entering through glass is found instead of stumbled upon. |
 | `globalIllumination.lightTree` | `true` | Picks the light to aim at by what it delivers to the shaded point (power, distance, facing) through a tree over the scene's lights, rather than by power alone: a small lamp near a surface gets the samples it needs. |
 | `depthOfField.enabled` | `false` | |
 | `depthOfField.focusDistance` | `10` | World units. |
@@ -193,9 +194,12 @@ Groups only this renderer reads, all on by default except the physical exposure,
 | `glare.intensity` | `0.06` | Share of the light the rays take, `0` to `1`. |
 | `glare.blades` | `6` | Blades of the aperture: an even count makes as many rays, an odd count twice as many. |
 | `glare.length`, `glare.rotation` | `0.25`, `15` | How far the rays reach, as a share of the half diagonal, and the aperture's turn in degrees. |
-| `lens.chromaticAberration` | `0.2` | Lateral colour fringes towards the corners, `0` to `1`. |
+| `camera.contrast` | `1` | AgX's look, `0` its base curve (flat on purpose) to `1` a look like Blender's Punchy, pivoted on middle grey so brightness stands; other tone mappings ignore it. |
+| `lens.chromaticAberration` | `0.05` | Lateral colour fringes towards the corners, `0` to `1`. |
 | `lens.distortion` | `0` | Radial distortion of the camera rays: positive is barrel, negative pincushion. |
 | `camera.whiteBalance` | `6500` | Kelvin the camera takes as white; `6500` is neutral, lower cools the image. |
+| `camera.autoExposure` | `false` | Meters the image as a camera in automatic does, the mean of the logarithms of its luminance weighed towards the centre, and exposes it to middle grey: a window or the sky cannot darken the room. Takes the place of `exposure`. |
+| `camera.exposureCompensation` | `0` | Stops over the metered exposure. |
 | `camera.physicalExposure` | `false` | Exposes from `iso`, `shutterSpeed` and `depthOfField.aperture`, with `exposure` as compensation. |
 | `camera.iso`, `camera.shutterSpeed` | `100`, `1/125` | Seconds for the shutter. |
 | `atmosphere.enabled` | `true` | Aerial perspective: the air fades distant surfaces towards the light it scatters, from the surroundings and the brightest directional light. Scenes in metres. |
@@ -215,10 +219,14 @@ renderer.setSettings({ glare: { blades: 7 }, camera: { whiteBalance: 3200 }, atm
 
 ### Denoiser
 
-A variance-guided wavelet filter, the spatial half of SVGF, with the diffuse and the specular light filtered apart, as NVIDIA's RELAX and REBLUR do. Every path is split at its first scatter by the lobe it took; each signal is divided by its own albedo (the diffuse colour, the GGX lobe's directional albedo), filtered by passes that stop at normals and depths, and multiplied back, so textures stay sharp. The specular filter also stops at roughness, and reaches only as far as the footprint the lobe leaves on the screen, from the roughness and the distance to what it reflects: a mirror is left alone, a rough reflection of something far is smoothed widely. Each pixel is trusted as far as its own variance says. `DenoiserSettings`, defaults in `DEFAULT_DENOISER`:
+Two denoisers, chosen by `algorithm`. `"oidn"`, the default, is Intel's Open Image Denoise, the neural network Blender and most production renderers use, run on the device through [oidn-webgpu](https://github.com/pissang/oidn-webgpu): the image, its albedo and its normal go through a U-Net trained on path traced images, which keeps texture and fine detail at a handful of samples per pixel. Its weights (RenderKit's `rt_hdr_alb_nrm.tza`, Apache-2.0, 1.8 MB) ship in `weights/`; an app whose bundler does not carry them along serves its own copy and passes its URL as `oidnWeights`. Where the network cannot load, the renderer warns once and uses SVGF. Only `strength` applies to it.
+
+`"svgf"` is a variance-guided wavelet filter, the spatial half of SVGF, with the diffuse and the specular light filtered apart, as NVIDIA's RELAX and REBLUR do. Every path is split at its first scatter by the lobe it took; each signal is divided by its own albedo (the diffuse colour, the GGX lobe's directional albedo), filtered by passes that stop at normals and depths, and multiplied back, so textures stay sharp. The specular filter also stops at roughness, and reaches only as far as the footprint the lobe leaves on the screen, from the roughness and the distance to what it reflects: a mirror is left alone, a rough reflection of something far is smoothed widely. Each pixel is trusted as far as its own variance says. `DenoiserSettings`, defaults in `DEFAULT_DENOISER`:
 
 | Field | Default | |
 | --- | --- | --- |
+| `algorithm` | `"oidn"` | `"oidn"` (neural, keeps detail) or `"svgf"` (the wavelet filter, faster, with the fields below). |
+| `oidnWeights` | `""` | Where OIDN's weights are fetched from; empty takes `DEFAULT_OIDN_WEIGHTS`, the copy in the package. |
 | `strength` | `1` | How much of the filtered image replaces the traced one, from `0` to `1`. |
 | `passes` | `3` | Wavelet passes, `1` to `5`: how far the filter reaches, 2, 6, 14, 30 or 62 pixels. |
 | `edge` | `2` | How large a luminance difference still counts as noise, in standard deviations of the pixel's own noise. Lower keeps more detail and removes less noise. |

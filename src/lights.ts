@@ -73,6 +73,49 @@ export interface PackedLights {
   leavesAt: number;
   /** Where the lights of the tree's leaves are listed in the texture buffer. */
   listAt: number;
+  /**
+   * The windows the sky is also sampled through, from inside: the triangles of every thin transmissive material, in a
+   * tree of their own, as the lights have, so a point aims at the windows near it rather than at every one in the
+   * building alike. Where its nodes start, where its leaves' list starts, and how many windows there are.
+   */
+  portalTreeAt: number;
+  portalListAt: number;
+  portalCount: number;
+}
+
+/**
+ * The triangles of thin glass, which is where daylight enters a room, as the tree sees them: their bounds, their area
+ * as power, so a window weighs by the solid angle it takes from a point, and no orientation, since a pane lets the sky
+ * through from either side.
+ */
+export function portalTriangles(geometry: PackedGeometry): { triangles: number[]; lights: TreeLight[] } {
+  const windows = geometry.materialProperties.map(p => p.transmission > 0 && p.thickness <= 0);
+  const triangles: number[] = [], lights: TreeLight[] = [];
+
+  for (let triangle = 0; triangle < geometry.triangleCount; triangle++) {
+    if (!windows[geometry.materials[triangle]]) continue;
+
+    const at = triangle * 9;
+    const area = doubleArea(geometry.positions, at) / 2;
+
+    if (!(area > 0)) continue;
+
+    const corner = (k: number) => [0, 1, 2].map(c => geometry.positions[at + k * 3 + c]);
+    const points = [corner(0), corner(1), corner(2)];
+
+    triangles.push(triangle);
+    lights.push({
+      low: [0, 1, 2].map(c => Math.min(points[0][c], points[1][c], points[2][c])),
+      high: [0, 1, 2].map(c => Math.max(points[0][c], points[1][c], points[2][c])),
+      power: area,
+      axis: [0, 1, 0],
+      thetaO: Math.PI,
+      thetaE: Math.PI / 2,
+      density: 1 / area,
+    });
+  }
+
+  return { triangles, lights };
 }
 
 const luminance = (color: ArrayLike<number>) => 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
@@ -439,7 +482,24 @@ export function packLights(
     for (const leaf of tree.leafOf) extra.push(leaf);
   }
 
+  const portals = environment && environment.power > 0 ? portalTriangles(geometry) : { triangles: [], lights: [] };
+  let portalTreeAt = 0, portalListAt = 0;
+
+  if (portals.triangles.length) {
+    const tree = buildLightTree(portals.lights);
+
+    portalTreeAt = base + extra.length;
+    portalListAt = portalTreeAt + tree.listAt;
+
+    // The leaves list window numbers; the kernel wants the triangles they stand for.
+    for (let k = tree.listAt; k < tree.words.length; k += 4) tree.words[k] = portals.triangles[tree.words[k]];
+    for (const word of tree.words) extra.push(word);
+  }
+
   return {
+    portalTreeAt,
+    portalListAt,
+    portalCount: portals.triangles.length,
     localCount,
     localPick: localCount > 0 ? floats[(localCount - 1) * LIGHT_WORDS + 1] : 0,
     treeAt,

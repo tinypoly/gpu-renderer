@@ -491,10 +491,24 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.sceneDirty = true;
   }
 
-  /** Used by `attachCanvas`; pass `null` to detach. */
+  /**
+   * Used by `attachCanvas`; pass `null` to detach. A canvas attached after a frame started, or after it finished,
+   * shows what the accumulation already holds at once, instead of staying empty until the next frame.
+   */
   setOutputCanvas(canvas: HTMLCanvasElement | null) {
     this.canvas = canvas;
     this.context = null;
+
+    const gpu = this.gpu, accumulator = this.accumulator;
+
+    if (!canvas || !gpu || !accumulator || this.disposed) return;
+
+    this.configureCanvas(gpu, accumulator.width, accumulator.height);
+
+    const encoder = gpu.device.createCommandEncoder();
+
+    this.encodePresent(encoder, accumulator.width, accumulator.height);
+    gpu.device.queue.submit([encoder.finish()]);
   }
 
   /**

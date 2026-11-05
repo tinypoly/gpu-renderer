@@ -156,11 +156,29 @@ const SHOW_EVERY_MS = 16;
  */
 const BANDS_IN_FLIGHT = 2;
 
-/** Throughput under which Russian roulette may end a path, with the chance of carrying on equal to the throughput. */
-const ROULETTE_THRESHOLD = 0.2;
+/**
+ * Throughput under which Russian roulette may end a path, with the chance of carrying on equal to the throughput. One
+ * plays it on every path past the first bounces, as PBRT does: a path off a light wall carries on as long as it
+ * carries light, instead of seven bounces before the roulette ever looks at it. The mean stays exact.
+ */
+const ROULETTE_THRESHOLD = 1;
 
-/** How often the canvas takes a freshly denoised image while a frame traces. */
+/** How often the lens pass grades the canvas again while a frame traces without the denoiser. */
+const LENS_EVERY_MS = 100;
+
+/** How often the canvas takes a freshly denoised image while a frame traces, for an image of DENOISE_REFERENCE work. */
 const DENOISE_EVERY_MS = 200;
+
+/** The filtering of a 1080p image with three passes, which the interval above was set for. */
+const DENOISE_REFERENCE = 1920 * 1080 * 3;
+
+/**
+ * How long the canvas waits between denoised images: longer for a larger image or more passes, in proportion, so the
+ * filter takes the same share of the device from tracing whatever the size. The finished image is filtered regardless.
+ */
+export function denoiseInterval(width: number, height: number, passes: number): number {
+  return DENOISE_EVERY_MS * Math.max(1, width * height * Math.max(1, passes) / DENOISE_REFERENCE);
+}
 
 /** The most paths per pixel one dispatch takes, while no pixel can stop yet. */
 const BATCH_PATHS = 4;
@@ -274,6 +292,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private resolve: CaptureResolvePass | null = null;
   private denoisePass: DenoisePass | null = null;
   private lensPass: LensPass | null = null;
+  // What the lens pass last graded, and when: its input only changes when the denoiser runs or the accumulation grows.
+  private lensKey = "";
+  private lensAt = -Infinity;
+  private denoiseVersion = 0;
   private denoiserSettings: DenoiserSettings = { ...DEFAULT_DENOISER };
   // The size of the last frame that finished, which setDenoiser filters again; null while a frame traces.
   private finished: { width: number; height: number } | null = null;
@@ -716,7 +738,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
       // The canvas shows the denoised image, refreshed a few times a second while the bands refine underneath it:
       // filtering the whole image after every pass would cost a cheap scene as much as tracing it.
-      if (denoise && this.canvas && this.context && performance.now() - denoisedAt >= DENOISE_EVERY_MS) {
+      if (denoise && this.canvas && this.context && performance.now() - denoisedAt
+        >= denoiseInterval(width, height, this.denoiserSettings.passes)) {
         const encoder = gpu.device.createCommandEncoder();
 
         this.encodeDenoise(gpu, encoder, width, height);
@@ -1060,12 +1083,24 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
    * buffer of graded colour the display transform reads instead, or the input as it was.
    */
   private encodeLens(gpu: RenderDevice, encoder: GPUCommandEncoder, width: number, height: number,
-    denoised: GPUBuffer | null): GPUBuffer | null {
+    denoised: GPUBuffer | null, force = false): GPUBuffer | null {
     const effects = lensEffects(this.current);
 
     if (!effects) return denoised;
 
     this.lensPass ??= new LensPass(gpu.device);
+
+    // The canvas is drawn about once a display frame, but a denoised image only changes a few times a second: grading
+    // the same one again would take the device from tracing for nothing. Straight from the accumulation, the image
+    // grows with every pass, and is graded again at most every LENS_EVERY_MS.
+    const key = JSON.stringify([this.revision, width, height, denoised ? this.denoiseVersion : -1, effects]);
+    const now = performance.now();
+    const fresh = key === this.lensKey && (denoised !== null || now - this.lensAt < LENS_EVERY_MS);
+
+    if (!force && fresh && this.lensPass.output) return this.lensPass.output;
+
+    this.lensKey = key;
+    this.lensAt = now;
 
     return this.lensPass.encode(encoder, (this.accumulator as Accumulator).buffer, denoised, width, height, effects);
   }
@@ -1076,6 +1111,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.denoisePass.encode(encoder, (this.accumulator as Accumulator).buffer, width, height, this.denoiserSettings,
       this.denoiseView);
     this.denoised = true;
+    this.denoiseVersion++;
   }
 
   private frameUniforms(
@@ -1145,6 +1181,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       rouletteStart: Math.max(0, Math.round(this.current.globalIllumination.rouletteStart ?? 0)),
       lensDistortion: Number.isFinite(this.current.lens.distortion) ? this.current.lens.distortion : 0,
       subsurfaceEnabled: this.current.subsurface.enabled,
+      subsurfaceDepth: Math.max(0, Math.round(Number(this.current.subsurface.depth ?? 2))),
       bevelEnabled: this.current.bevel.enabled,
       volumesEnabled: this.current.volumes.enabled,
       cameraVolume: this.current.volumes.enabled
@@ -1163,6 +1200,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       localLightPick: buffers?.localLightPick ?? 0,
       lightTree: this.current.globalIllumination.lightTree === false ? 0 : buffers?.lightTree ?? 0,
       lightLeaves: buffers?.lightLeaves ?? 0,
+      lightList: buffers?.lightList ?? 0,
       clampIndirect: Math.max(0, this.current.globalIllumination.clamp),
       // The setting is the angular diameter a light covers, in degrees, as it is for the CPU renderer's shadow blur.
       shadowSpread: shadows.enabled ? Math.tan(Math.max(0, shadows.softness) * Math.PI / 360) : 0,
@@ -1206,7 +1244,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
     // The lens's effects are encoded on their own, ahead of the resolve, which reads the colour they leave.
     const encoder = gpu.device.createCommandEncoder({ label: "lens" });
-    const graded = this.encodeLens(gpu, encoder, width, height, denoised);
+    const graded = this.encodeLens(gpu, encoder, width, height, denoised, true);
 
     gpu.device.queue.submit([encoder.finish()]);
 

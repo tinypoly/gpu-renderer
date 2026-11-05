@@ -456,55 +456,57 @@ fn traceRadiance(
   for (var step = 0u; step < MAX_STEPS + MAX_WALK; step = step + 1u) {
     let hit = traceScene(origin, direction, limit);
 
-    // Every vertex draws the same dimensions in the same order, whatever the path then does with them.
-    let coverage = sample2D(rng);
-    let pick = sample2D(rng);
-    let lightSample = sample2D(rng);
-    let lobe = sample2D(rng);
-    let bounceSample = sample2D(rng);
-    var mediumSample = vec2<f32>(0.0);
-    var bevelSample = vec4<f32>(0.0);
+    // A step of the walk inside a material that ends in the medium: the light scatters there, keeping each colour's
+    // share of it. It needs three numbers, which a plain hash gives for a fraction of what the sequence costs.
+    if (SUBSURFACE_WALK && inMedium && hit.triangle == NO_HIT) {
+      let travelled = exp(-sigma * limit);
+      let density = dot(walkOdds, sigma * travelled);
+      // A new direction, the next distance (a colour and how far), and the roulette's chance.
+      let turn = hashSample2D(rng);
+      let next = hashSample2D(rng);
+      let chance = hashSample2D(rng).x;
 
-    if (VOLUMES) {
-      mediumSample = sample2D(rng);
+      throughput = throughput * sigma * walkAlbedo * travelled / max(density, 1e-20);
+      walkSteps = walkSteps + 1u;
+
+      let survival = max3(throughput);
+
+      if (walkSteps >= MAX_WALK || survival <= 0.0) {
+        break;
+      }
+
+      if (survival < 0.2) {
+        if (chance > survival) {
+          break;
+        }
+
+        throughput = throughput / survival;
+      }
+
+      origin = origin + direction * limit;
+      direction = sampleHenyeyGreenstein(direction, walkG, turn);
+      limit = walkDistance(throughput, sigma, next, &walkOdds);
+      continue;
     }
 
-    if (BEVEL) {
-      bevelSample = vec4<f32>(sample2D(rng), sample2D(rng));
+    // Every vertex draws the same dimensions in the same order, whatever the path then does with them: from the
+    // sequence for the first vertices, from a hash past SEQUENCE_DEPTH bounces.
+    let deep = bounce >= SEQUENCE_DEPTH;
+    let coverage = pathSample2D(rng, deep);
+    let pick = pathSample2D(rng, deep);
+    let lightSample = pathSample2D(rng, deep);
+    let lobe = pathSample2D(rng, deep);
+    let bounceSample = pathSample2D(rng, deep);
+    var mediumSample = vec2<f32>(0.0);
+
+    if (VOLUMES) {
+      mediumSample = pathSample2D(rng, deep);
     }
 
     // The walk left the material here, and the surface below is its way out rather than what the material shows.
     var exiting = false;
 
     if (SUBSURFACE_WALK && inMedium) {
-      if (hit.triangle == NO_HIT) {
-        // Nothing within the drawn distance: the light scatters there, keeping each colour's share of the medium.
-        let travelled = exp(-sigma * limit);
-        let density = dot(walkOdds, sigma * travelled);
-
-        throughput = throughput * sigma * walkAlbedo * travelled / max(density, 1e-20);
-        walkSteps = walkSteps + 1u;
-
-        let survival = max3(throughput);
-
-        if (walkSteps >= MAX_WALK || survival <= 0.0) {
-          break;
-        }
-
-        if (survival < 0.2) {
-          if (coverage.x > survival) {
-            break;
-          }
-
-          throughput = throughput / survival;
-        }
-
-        origin = origin + direction * limit;
-        direction = sampleHenyeyGreenstein(direction, walkG, lobe);
-        limit = walkDistance(throughput, sigma, pick, &walkOdds);
-        continue;
-      }
-
       // The walk reached the surface before scattering again: the chance of travelling that far, per colour.
       let travelled = exp(-sigma * hit.distance);
 
@@ -631,8 +633,16 @@ fn traceRadiance(
 
     surface = resolveSurfaceFrom(hit.triangle, bary, direction, base);
 
+    // Deep in the path, light reflects off a material that scatters inside as off a diffuse one of the same colour.
+    if (SUBSURFACE_WALK && bounce >= frame.subsurfaceDepth) {
+      surface.subsurface = 0.0;
+    }
+
     if (BEVEL && frame.bevelEnabled != 0u && materials[m].bevel > 0.0) {
-      surface.normal = bevelNormal(m, point, surface, -direction, materials[m].bevel, bevelSample.xy, bevelSample.zw);
+      let disk = hashSample2D(rng);
+      let axis = hashSample2D(rng);
+
+      surface.normal = bevelNormal(m, point, surface, -direction, materials[m].bevel, disk, axis);
     }
     }
 

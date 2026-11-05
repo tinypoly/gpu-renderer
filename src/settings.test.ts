@@ -189,3 +189,12 @@ it("finds the volume a point stands inside by the parity of its crossings", () =
   expect(containingVolume(volumes, [0, 0, 5])).toBe(NO_MATERIAL);
   expect(containingVolume(null, [0, 0, 0])).toBe(NO_MATERIAL);
 });
+
+it("spaces the canvas's denoised images out as the image grows, keeping the filter's share of the device", async() => {
+  const { denoiseInterval } = await import("./renderer.js");
+
+  expect(denoiseInterval(1280, 720, 3)).toBe(200);
+  expect(denoiseInterval(1920, 1080, 3)).toBe(200);
+  expect(denoiseInterval(3840, 2160, 3)).toBe(800);
+  expect(denoiseInterval(1920, 1080, 5)).toBeCloseTo(200 * 5 / 3, 6);
+});

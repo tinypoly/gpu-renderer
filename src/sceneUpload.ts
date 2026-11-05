@@ -52,6 +52,7 @@ export interface SceneBuffers {
   localLightPick: number;
   lightTree: number;
   lightLeaves: number;
+  lightList: number;
   /** Radiance an ambient or hemisphere light adds, which no shadow ray can reach. */
   ambient: PackedLights["ambient"];
   /** Where the surrounding image and its distributions ended up, for the frame uniform. */
@@ -206,6 +207,7 @@ export function uploadScene(
     localLightPick: lights.localPick,
     lightTree: lights.treeAt,
     lightLeaves: lights.leavesAt,
+    lightList: lights.listAt,
     ambient: lights.ambient,
     environment: {
       texture: environment ? textures.indexOf.get(environment.texture.id) ?? NO_TEXTURE : NO_TEXTURE,

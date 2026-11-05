@@ -71,6 +71,8 @@ export interface PackedLights {
   /** Where the light tree's nodes start in the texture buffer, and the leaf of every local entry; zero for no tree. */
   treeAt: number;
   leavesAt: number;
+  /** Where the lights of the tree's leaves are listed in the texture buffer. */
+  listAt: number;
 }
 
 const luminance = (color: ArrayLike<number>) => 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
@@ -425,12 +427,13 @@ export function packLights(
 
   for (let index = 0; index < areas.length; index++) extra.push(words[index * LIGHT_WORDS + 3]);
 
-  let treeAt = 0, leavesAt = 0;
+  let treeAt = 0, leavesAt = 0, listAt = 0;
 
   if (localCount > 0) {
     const tree = buildLightTree(candidates.slice(0, localCount).map(candidate => candidate.tree as TreeLight));
 
     treeAt = base + extra.length;
+    listAt = treeAt + tree.listAt;
     for (const word of tree.words) extra.push(word);
     leavesAt = base + extra.length;
     for (const leaf of tree.leafOf) extra.push(leaf);
@@ -441,6 +444,7 @@ export function packLights(
     localPick: localCount > 0 ? floats[(localCount - 1) * LIGHT_WORDS + 1] : 0,
     treeAt,
     leavesAt,
+    listAt,
     cdfAt,
     trianglesAt,
     entries,

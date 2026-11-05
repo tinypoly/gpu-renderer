@@ -55,6 +55,7 @@ fn lightByProbability(u: f32) -> Light {
 const TREE_NODE_WORDS: u32 = 16u;
 const TREE_LEAF: u32 = 0x80000000u;
 const TREE_ROOT_PARENT: u32 = 0xffffffffu;
+const TREE_ENTRY_WORDS: u32 = 4u;
 const NO_LIGHT: u32 = 0xffffffffu;
 
 /**
@@ -67,39 +68,58 @@ fn lightNodeImportance(node: u32, position: vec3<f32>, normal: vec3<f32>) -> f32
   let at = frame.lightTree + node * TREE_NODE_WORDS;
   let low = extraVec4(at);
   let high = extraVec4(at + 4u);
-  let cone = extraVec4(at + 8u);
 
   if (low.w <= 0.0) {
     return 0.0;
   }
 
   let centre = (low.xyz + high.xyz) * 0.5;
-  let radius = length(high.xyz - low.xyz) * 0.5;
+  let radius2 = dot(high.xyz - low.xyz, high.xyz - low.xyz) * 0.25;
   let offset = position - centre;
   let distance2 = dot(offset, offset);
 
-  if (distance2 <= radius * radius) {
-    return low.w / max(radius * radius, 1e-12);
+  if (distance2 <= radius2) {
+    return low.w / max(radius2, 1e-12);
   }
 
-  let distance = sqrt(distance2);
-  let spread = asin(clamp(radius / distance, 0.0, 1.0));
+  let away = offset * inverseSqrt(distance2);
+  // The angle the box takes from the point, as its sine and cosine: the angles below are widened by it without a
+  // single inverse trigonometric function, by the sum and difference formulas.
+  let sinU2 = radius2 / distance2;
+  let cosU = sqrt(1.0 - sinU2);
+  let sinU = sqrt(sinU2);
   var orientation = 1.0;
 
   // A cone of minus one is the whole sphere: such lights shine towards every point alike.
   if (high.w > -1.0) {
-    let theta = acos(clamp(dot(cone.xyz, offset / distance), -1.0, 1.0));
-    let past = max(0.0, theta - acos(high.w) - spread);
+    let cone = extraVec4(at + 8u);
+    let cosO = high.w;
+    let sinO = sqrt(max(0.0, 1.0 - cosO * cosO));
+    // The cone widened by the box: cos and sin of theta_o + theta_u, the whole sphere once that passes pi.
+    let cosWide = cosO * cosU - sinO * sinU;
+    let sinWide = sinO * cosU + cosO * sinU;
+    let cosTheta = dot(cone.xyz, away);
 
-    orientation = select(0.0, cos(past), past <= acos(clamp(cone.w, -1.0, 1.0)));
+    // cos(max(0, theta - theta_o - theta_u)), which is one while the point lies within the widened cone.
+    if (sinWide >= 0.0 && cosTheta < cosWide) {
+      let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+      let cosPast = cosTheta * cosWide + sinTheta * sinWide;
+
+      orientation = select(0.0, cosPast, cosPast >= cone.w);
+    }
   }
 
   var facing = 1.0;
 
   if (any(normal != vec3<f32>(0.0))) {
-    let past = max(0.0, acos(clamp(dot(normal, -offset / distance), -1.0, 1.0)) - spread);
+    let cosN = -dot(normal, away);
 
-    facing = select(0.0, cos(past), past < 0.5 * PI);
+    // cos(max(0, theta_n - theta_u)), and nothing once that reaches a right angle.
+    if (cosN < cosU) {
+      let sinN = sqrt(max(0.0, 1.0 - cosN * cosN));
+
+      facing = max(0.0, cosN * cosU + sinN * sinU);
+    }
   }
 
   return low.w * orientation * facing / distance2;
@@ -130,11 +150,23 @@ fn sampleLightTree(position: vec3<f32>, normal: vec3<f32>, u: f32, pdf: ptr<func
     let at = frame.lightTree + node * TREE_NODE_WORDS;
     let first = textures[at + 12u];
 
+    // A leaf lists its lights, too close together to tell apart from here: one is picked by its share of the power.
     if ((first & TREE_LEAF) != 0u) {
-      *pdf = chance;
-      *density = extraFloat(at + 13u);
+      let start = frame.lightList + (first & ~TREE_LEAF) * TREE_ENTRY_WORDS;
+      let count = textures[at + 13u];
+      var slot = start + (count - 1u) * TREE_ENTRY_WORDS;
 
-      return first & ~TREE_LEAF;
+      for (var j = 0u; j + 1u < count; j = j + 1u) {
+        if (x < extraFloat(start + j * TREE_ENTRY_WORDS + 3u)) {
+          slot = start + j * TREE_ENTRY_WORDS;
+          break;
+        }
+      }
+
+      *pdf = chance * extraFloat(slot + 1u);
+      *density = extraFloat(slot + 2u);
+
+      return textures[slot];
     }
 
     let second = textures[at + 13u];
@@ -162,8 +194,10 @@ fn sampleLightTree(position: vec3<f32>, normal: vec3<f32>, u: f32, pdf: ptr<func
 
 /** The chance the tree would have picked the local light at this index from this point, walked up from its leaf. */
 fn lightTreePdf(index: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
-  var node = textures[frame.lightLeaves + index];
-  var chance = extraFloat(frame.lightTree + node * TREE_NODE_WORDS + 13u);
+  var node = textures[frame.lightLeaves + index * 2u];
+  let slot = frame.lightList + textures[frame.lightLeaves + index * 2u + 1u] * TREE_ENTRY_WORDS;
+  // Its share within its leaf, and the area density of a point on it.
+  var chance = extraFloat(slot + 1u) * extraFloat(slot + 2u);
 
   for (var depth = 0u; depth < 64u; depth = depth + 1u) {
     let parent = textures[frame.lightTree + node * TREE_NODE_WORDS + 14u];

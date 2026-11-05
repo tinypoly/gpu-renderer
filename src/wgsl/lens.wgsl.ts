@@ -260,21 +260,6 @@ fn streakBilinear(position: vec2<f32>) -> vec3<f32> {
   return mix(mix(streakTexel(x, y), streakTexel(x + 1, y), b.z), mix(streakTexel(x, y + 1), streakTexel(x + 1, y + 1), b.z), b.w);
 }
 
-/** The folded halo at full resolution: a tent over its largest level, which is half the image's size. */
-fn tentHalo(position: vec2<f32>) -> vec3<f32> {
-  var sum = vec3<f32>(0.0);
-
-  for (var dy = -1; dy <= 1; dy = dy + 1) {
-    for (var dx = -1; dx <= 1; dx = dx + 1) {
-      let weight = f32((2 - abs(dx)) * (2 - abs(dy))) / 16.0;
-
-      sum = sum + upBilinear(lens.haloOffset, lens.haloSize, position + vec2<f32>(f32(dx), f32(dy)) * 0.5) * weight;
-    }
-  }
-
-  return sum;
-}
-
 /** The image as the lens delivers it: fringed towards the corners, with its halo, balanced for the camera's white. */
 @compute @workgroup_size(8, 8, 1)
 fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -298,7 +283,8 @@ fn composite(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 
   if (lens.intensity > 0.0) {
-    let halo = tentHalo(position * vec2<f32>(lens.haloSize) / size);
+    // The largest folded level is already a tent over the levels below it, so one bilinear read of it is smooth.
+    let halo = upBilinear(lens.haloOffset, lens.haloSize, position * vec2<f32>(lens.haloSize) / size);
 
     color = mix(color, halo, lens.intensity);
   }

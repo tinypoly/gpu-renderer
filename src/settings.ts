@@ -78,6 +78,12 @@ export interface GpuRenderSettings extends Omit<RenderSettings, "globalIlluminat
   subsurface: {
     /** Materials with `userData.cpuRenderer.subsurface` scatter light inside themselves. Off renders them opaque. */
     enabled: boolean;
+    /**
+     * Bounces at which light still walks inside such a material: past them it reflects off it as a diffuse surface of
+     * the same colour. Light that has already bounced that often hardly shows the difference, and every walk costs as
+     * much as many bounces.
+     */
+    depth: number;
   };
   /**
    * Aerial perspective: the air between the camera and what it sees, which fades distant things towards the colour of
@@ -123,13 +129,13 @@ export const DEFAULT_GPU_RENDER_SETTINGS: Readonly<GpuRenderSettings> = Object.f
     ...DEFAULT_RENDER_SETTINGS,
     // AgX rolls highlights off as film does, where ACES pushes saturated colours to the gamut's edge.
     toneMapping: "agx",
-    globalIllumination: { ...DEFAULT_RENDER_SETTINGS.globalIllumination, russianRoulette: true, rouletteStart: 3,
+    globalIllumination: { ...DEFAULT_RENDER_SETTINGS.globalIllumination, russianRoulette: true, rouletteStart: 1,
       lightTree: true },
     bloom: { enabled: true, intensity: 0.04, radius: 0.65 },
     glare: { enabled: true, intensity: 0.06, blades: 6, length: 0.25, rotation: 15 },
     lens: { chromaticAberration: 0.2, distortion: 0 },
     camera: { physicalExposure: false, iso: 100, shutterSpeed: 1 / 125, whiteBalance: 6500 },
-    subsurface: { enabled: true },
+    subsurface: { enabled: true, depth: 2 },
     atmosphere: { enabled: true, visibility: 20000, haze: 0.6, color: "" },
     volumes: { enabled: true },
     bevel: { enabled: true },

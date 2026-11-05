@@ -65,6 +65,34 @@ fn toUnit(value: u32) -> f32 {
 }
 
 /**
+ * The next pair of dimensions from a plain hash instead of the scrambled sequence: for the deep dimensions of a random
+ * walk, where stratification buys nothing and the sequence's table reads and scrambles cost a step more than its ray.
+ * It takes a dimension of its own, so the sequence's draws after it stay where they would have been.
+ */
+fn hashSample2D(rng: ptr<function, PathSampler>) -> vec2<f32> {
+  let first = pcgHash((*rng).seed ^ pcgHash((*rng).index * 2654435761u + (*rng).dimension * 0x9e3779b9u));
+  (*rng).dimension = (*rng).dimension + 1u;
+
+  return vec2<f32>(toUnit(first), toUnit(pcgHash(first)));
+}
+
+/**
+ * How many vertices of a path draw from the scrambled sequence. Its stratification shows on the camera ray and the
+ * first bounces, where the light a pixel sees is decided; past them the light has been averaged by every bounce
+ * before, and a plain hash gives numbers as good for a fraction of the cost.
+ */
+const SEQUENCE_DEPTH: u32 = 3u;
+
+/** The next pair of dimensions of a path's vertex: from the sequence while the path is shallow, from a hash after. */
+fn pathSample2D(rng: ptr<function, PathSampler>, deep: bool) -> vec2<f32> {
+  if (deep) {
+    return hashSample2D(rng);
+  }
+
+  return sample2D(rng);
+}
+
+/**
  * The next pair of dimensions, in [0, 1). The sample index is shuffled per pair as well, which pads the two dimensional
  * sequence out to as many dimensions as a path needs without correlating them.
  */

@@ -168,7 +168,7 @@ The renderer never falls back on its own. Choosing another renderer when WebGPU 
 | `globalIllumination.bounces` | `12` | How far a path goes: enough for light to fill a room. The roulette below keeps it affordable. |
 | `globalIllumination.clamp` | `10` | Maximum luminance one indirect contribution may add, which trades a little bias for fewer fireflies, as Cycles' indirect light clamp does. `0` disables clamping. |
 | `globalIllumination.russianRoulette` | `true` | Ends a path that carries little light by chance, weighting the survivors up so the mean stays exact. |
-| `globalIllumination.rouletteStart` | `3` | Bounces every path takes before the roulette may end it. |
+| `globalIllumination.rouletteStart` | `1` | Bounces every path takes before the roulette may end it. Past them a path carries on with the chance its own throughput gives, as in PBRT. |
 | `globalIllumination.lightTree` | `true` | Picks the light to aim at by what it delivers to the shaded point (power, distance, facing) through a tree over the scene's lights, rather than by power alone: a small lamp near a surface gets the samples it needs. |
 | `depthOfField.enabled` | `false` | |
 | `depthOfField.focusDistance` | `10` | World units. |
@@ -203,6 +203,7 @@ Groups only this renderer reads, all on by default except the physical exposure,
 | `atmosphere.haze` | `0.6` | `0` clean air, blue (Rayleigh); `1` haze, grey and bright towards the sun (Mie). |
 | `atmosphere.color` | `""` | The air's glow as `#rrggbb`; empty takes the surroundings' average. |
 | `subsurface.enabled` | `true` | Materials with a [`subsurface`](#object-options) medium scatter light inside. |
+| `subsurface.depth` | `2` | Bounces at which light still walks inside such a material; deeper it reflects as a diffuse surface of the same colour, which saves most of the walk's cost for what hardly shows. |
 | `volumes.enabled` | `true` | Meshes with a [`volume`](#object-options) are filled with their medium; off leaves them out. |
 | `bevel.enabled` | `true` | Materials with a [`bevel`](#object-options) radius round their edges at shading time. |
 

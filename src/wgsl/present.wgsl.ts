@@ -15,6 +15,8 @@ struct Present {
   transparent: u32,
   // Whether the colour comes from the denoiser's output rather than straight from the accumulation.
   denoised: u32,
+  // How much of AgX's Punchy look goes over its base curve.
+  contrast: f32,
 };
 
 @group(0) @binding(0) var<uniform> present: Present;
@@ -63,8 +65,16 @@ fn toneMapAgx(color: vec3<f32>) -> vec3<f32> {
     vec3<f32>(-0.0728, -0.0083, 1.1187));
   let logged = inset * (toAgx * color);
   let x = clamp((log2(max(logged, vec3<f32>(1e-10))) + 12.47393) / 16.499999, vec3<f32>(0.0), vec3<f32>(1.0));
-  let curved = 15.5 * pow(x, vec3<f32>(6.0)) - 40.14 * pow(x, vec3<f32>(5.0)) + 31.96 * pow(x, vec3<f32>(4.0))
+  let base = 15.5 * pow(x, vec3<f32>(6.0)) - 40.14 * pow(x, vec3<f32>(5.0)) + 31.96 * pow(x, vec3<f32>(4.0))
     - 6.868 * pow(x, vec3<f32>(3.0)) + 0.4298 * x * x + 0.1191 * x - 0.00232;
+  // A look in the spirit of Blender's Punchy, a power of 1.35 and more saturation, but pivoted on middle grey: Punchy
+  // raises the power around zero, which takes middle grey from half the display down to a third and darkens the whole
+  // image. Here the highlights rise and the shadows fall while grey, which the automatic exposure aims at, stands.
+  let pivot = 0.49673;
+  let contrasted = pivot * pow(max(base, vec3<f32>(0.0)) / pivot, vec3<f32>(1.35));
+  let luma = dot(contrasted, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let punchy = luma + 1.2 * (contrasted - luma);
+  let curved = mix(base, punchy, clamp(present.contrast, 0.0, 1.0));
 
   return fromAgx * pow(max(outset * curved, vec3<f32>(0.0)), vec3<f32>(2.2));
 }

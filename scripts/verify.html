@@ -17,7 +17,8 @@
           "three/": "/node_modules/three/",
           "@tinypoly/cpu-renderer": "/node_modules/@tinypoly/cpu-renderer/dist/index.js",
           "@tinypoly/cpu-renderer/engine": "/node_modules/@tinypoly/cpu-renderer/dist/engine.js",
-          "naga-wasm": "/node_modules/naga-wasm/dist/index.js"
+          "naga-wasm": "/node_modules/naga-wasm/dist/index.js",
+          "oidn-webgpu/dist/oidn.js": "/node_modules/oidn-webgpu/dist/oidn.js"
         }
       }
     </script>
@@ -767,6 +768,24 @@
         check("denoised mean matches the converged one", smooth.mean, converged.mean, 4);
         lines.push(`denoiser at 8 samples: deviation ${raw.deviation.toFixed(4)} raw, ${smooth.deviation.toFixed(4)} denoised`);
         check("denoising removes most of the noise", smooth.deviation < raw.deviation * 0.5 ? 1 : 0, 1);
+        // The same plane behind a thin window: the filter takes its guides from the plane, not from the glass. The
+        // window reflects nothing (an index of one), so the noise left is the plane's own: a reflection of this sun,
+        // straight behind the camera, would be a sharp glint the filter rightly leaves alone.
+        const behindGlass = () => {
+          const scene = plainScene();
+          const glass = new THREE.MeshPhysicalMaterial({ transmission: 1, thickness: 0, roughness: 0, ior: 1 });
+          const pane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), glass);
+          pane.position.z = 1.5;
+          scene.add(pane);
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        const rawGlass = await measureWith(behindGlass(), camera, { samples: 8 }, { kind: "hdri", url: noisySun });
+        const smoothGlass = await measureWith(behindGlass(), camera, { samples: 8, globalIllumination: { denoise: true } },
+          { kind: "hdri", url: noisySun });
+        lines.push(`behind a window at 8 samples: deviation ${rawGlass.deviation.toFixed(4)} raw, `
+          + `${smoothGlass.deviation.toFixed(4)} denoised`);
+        check("denoising sees through a window", smoothGlass.deviation < rawGlass.deviation * 0.5 ? 1 : 0, 1);
         check("a one pixel line stays one pixel wide, denoised", await measure(lineScene,
           { samples: 1024, globalIllumination: { denoise: true } }), 1 / 6, 6);
 
@@ -904,6 +923,63 @@
         const centreGreen = ((SIZE / 2) * SIZE + SIZE / 2) * 4 + 1;
         check("and glows with its colour over what it takes", toLinear(glowAir[centreGreen] / 255),
           0.25 * Math.sqrt(0.02) + (srgbToLinear(128 / 255) + I * backwards) * (1 - Math.sqrt(0.02)), 4);
+
+        log("portals");
+        // A room whose front wall is glass, the camera inside it facing the back wall, in a uniform sky: aiming through
+        // the window as well keeps the mean and leaves less noise.
+        const glassRoom = () => {
+          const scene = new THREE.Scene();
+          const wall = new THREE.MeshLambertMaterial({ side: THREE.DoubleSide });
+          wall.color.setRGB(0.8, 0.8, 0.8, THREE.LinearSRGBColorSpace);
+          const face = (w, h, x, y, z, rx, ry, material = wall) => {
+            const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), material);
+            mesh.position.set(x, y, z);
+            mesh.rotation.set(rx, ry, 0);
+            scene.add(mesh);
+          };
+          face(6, 6.5, 0, -1.5, 0.25, -Math.PI / 2, 0);
+          face(6, 6.5, 0, 1.5, 0.25, Math.PI / 2, 0);
+          face(6, 3, 0, 0, -3, 0, 0);
+          face(6.5, 3, -3, 0, 0.25, 0, Math.PI / 2);
+          face(6.5, 3, 3, 0, 0.25, 0, -Math.PI / 2);
+          face(6, 3, 0, 0, 3.5, 0, Math.PI,
+            new THREE.MeshPhysicalMaterial({ transmission: 1, thickness: 0, roughness: 0, side: THREE.DoubleSide }));
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        const throughWindows = await measureWith(glassRoom(), camera, {}, furnace);
+        const bySky = await measureWith(glassRoom(), camera, { globalIllumination: { portals: false } }, furnace);
+        check("portals keep the mean of sampling the sky alone", throughWindows.mean, bySky.mean, 3);
+        const fewWindows = await measureWith(glassRoom(), camera, { samples: 16 }, furnace);
+        const fewSky = await measureWith(glassRoom(), camera, { samples: 16, globalIllumination: { portals: false } }, furnace);
+        lines.push(`a glazed room at 16 samples: deviation ${fewSky.deviation.toFixed(4)} by the sky, `
+          + `${fewWindows.deviation.toFixed(4)} through the windows`);
+        check("and leave less noise inside", fewWindows.deviation < fewSky.deviation ? 1 : 0, 1);
+        // The same room in a building of 300 more windows, 600 triangles of glass, all further off, which the tree cannot
+        // see past walls: it still aims at the room's own window most, where a pick by area alone would spend nearly
+        // every sample on the others.
+        const glassHouse = () => {
+          const scene = glassRoom();
+          const glass = new THREE.MeshPhysicalMaterial({ transmission: 1, thickness: 0, roughness: 0, side: THREE.DoubleSide });
+          for (let k = 0; k < 300; k++) {
+            const pane = new THREE.Mesh(new THREE.PlaneGeometry(6, 3), glass);
+            pane.position.set(12 + (k % 20) * 8, 6 * Math.floor(k / 20), 3.5 + 12 * (k % 3));
+            scene.add(pane);
+          }
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        const houseWindows = await measureWith(glassHouse(), camera, {}, furnace);
+        check("in a building, portals still keep the mean", houseWindows.mean, bySky.mean, 3);
+        const fewHouse = await measureWith(glassHouse(), camera, { samples: 16 }, furnace);
+        lines.push(`a glazed room among 300 windows at 16 samples: deviation ${fewHouse.deviation.toFixed(4)} through the windows`);
+        check("and leave less noise there too", fewHouse.deviation < fewSky.deviation ? 1 : 0, 1);
+
+        log("auto exposure");
+        // A frame of uniform radiance 0.25 metered to middle grey, and a stop over it.
+        check("auto exposure meters to middle grey", await measure(lit(white()), { camera: { autoExposure: true } }), 0.18);
+        check("and its compensation adds stops", await measure(lit(white()),
+          { camera: { autoExposure: true, exposureCompensation: 1 } }), 0.36);
 
         log("light tree");
         // A small bright bulb near the plane and a large dim panel far off, which weighing by power alone gets wrong:

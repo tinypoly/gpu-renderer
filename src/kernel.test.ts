@@ -25,7 +25,7 @@ it("validates the path tracing kernel without any shader", () => {
 });
 
 it("validates the kernel without the subsurface walk or volumes, as a plain scene compiles it", () => {
-  expect(() => check(pathTraceSource(null, false, false, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, false, false, false))).not.toThrow();
   expect(() => check(pathTraceSource(null, false, false, true))).not.toThrow();
   expect(() => check(pathTraceSource(null, true, false))).not.toThrow();
   expect(() => check(pathTraceSource(null, false, true))).not.toThrow();

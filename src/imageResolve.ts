@@ -62,6 +62,7 @@ export interface ResolveSettings {
   exposure: number;
   toneMapping: RenderToneMapping;
   vignette: number;
+  contrast: number;
   transparent: boolean;
 }
 
@@ -92,6 +93,7 @@ export class ImageResolvePass {
     floats[4] = settings.vignette;
     integers[7] = settings.transparent ? 1 : 0;
     integers[8] = denoised ? 1 : 0;
+    floats[9] = settings.contrast;
     this.device.queue.writeBuffer(this.uniforms, 0, this.values);
 
     const bytes = width * height * 4;

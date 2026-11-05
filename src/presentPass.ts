@@ -9,6 +9,8 @@ export interface PresentUniforms {
   toneMapping: RenderToneMapping;
   vignette: number;
   grain: number;
+  /** AgX's look, from its base curve to Punchy. */
+  contrast: number;
   frameIndex: number;
   transparent: boolean;
   /** The denoiser's output, which the colour is read from instead of the accumulation when given. */
@@ -84,6 +86,7 @@ export class PresentPass {
     this.integers[6] = present.frameIndex;
     this.integers[7] = present.transparent ? 1 : 0;
     this.integers[8] = present.denoised ? 1 : 0;
+    this.floats[9] = present.contrast;
     this.device.queue.writeBuffer(this.uniforms, 0, this.values);
 
     const pass = encoder.beginRenderPass({

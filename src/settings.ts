@@ -20,6 +20,12 @@ export interface GpuRenderSettings extends Omit<RenderSettings, "globalIlluminat
      * gets the samples a large panel far away would have taken.
      */
     lightTree: boolean;
+    /**
+     * Inside a room, aims at the sky through its windows (every thin transmissive material) as well as by its
+     * brightness, as Cycles' portals do, so daylight that enters through glass is found instead of stumbled upon.
+     * A point counts as inside when something is above it; elsewhere the sky is sampled as before.
+     */
+    portals: boolean;
   };
   /**
    * The light a real lens and sensor scatter around anything bright: a soft halo that fades with distance. Energy
@@ -61,10 +67,23 @@ export interface GpuRenderSettings extends Omit<RenderSettings, "globalIlluminat
   /** A camera's exposure triangle and white balance. */
   camera: {
     /**
+     * The contrast and saturation of AgX's look, `0` to `1`: `0` is its base curve, flat on purpose, and `1` a look
+     * like Blender's Punchy, pivoted on middle grey so the image keeps its brightness. The other tone mappings ignore it.
+     */
+    contrast: number;
+    /**
      * Exposes from `iso`, `shutterSpeed` and `depthOfField.aperture` as a camera would, with `exposure` as a
      * compensation on top. The scene's lights then have to be in physical units (lux, candela, nits).
      */
     physicalExposure: boolean;
+    /**
+     * Meters the image as a camera in automatic does and exposes it to middle grey, from the mean of the logarithms of
+     * its luminance, weighed towards the centre: a bright window or sky cannot darken the rest. It takes the place of
+     * `exposure` and of the physical exposure, with `exposureCompensation` on top.
+     */
+    autoExposure: boolean;
+    /** Stops added to the metered exposure: positive brightens, as on a camera's dial. */
+    exposureCompensation: number;
     iso: number;
     /** Seconds. */
     shutterSpeed: number;
@@ -130,11 +149,14 @@ export const DEFAULT_GPU_RENDER_SETTINGS: Readonly<GpuRenderSettings> = Object.f
     // AgX rolls highlights off as film does, where ACES pushes saturated colours to the gamut's edge.
     toneMapping: "agx",
     globalIllumination: { ...DEFAULT_RENDER_SETTINGS.globalIllumination, russianRoulette: true, rouletteStart: 1,
-      lightTree: true },
+      lightTree: true, portals: true },
     bloom: { enabled: true, intensity: 0.04, radius: 0.65 },
     glare: { enabled: true, intensity: 0.06, blades: 6, length: 0.25, rotation: 15 },
-    lens: { chromaticAberration: 0.2, distortion: 0 },
-    camera: { physicalExposure: false, iso: 100, shutterSpeed: 1 / 125, whiteBalance: 6500 },
+    lens: { chromaticAberration: 0.05, distortion: 0 },
+    camera: {
+      contrast: 1, physicalExposure: false, autoExposure: false, exposureCompensation: 0, iso: 100,
+      shutterSpeed: 1 / 125, whiteBalance: 6500,
+    },
     subsurface: { enabled: true, depth: 2 },
     atmosphere: { enabled: true, visibility: 20000, haze: 0.6, color: "" },
     volumes: { enabled: true },
@@ -160,9 +182,15 @@ export function physicalExposure(aperture: number, shutterSpeed: number, iso: nu
   return 1 / (1.2 * 2 ** ev100);
 }
 
-/** The exposure the image is multiplied by: the setting itself, or a camera's on top of it as compensation. */
+/**
+ * The exposure the image is multiplied by: the setting itself, or a camera's on top of it as compensation, or with
+ * the automatic exposure only its compensation, the meter's own exposure being applied on the device.
+ */
 export function effectiveExposure(settings: GpuRenderSettings): number {
   const { camera, depthOfField, exposure } = settings;
+
+  // The meter's exposure is applied on the device, by the lens pass; what is left here is the compensation.
+  if (camera.autoExposure) return 2 ** (Number(camera.exposureCompensation) || 0);
 
   return camera.physicalExposure
     ? exposure * physicalExposure(depthOfField.aperture, camera.shutterSpeed, camera.iso)

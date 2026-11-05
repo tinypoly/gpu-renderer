@@ -40,6 +40,7 @@ import {
   type DenoiserSettings,
   type DenoiseView,
 } from "./denoise.js";
+import { DEFAULT_OIDN_WEIGHTS, OidnPass } from "./oidnPass.js";
 import { CaptureResolvePass, planarCaptures, type PlanarCaptures } from "./planarCapture.js";
 import { prepareSceneAssets, type SceneAssets } from "./sceneAssets.js";
 import { packVolumetricLights, VOLUMETRIC_WORDS } from "./volumetric.js";
@@ -121,6 +122,13 @@ export interface GpuRendererOptions {
 interface PendingFrame {
   resolve: (image: RenderImage) => void;
   reject: (reason: Error) => void;
+}
+
+/** AgX's look, which a missing or broken setting leaves at the base curve's own. */
+function lookContrast(settings: GpuRenderSettings): number {
+  const contrast = Number(settings.camera.contrast);
+
+  return Number.isFinite(contrast) ? Math.min(1, Math.max(0, contrast)) : 0;
 }
 
 function abortError(message: string): Error {
@@ -291,6 +299,14 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private planar = false;
   private resolve: CaptureResolvePass | null = null;
   private denoisePass: DenoisePass | null = null;
+  private oidnPass: OidnPass | null = null;
+  // The buffer the last denoise wrote, whichever denoiser ran it.
+  private denoiseOutput: GPUBuffer | null = null;
+  // The network denoises one image at a time: each run waits for the one before it.
+  private oidnRun: Promise<unknown> = Promise.resolve();
+  private oidnBusy = false;
+  // Set once the network failed to load or run; SVGF stands in until the denoiser settings change.
+  private oidnFailed = false;
   private lensPass: LensPass | null = null;
   // What the lens pass last graded, and when: its input only changes when the denoiser runs or the accumulation grows.
   private lensKey = "";
@@ -351,6 +367,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
    */
   setDenoiser(input: Partial<DenoiserSettings>) {
     this.denoiserSettings = mergeDenoiser(this.denoiserSettings, input);
+    this.oidnFailed = false;
     this.refilter();
   }
 
@@ -364,16 +381,18 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     const denoise = this.current.globalIllumination.denoise;
 
     void (async() => {
-      const encoder = gpu.device.createCommandEncoder();
-
-      if (denoise) this.encodeDenoise(gpu, encoder, finished.width, finished.height);
+      if (denoise) await this.denoiseNow(gpu, finished.width, finished.height);
       else this.denoised = false;
+
+      if (revision !== this.revision || this.rendering) return;
+
+      const encoder = gpu.device.createCommandEncoder();
 
       this.encodePresent(encoder, finished.width, finished.height);
       gpu.device.queue.submit([encoder.finish()]);
 
       const image = await this.readImage(gpu, finished.width, finished.height,
-        denoise ? this.denoisePass?.output ?? null : null);
+        denoise && this.denoised ? this.denoiseOutput : null);
 
       // A frame started meanwhile owns the image now.
       if (revision !== this.revision || this.rendering) return;
@@ -558,6 +577,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.buffers?.destroy();
     this.accumulator?.destroy();
     this.denoisePass?.destroy();
+    this.oidnPass?.destroy();
     this.lensPass?.destroy();
     this.lensPass = null;
     this.imageResolve?.dispose();
@@ -738,14 +758,30 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
       // The canvas shows the denoised image, refreshed a few times a second while the bands refine underneath it:
       // filtering the whole image after every pass would cost a cheap scene as much as tracing it.
-      if (denoise && this.canvas && this.context && performance.now() - denoisedAt
+      if (denoise && this.canvas && this.context && !this.oidnBusy && performance.now() - denoisedAt
         >= denoiseInterval(width, height, this.denoiserSettings.passes)) {
-        const encoder = gpu.device.createCommandEncoder();
+        if (this.usesOidn()) {
+          // The network takes longer than a pass: it runs beside the tracing, and the canvas takes its image when done.
+          this.oidnBusy = true;
+          void this.denoiseNow(gpu, width, height).then(() => {
+            if (revision !== this.revision || !this.denoised) return;
 
-        this.encodeDenoise(gpu, encoder, width, height);
-        this.encodePresent(encoder, width, height);
-        gpu.device.queue.submit([encoder.finish()]);
-        denoisedAt = performance.now();
+            const encoder = gpu.device.createCommandEncoder();
+
+            this.encodePresent(encoder, width, height);
+            gpu.device.queue.submit([encoder.finish()]);
+          }).finally(() => {
+            this.oidnBusy = false;
+            denoisedAt = performance.now();
+          });
+        } else {
+          const encoder = gpu.device.createCommandEncoder();
+
+          this.encodeDenoise(gpu, encoder, width, height);
+          this.encodePresent(encoder, width, height);
+          gpu.device.queue.submit([encoder.finish()]);
+          denoisedAt = performance.now();
+        }
       }
 
       this.emit("sample", { samples: Math.min(target, Math.round(spent / height)), target });
@@ -766,14 +802,16 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.check(revision);
 
     if (denoise) {
+      await this.denoiseNow(gpu, width, height);
+      this.check(revision);
+
       const encoder = gpu.device.createCommandEncoder();
 
-      this.encodeDenoise(gpu, encoder, width, height);
       this.encodePresent(encoder, width, height);
       gpu.device.queue.submit([encoder.finish()]);
     }
 
-    const image = await this.readImage(gpu, width, height, denoise ? this.denoisePass?.output ?? null : null);
+    const image = await this.readImage(gpu, width, height, denoise && this.denoised ? this.denoiseOutput : null);
 
     this.check(revision);
     this.output = image;
@@ -831,7 +869,11 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
         && subsurfaceOf(material) !== null),
       // Even turned off, a volume's boundary has to stay invisible, which takes the same code.
       materials.some(material => volumeOf(material) !== null),
-      this.current.bevel.enabled && materials.some(material => bevelOf(material) > 0));
+      this.current.bevel.enabled && materials.some(material => bevelOf(material) > 0),
+      // Portals need windows: thin glass, which is what a physical material with transmission and no thickness is.
+      this.current.globalIllumination.portals !== false && materials.some(material =>
+        material.type === "MeshPhysicalMaterial" && Number(material.values.transmission) > 0
+        && !(Number(material.values.thickness) > 0)));
 
     // A procedural sky stands in for the renderer's own environment, as it does in the CPU renderer.
     const environment = assets.sky?.environment ?? image;
@@ -1071,10 +1113,11 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       toneMapping: this.current.toneMapping,
       vignette: this.current.vignette,
       grain: this.current.grain,
+      contrast: lookContrast(this.current),
       frameIndex: this.frameIndex,
       transparent: this.current.background.mode === "transparent",
       denoised: this.encodeLens(this.gpu, encoder, width, height,
-        this.denoised ? this.denoisePass?.output ?? null : null),
+        this.denoised ? this.denoiseOutput : null),
     });
   }
 
@@ -1110,8 +1153,65 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.denoisePass ??= new DenoisePass(gpu.device);
     this.denoisePass.encode(encoder, (this.accumulator as Accumulator).buffer, width, height, this.denoiserSettings,
       this.denoiseView);
+    this.denoiseOutput = this.denoisePass.output;
     this.denoised = true;
     this.denoiseVersion++;
+  }
+
+  private usesOidn(): boolean {
+    return this.denoiserSettings.algorithm === "oidn" && !this.oidnFailed;
+  }
+
+  /**
+   * Denoises the accumulation as it stands with the chosen denoiser, and resolves once the output holds it. SVGF is
+   * submitted at once; OIDN runs after any run still in flight, and is dropped when a newer frame starts meanwhile.
+   */
+  private async denoiseNow(gpu: RenderDevice, width: number, height: number): Promise<void> {
+    if (this.usesOidn()) {
+      const revision = this.revision;
+      const run = this.oidnRun.then(() => this.runOidn(gpu, width, height, revision));
+
+      this.oidnRun = run.catch(() => undefined);
+
+      // Denoised, or replaced by a newer frame: either way nothing is left to do here.
+      if (await run || !this.oidnFailed) return;
+    }
+
+    const encoder = gpu.device.createCommandEncoder();
+
+    this.encodeDenoise(gpu, encoder, width, height);
+    gpu.device.queue.submit([encoder.finish()]);
+  }
+
+  private async runOidn(gpu: RenderDevice, width: number, height: number, revision: number): Promise<boolean> {
+    if (revision !== this.revision || !this.accumulator) return false;
+
+    const signal = { cancelled: false };
+
+    const watch = () => { signal.cancelled = revision !== this.revision; };
+
+    this.oidnPass ??= new OidnPass(gpu.device);
+
+    try {
+      const { strength, oidnWeights } = this.denoiserSettings;
+      const timer = setInterval(watch, 50);
+
+      const done = await this.oidnPass.run(this.accumulator.buffer, width, height, strength,
+        oidnWeights || DEFAULT_OIDN_WEIGHTS, signal).finally(() => clearInterval(timer));
+
+      if (!done || revision !== this.revision) return false;
+
+      this.denoiseOutput = this.oidnPass.output;
+      this.denoised = true;
+      this.denoiseVersion++;
+
+      return true;
+    } catch(error) {
+      this.oidnFailed = true;
+      console.warn("GPU renderer: OIDN could not denoise, so SVGF does.", error);
+
+      return false;
+    }
   }
 
   private frameUniforms(
@@ -1201,6 +1301,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       lightTree: this.current.globalIllumination.lightTree === false ? 0 : buffers?.lightTree ?? 0,
       lightLeaves: buffers?.lightLeaves ?? 0,
       lightList: buffers?.lightList ?? 0,
+      portals: buffers?.portals ?? 0,
+      portalCount: this.current.globalIllumination.portals === false ? 0 : buffers?.portalCount ?? 0,
+      portalList: buffers?.portalList ?? 0,
       clampIndirect: Math.max(0, this.current.globalIllumination.clamp),
       // The setting is the angular diameter a light covers, in degrees, as it is for the CPU renderer's shadow blur.
       shadowSpread: shadows.enabled ? Math.tan(Math.max(0, shadows.softness) * Math.PI / 360) : 0,
@@ -1249,7 +1352,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     gpu.device.queue.submit([encoder.finish()]);
 
     const data = await this.imageResolve.read(accumulator.buffer, graded, width, height,
-      { exposure, toneMapping, vignette, transparent });
+      { exposure, toneMapping, vignette, contrast: lookContrast(this.current), transparent });
 
     return { width, height, data };
   }

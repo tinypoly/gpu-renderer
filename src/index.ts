@@ -19,7 +19,8 @@ export type {
 export { attachCanvas } from "./canvas.js";
 
 export { DEFAULT_DENOISER } from "./denoise.js";
-export type { DenoiserSettings } from "./denoise.js";
+export { DEFAULT_OIDN_WEIGHTS } from "./oidnPass.js";
+export type { DenoiserAlgorithm, DenoiserSettings } from "./denoise.js";
 
 // The settings only this renderer reads, beside the CPU renderer's, and the defaults it renders with.
 export {

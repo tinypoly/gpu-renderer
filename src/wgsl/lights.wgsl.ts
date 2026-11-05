@@ -52,11 +52,143 @@ fn lightByProbability(u: f32) -> Light {
   return lights[low];
 }
 
+const TREE_NODE_WORDS: u32 = 16u;
+const TREE_LEAF: u32 = 0x80000000u;
+const TREE_ROOT_PARENT: u32 = 0xffffffffu;
+const NO_LIGHT: u32 = 0xffffffffu;
+
 /**
- * The area density with which direct sampling would have picked a point on this triangle, or zero if it never would.
- * Only the leading entries are emissive triangles, and they are in triangle order, so one binary search answers it.
+ * How much the lights under a node of the light tree can deliver to a point: their power over the square of the
+ * distance, times how well their cone of directions and the receiving surface face each other, each widened by the
+ * angle the node's box takes from the point (Conty Estevez and Kulla's importance). A point inside the box rules
+ * nothing out. A zero normal is a receiver that takes light from everywhere, such as a point in a volume.
  */
-fn lightPdfOfTriangle(triangle: u32) -> f32 {
+fn lightNodeImportance(node: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
+  let at = frame.lightTree + node * TREE_NODE_WORDS;
+  let low = extraVec4(at);
+  let high = extraVec4(at + 4u);
+  let cone = extraVec4(at + 8u);
+
+  if (low.w <= 0.0) {
+    return 0.0;
+  }
+
+  let centre = (low.xyz + high.xyz) * 0.5;
+  let radius = length(high.xyz - low.xyz) * 0.5;
+  let offset = position - centre;
+  let distance2 = dot(offset, offset);
+
+  if (distance2 <= radius * radius) {
+    return low.w / max(radius * radius, 1e-12);
+  }
+
+  let distance = sqrt(distance2);
+  let spread = asin(clamp(radius / distance, 0.0, 1.0));
+  var orientation = 1.0;
+
+  // A cone of minus one is the whole sphere: such lights shine towards every point alike.
+  if (high.w > -1.0) {
+    let theta = acos(clamp(dot(cone.xyz, offset / distance), -1.0, 1.0));
+    let past = max(0.0, theta - acos(high.w) - spread);
+
+    orientation = select(0.0, cos(past), past <= acos(clamp(cone.w, -1.0, 1.0)));
+  }
+
+  var facing = 1.0;
+
+  if (any(normal != vec3<f32>(0.0))) {
+    let past = max(0.0, acos(clamp(dot(normal, -offset / distance), -1.0, 1.0)) - spread);
+
+    facing = select(0.0, cos(past), past < 0.5 * PI);
+  }
+
+  return low.w * orientation * facing / distance2;
+}
+
+/** The chance of stepping from a node of the tree to each of its children, from this point. */
+fn lightChildOdds(left: u32, right: u32, position: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+  var importance = vec2<f32>(0.0);
+
+  // One loop over the two children, so the importance is written into the kernel once per walk.
+  for (var k = 0u; k < 2u; k = k + 1u) {
+    importance[k] = lightNodeImportance(select(right, left, k == 0u), position, normal);
+  }
+
+  let total = importance.x + importance.y;
+
+  return select(importance / total, vec2<f32>(0.0), total <= 0.0);
+}
+
+/** A light picked down the tree by importance from this point, with the chance of picking it; NO_LIGHT for none. */
+fn sampleLightTree(position: vec3<f32>, normal: vec3<f32>, u: f32, pdf: ptr<function, f32>,
+  density: ptr<function, f32>) -> u32 {
+  var node = 0u;
+  var chance = 1.0;
+  var x = u;
+
+  for (var depth = 0u; depth < 64u; depth = depth + 1u) {
+    let at = frame.lightTree + node * TREE_NODE_WORDS;
+    let first = textures[at + 12u];
+
+    if ((first & TREE_LEAF) != 0u) {
+      *pdf = chance;
+      *density = extraFloat(at + 13u);
+
+      return first & ~TREE_LEAF;
+    }
+
+    let second = textures[at + 13u];
+    let odds = lightChildOdds(first, second, position, normal);
+
+    if (odds.x + odds.y <= 0.0) {
+      return NO_LIGHT;
+    }
+
+    if (x < odds.x) {
+      node = first;
+      chance = chance * odds.x;
+      x = x / odds.x;
+    } else {
+      node = second;
+      chance = chance * odds.y;
+      x = (x - odds.x) / max(odds.y, 1e-20);
+    }
+
+    x = min(x, 0.99999994);
+  }
+
+  return NO_LIGHT;
+}
+
+/** The chance the tree would have picked the local light at this index from this point, walked up from its leaf. */
+fn lightTreePdf(index: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
+  var node = textures[frame.lightLeaves + index];
+  var chance = extraFloat(frame.lightTree + node * TREE_NODE_WORDS + 13u);
+
+  for (var depth = 0u; depth < 64u; depth = depth + 1u) {
+    let parent = textures[frame.lightTree + node * TREE_NODE_WORDS + 14u];
+
+    if (parent == TREE_ROOT_PARENT) {
+      return chance;
+    }
+
+    let at = frame.lightTree + parent * TREE_NODE_WORDS;
+    let first = textures[at + 12u];
+    let odds = lightChildOdds(first, textures[at + 13u], position, normal);
+
+    chance = chance * select(odds.y, odds.x, node == first);
+    node = parent;
+  }
+
+  return 0.0;
+}
+
+/**
+ * The area density with which direct sampling from this point would have picked a point on this triangle, or zero if
+ * it never would. Only the leading entries are emissive triangles, and they are in triangle order, so one binary search
+ * finds the entry; the tree, when there is one, says how likely it was from here.
+ */
+fn lightPdfOfTriangle(triangle: u32, position: vec3<f32>, normal: vec3<f32>) -> f32 {
   var low = 0u;
   var high = frame.areaLightCount;
 
@@ -69,6 +201,10 @@ fn lightPdfOfTriangle(triangle: u32) -> f32 {
     let candidate = textures[frame.lightTriangles + middle];
 
     if (candidate == triangle) {
+      if (frame.lightTree != 0u) {
+        return frame.localLightPick * lightTreePdf(middle, position, normal);
+      }
+
       return lights[middle].pdf;
     }
 
@@ -128,12 +264,27 @@ fn rectanglePoint(light: Light, u: vec2<f32>) -> vec3<f32> {
  * Where the light that pick selects arrives from, and how much of it. u places the point on a surface light or spreads a
  * point light's shadow, so the same two dimensions serve every kind.
  */
-fn sampleLight(position: vec3<f32>, pick: f32, u: vec2<f32>) -> LightSample {
+fn sampleLight(position: vec3<f32>, normal: vec3<f32>, pick: f32, u: vec2<f32>) -> LightSample {
   if (frame.lightCount == 0u) {
     return noLight();
   }
 
-  return sampleLightEntry(lightByProbability(pick), position, u);
+  // The lights in the scene go through the tree, by what they can deliver here; what lies outside it by its weight.
+  if (frame.lightTree != 0u && pick < frame.localLightPick) {
+    var chance = 0.0;
+    var density = 1.0;
+    let index = sampleLightTree(position, normal, pick / frame.localLightPick, &chance, &density);
+
+    if (index == NO_LIGHT || chance <= 0.0) {
+      return noLight();
+    }
+
+    return sampleLightEntry(lights[index], frame.localLightPick * chance * density, position, u);
+  }
+
+  let light = lightByProbability(pick);
+
+  return sampleLightEntry(light, light.pdf, position, u);
 }
 
 /** Three's spotLightMap: inside the projection's frustum the texture tints the light; outside it leaves it alone. */
@@ -160,7 +311,8 @@ fn spotLightTint(light: Light, position: vec3<f32>) -> vec3<f32> {
   return sampleTextureRaw(map, projected.xy).rgb;
 }
 
-fn sampleLightEntry(light: Light, position: vec3<f32>, u: vec2<f32>) -> LightSample {
+/** pdf is the chance of picking this light, times the area density of a point on it where it has an area. */
+fn sampleLightEntry(light: Light, pdf: f32, position: vec3<f32>, u: vec2<f32>) -> LightSample {
   var sample: LightSample;
   sample.valid = true;
   sample.kind = light.kind;
@@ -176,7 +328,7 @@ fn sampleLightEntry(light: Light, position: vec3<f32>, u: vec2<f32>) -> LightSam
       return noLight();
     }
 
-    let density = light.pdf * drawn.pdf;
+    let density = pdf * drawn.pdf;
 
     sample.direction = drawn.direction;
     sample.distance = 1e30;
@@ -191,7 +343,7 @@ fn sampleLightEntry(light: Light, position: vec3<f32>, u: vec2<f32>) -> LightSam
     sample.direction = spreadDirection(light.direction, u);
     sample.distance = 1e30;
     // The colour already carries the intensity, which for a directional light is the irradiance it delivers.
-    sample.value = light.color / light.pdf;
+    sample.value = light.color / pdf;
 
     return sample;
   }
@@ -220,7 +372,7 @@ fn sampleLightEntry(light: Light, position: vec3<f32>, u: vec2<f32>) -> LightSam
 
     // Stop just short of the light so its own surface is not reported as the blocker.
     sample.distance = distance * (1.0 - 1e-3);
-    let density = light.pdf * distanceSquared / cosLight;
+    let density = pdf * distanceSquared / cosLight;
     // The emissive map is read at the very point that was sampled, so this agrees with what a bounce ray would find.
     let emission = select(light.color, emissionAt(light.triangle, bary), area);
 
@@ -260,7 +412,7 @@ fn sampleLightEntry(light: Light, position: vec3<f32>, u: vec2<f32>) -> LightSam
 
   sample.direction = spreadDirection(towards, u);
   sample.distance = distance;
-  sample.value = light.color * (power / light.pdf);
+  sample.value = light.color * (power / pdf);
 
   if (light.kind == LIGHT_SPOT) {
     sample.value = sample.value * spotLightTint(light, position);
@@ -277,7 +429,7 @@ fn blocksAll(m: u32) -> bool {
   let flags = materials[m].flags;
   let blending = materials[m].blending;
 
-  return (flags & (MATERIAL_TRANSPARENT | MATERIAL_ALPHA_HASH | MATERIAL_WIREFRAME)) == 0u
+  return (flags & (MATERIAL_TRANSPARENT | MATERIAL_ALPHA_HASH | MATERIAL_WIREFRAME | MATERIAL_VOLUME)) == 0u
     && materials[m].alphaTest <= 0.0
     && materials[m].transmission <= 0.0
     && materials[m].clipCount == 0u
@@ -333,45 +485,63 @@ fn blendColor(triangle: u32, bary: vec2<f32>) -> vec3<f32> {
 /**
  * How much of the light this sample came from reaches the shaded point. A surface that only partly covers its triangle
  * blocks the ray only that often, which is what makes a cutout leaf cast a cutout shadow; a thin transmissive wall
- * lets its own share through, tinted.
+ * lets its own share through, tinted. A volume's boundary lets the ray in or out, and the medium inside takes its
+ * share over the distance between; medium is the density at the shaded point itself, zero outside any volume.
  */
-fn lightTransmittance(
-  position: vec3<f32>, chosen: LightSample, rng: ptr<function, PathSampler>, skipMaterial: u32) -> vec3<f32> {
-  if (!chosen.occlude) {
+fn lightTransmittance(position: vec3<f32>, chosen: LightSample, rng: ptr<function, PathSampler>, skipMaterial: u32,
+  medium: f32) -> vec3<f32> {
+  // A light that casts no shadow is blocked by nothing, but a medium on the way still takes its share: then the walk
+  // below only looks for volumes and passes every other surface.
+  if (!chosen.occlude && !VOLUMES) {
     return vec3<f32>(1.0);
   }
 
-  // Most blockers are plainly opaque, and for those any triangle on the way settles it: the search stops at the first
-  // one found instead of looking for the closest. Anything that lets light through goes the long way below.
-  let first = traceAny(position, chosen.direction, chosen.distance);
+  if (chosen.occlude) {
+    // Most blockers are plainly opaque, and for those any triangle on the way settles it: the search stops at the
+    // first one found instead of looking for the closest. Anything that lets light through goes the long way below.
+    let first = traceAny(position, chosen.direction, chosen.distance);
 
-  if (first == NO_HIT) {
-    return vec3<f32>(1.0);
-  }
+    if (first == NO_HIT) {
+      return vec3<f32>(exp(-medium * chosen.distance));
+    }
 
-  let firstMaterial = materialIndexOf(first);
+    let firstMaterial = materialIndexOf(first);
 
-  if (firstMaterial != skipMaterial && blocksAll(firstMaterial)) {
-    return vec3<f32>(0.0);
+    if (firstMaterial != skipMaterial && blocksAll(firstMaterial)) {
+      return vec3<f32>(0.0);
+    }
   }
 
   var origin = position;
   var remaining = chosen.distance;
   var through = vec3<f32>(1.0);
+  // The medium the ray is in, and how far along the ray it entered it.
+  var density = medium;
+  var travelled = 0.0;
+  var enteredAt = 0.0;
 
   for (var skip = 0u; skip < MAX_SHADOW_SKIPS; skip = skip + 1u) {
     let blocker = traceScene(origin, chosen.direction, remaining);
 
     if (blocker.triangle == NO_HIT) {
-      return through;
+      return through * exp(-density * (travelled + remaining - enteredAt));
     }
 
     let bary = vec2<f32>(blocker.u, blocker.v);
     let m = materialIndexOf(blocker.triangle);
     let blending = materials[m].blending;
 
-    // A shadow catcher catches shadows rather than casting them, and a surface that adds light blocks none.
-    if (m != skipMaterial && materials[m].kind != KIND_SHADOW && blending != BLEND_ADDITIVE) {
+    if (VOLUMES && (materials[m].flags & MATERIAL_VOLUME) != 0u) {
+      let at = travelled + blocker.distance;
+
+      if (dot(authoredNormal(blocker.triangle, bary), chosen.direction) < 0.0) {
+        density = select(0.0, materials[m].volume.w, frame.volumesEnabled != 0u);
+        enteredAt = at;
+      } else {
+        through = through * exp(-density * (at - enteredAt));
+        density = 0.0;
+      }
+    } else if (chosen.occlude && m != skipMaterial && materials[m].kind != KIND_SHADOW && blending != BLEND_ADDITIVE) {
       let coverage = coverageAt(blocker.triangle, bary, chosen.direction);
 
       if (blending == BLEND_MULTIPLY) {
@@ -390,13 +560,15 @@ fn lightTransmittance(
     // The ray carries on from just past the surface it saw through.
     origin = origin + chosen.direction * (blocker.distance + RAY_EPSILON);
     remaining = remaining - blocker.distance - RAY_EPSILON;
+    travelled = travelled + blocker.distance + RAY_EPSILON;
 
     if (remaining <= RAY_EPSILON) {
-      return through;
+      return through * exp(-density * (travelled - enteredAt));
     }
   }
 
-  return vec3<f32>(0.0);
+  // Too many surfaces to see through: a shadow ray gives up dark, a ray that only counts the media keeps what it has.
+  return select(vec3<f32>(0.0), through, !chosen.occlude);
 }
 
 /**
@@ -418,13 +590,13 @@ fn shadowMaskAt(position: vec3<f32>, rng: ptr<function, PathSampler>) -> f32 {
       continue;
     }
 
-    let chosen = sampleLightEntry(light, position, sample2D(rng));
+    let chosen = sampleLightEntry(light, light.pdf, position, sample2D(rng));
 
     if (!chosen.valid) {
       continue;
     }
 
-    let visible = luminanceOf(lightTransmittance(position, chosen, rng, NO_MATERIAL));
+    let visible = luminanceOf(lightTransmittance(position, chosen, rng, NO_MATERIAL, 0.0));
 
     shadow = max(shadow, 1.0 - clamp(visible, 0.0, 1.0));
   }

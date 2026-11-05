@@ -15,6 +15,16 @@ export interface DenoiserSettings {
   onlyNoisy: boolean;
   /** Clamp a pixel brighter than every one of its neighbours to the brightest of them, before filtering. */
   antiFirefly: boolean;
+  /**
+   * How far the filter lets go of the normal and depth tests over a material that scatters light inside, from 0 to 1.
+   * Light leaves such a surface after wandering under it, so its shading hardly follows the normal at each point.
+   */
+  subsurface: number;
+  /**
+   * The smallest footprint a smooth reflection is filtered over, in pixels; 0 leaves a mirror alone. Within it, taps
+   * also have to agree on how far away the reflected thing is, so the edge of a reflected object stays sharp.
+   */
+  mirrorRadius: number;
 }
 
 export const DEFAULT_DENOISER: Readonly<DenoiserSettings> = Object.freeze({
@@ -23,6 +33,8 @@ export const DEFAULT_DENOISER: Readonly<DenoiserSettings> = Object.freeze({
   edge: 2,
   onlyNoisy: true,
   antiFirefly: true,
+  subsurface: 1,
+  mirrorRadius: 3,
 });
 
 /** The settings with `input` applied, each field kept in range. */
@@ -35,6 +47,8 @@ export function mergeDenoiser(base: DenoiserSettings, input: Partial<DenoiserSet
     edge: Math.max(0.01, Number(merged.edge) || DEFAULT_DENOISER.edge),
     onlyNoisy: Boolean(merged.onlyNoisy),
     antiFirefly: Boolean(merged.antiFirefly),
+    subsurface: Math.min(1, Math.max(0, Number(merged.subsurface) || 0)),
+    mirrorRadius: Math.min(16, Math.max(0, Number(merged.mirrorRadius) || 0)),
   };
 }
 
@@ -77,7 +91,8 @@ struct Params {
   converged: f32,
   pixelScale: f32,
   orthographic: u32,
-  padding: vec2<u32>,
+  subsurface: f32,
+  mirrorRadius: f32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -130,6 +145,11 @@ fn guideDepth(index: u32) -> f32 {
 
 fn guideRoughness(index: u32) -> f32 {
   return accumulation[2u * params.count + index].w / samples(index);
+}
+
+/** How much of the first surface scatters light inside, averaged over the pixel's samples. */
+fn guideSubsurface(index: u32) -> f32 {
+  return accumulation[5u * params.count + index].w / samples(index);
 }
 
 fn specularDistance(index: u32) -> f32 {
@@ -282,11 +302,22 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
   let normal = guide.xyz;
   let depth = guide.w;
   let roughness = roughnesses[index];
-  let diffuseSigma = params.edge * sqrt(max(localVariance(pixel, false), 0.0)) + 1e-6;
+  let diffuseSigma = params.edge * sqrt(max(localVariance(pixel, false), 0.0))
+    * (1.0 + guideSubsurface(index) * params.subsurface) + 1e-6;
   let specularSigma = params.edge * sqrt(max(localVariance(pixel, true), 0.0)) + 1e-6;
-  let radius = specularRadius(index, depth);
-  // A smoother surface's reflection turns faster with its normal: the normal test sharpens with it.
-  let specularPower = min(128.0 / max(roughness * roughness, 0.03), 4096.0);
+  // A smooth reflection is filtered over at least the mirror radius, by taps that see the reflected thing at the same
+  // distance: that test keeps the edges of what it reflects, which lets the normal test relax over a curved mirror,
+  // where neighbouring normals part fast and would otherwise leave the reflection unfiltered.
+  let mirror = params.mirrorRadius > 0.0 && roughness < 0.3;
+  let radius = select(specularRadius(index, depth), max(specularRadius(index, depth), params.mirrorRadius), mirror);
+  let reflected = specularDistance(index);
+  // A smoother surface's reflection turns faster with its normal: the normal test sharpens with it, short of shutting
+  // out the neighbours of a curved mirror altogether once the reflected distance guards it.
+  let specularPower = min(128.0 / max(roughness * roughness, 0.03), select(4096.0, 64.0, mirror));
+  // Under a surface that scatters light inside, the normal and the depth say little about the light that leaves it.
+  let scattering = guideSubsurface(index) * params.subsurface;
+  let diffusePower = mix(128.0, 1.0, scattering);
+  let depthSlack = mix(1.0, 4.0, scattering);
   let step = i32(params.step);
   var diffuse = vec4<f32>(0.0);
   var specular = vec4<f32>(0.0);
@@ -320,14 +351,19 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
         let offset = length(vec2<f32>(f32(dx * step), f32(dy * step)));
         let alignment = max(dot(normal, otherGuide.xyz), 0.0);
         let depthWeight = exp(-abs(depth - otherGuide.w) / (0.02 * depth * offset + 1e-3));
+        let diffuseDepth = exp(-abs(depth - otherGuide.w) / (0.02 * depthSlack * depth * offset + 1e-3));
 
-        wd = wd * pow(alignment, 128.0) * depthWeight
+        wd = wd * pow(alignment, diffusePower) * diffuseDepth
           * exp(-abs(luminance(d.rgb) - luminance(diffuseCenter.rgb)) / diffuseSigma);
 
         ws = ws * pow(alignment, specularPower) * depthWeight
           * exp(-abs(otherRoughness - roughness) * 10.0)
           * exp(-abs(luminance(s.rgb) - luminance(specularCenter.rgb)) / specularSigma)
           * select(0.0, exp(-offset * offset / (radius * radius)), radius >= 0.5);
+
+        if (mirror) {
+          ws = ws * exp(-abs(specularDistance(other) - reflected) / (0.05 * reflected + 1e-3));
+        }
       }
 
       diffuse = diffuse + vec4<f32>(d.rgb * wd, d.w * wd * wd);
@@ -477,6 +513,8 @@ export class DenoisePass {
       floats[7] = CONVERGED_ERROR;
       floats[8] = view.pixelScale;
       words[9] = view.orthographic ? 1 : 0;
+      floats[10] = settings.subsurface;
+      floats[11] = settings.mirrorRadius;
       this.device.queue.writeBuffer(this.params[k], 0, values);
     });
   }

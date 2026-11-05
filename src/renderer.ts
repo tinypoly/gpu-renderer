@@ -12,6 +12,26 @@ import { NO_TEXTURE, planTextures, textureEntry, writeTextures } from "./texture
 import { PathTracePass, type FrameUniforms } from "./pathTracePass.js";
 import { ImageResolvePass } from "./imageResolve.js";
 import { PresentPass } from "./presentPass.js";
+import { LensPass, lensEffects } from "./lensPass.js";
+import {
+  DEFAULT_GPU_RENDER_SETTINGS,
+  effectiveExposure,
+  mergeGpuSettings,
+  type GpuRenderSettings,
+  type GpuRenderSettingsInput,
+} from "./settings.js";
+import {
+  bevelOf,
+  bevelRadius,
+  type BevelMaterial,
+  subsurfaceMedium,
+  subsurfaceOf,
+  volumeMedium,
+  volumeOf,
+  type SubsurfaceMaterial,
+  type VolumeMaterial,
+} from "./subsurface.js";
+import { containingVolume, NO_MATERIAL, volumeTriangles, type VolumeTriangles } from "./volumeContainment.js";
 import {
   CONVERGED_ERROR,
   DEFAULT_DENOISER,
@@ -24,11 +44,10 @@ import { CaptureResolvePass, planarCaptures, type PlanarCaptures } from "./plana
 import { prepareSceneAssets, type SceneAssets } from "./sceneAssets.js";
 import { packVolumetricLights, VOLUMETRIC_WORDS } from "./volumetric.js";
 import { environmentPower, uploadScene, type SceneBuffers } from "./sceneUpload.js";
+import { atmosphereExtinction, averageRadiance, brightestSun, gradientAverage } from "./atmosphere.js";
 import {
   DEFAULT_RENDER_ENVIRONMENT,
-  DEFAULT_RENDER_SETTINGS,
   EventEmitter,
-  mergeSettings,
   serializeCamera,
   serializeScene,
   srgbToLinear,
@@ -41,8 +60,6 @@ import {
   type RenderPhase,
   type RenderPixels,
   type RenderScene,
-  type RenderSettings,
-  type RenderSettingsInput,
   type SerializedScene,
 } from "./upstream.js";
 
@@ -74,8 +91,11 @@ export interface GpuRendererOptions {
   scene?: RenderScene | SerializedScene;
   /** Defaults to a perspective camera at (5, 5, 5) looking at the origin. */
   camera?: RenderCamera;
-  /** Merged over `DEFAULT_RENDER_SETTINGS`, group by group. */
-  settings?: RenderSettingsInput;
+  /**
+   * Merged over `DEFAULT_GPU_RENDER_SETTINGS`, group by group: the CPU renderer's settings, and the groups only this
+   * renderer reads (`bloom`, `lens`, `camera`, `subsurface`, the roulette under `globalIllumination`).
+   */
+  settings?: GpuRenderSettingsInput;
   /** Defaults to `DEFAULT_RENDER_ENVIRONMENT`. */
   environment?: RenderEnvironment;
   /** Image size in CSS pixels; the render size also applies `pixelRatio` and `settings.renderScale`. */
@@ -135,6 +155,9 @@ const SHOW_EVERY_MS = 16;
  * still stays short enough for the watchdog on its own.
  */
 const BANDS_IN_FLIGHT = 2;
+
+/** Throughput under which Russian roulette may end a path, with the chance of carrying on equal to the throughput. */
+const ROULETTE_THRESHOLD = 0.2;
 
 /** How often the canvas takes a freshly denoised image while a frame traces. */
 const DENOISE_EVERY_MS = 200;
@@ -201,6 +224,8 @@ interface PackedTarget {
   skyData: number;
   volumetricData: number;
   volumetricCount: number;
+  /** The boundaries of the scene's volumes, which say whether the camera stands inside one. */
+  volumes: VolumeTriangles | null;
 }
 
 /**
@@ -208,7 +233,7 @@ interface PackedTarget {
  * `render()` opens a frame with whatever is current and accumulates samples until it reaches `settings.samples`.
  */
 export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
-  private current: RenderSettings;
+  private current: GpuRenderSettings;
   private environment: RenderEnvironment;
   // Serializing walks the whole scene, so it is started by the setter and awaited by the frame that needs it.
   private scene: Promise<SerializedScene> = Promise.resolve(EMPTY_SCENE);
@@ -248,6 +273,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private planar = false;
   private resolve: CaptureResolvePass | null = null;
   private denoisePass: DenoisePass | null = null;
+  private lensPass: LensPass | null = null;
   private denoiserSettings: DenoiserSettings = { ...DEFAULT_DENOISER };
   // The size of the last frame that finished, which setDenoiser filters again; null while a frame traces.
   private finished: { width: number; height: number } | null = null;
@@ -257,6 +283,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private denoiseView: DenoiseView = { pixelScale: 1, orthographic: false };
   // Reading an environment image is a fetch, so it is started once and awaited by the frame that needs it.
   private environmentSource = "";
+  // The surroundings' radiance averaged over the sphere, which the air glows with; null for the gradient.
+  private environmentAverage: [number, number, number] | null = null;
   private environmentImage: Promise<PackedEnvironment | null> = Promise.resolve(null);
   private canvas: HTMLCanvasElement | null = null;
   private context: GPUCanvasContext | null = null;
@@ -274,7 +302,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.width = Math.max(1, Math.floor(options.width));
     this.height = Math.max(1, Math.floor(options.height));
     this.pixelRatio = checkedPixelRatio(options.pixelRatio ?? 1);
-    this.current = mergeSettings(DEFAULT_RENDER_SETTINGS, options.settings);
+    this.current = mergeGpuSettings(DEFAULT_GPU_RENDER_SETTINGS, options.settings);
     this.denoiserSettings = mergeDenoiser(DEFAULT_DENOISER, options.denoiser);
     this.environment = DEFAULT_RENDER_ENVIRONMENT;
     this.scheduler = new DispatchScheduler({ maxRows: this.renderHeight, maxSamples: BATCH_PATHS });
@@ -285,7 +313,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   }
 
   /** The settings the next frame renders with. */
-  get settings(): Readonly<RenderSettings> {
+  get settings(): Readonly<GpuRenderSettings> {
     return this.current;
   }
 
@@ -396,15 +424,16 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   }
 
   /**
-   * Merges the given fields into the current settings, group by group. Turning the denoiser on or off also filters the
-   * finished image again at once, as `setDenoiser` does, since that needs no tracing.
+   * Merges the given fields into the current settings, group by group. Turning the denoiser on or off, or changing
+   * what is done to the light after it is traced (exposure, tone mapping, vignette, bloom, chromatic aberration, white
+   * balance), shows the finished image again at once, as `setDenoiser` does, since none of that needs tracing.
    */
-  setSettings(settings: RenderSettingsInput) {
-    const denoise = this.current.globalIllumination.denoise;
+  setSettings(settings: GpuRenderSettingsInput) {
+    const before = developing(this.current);
 
-    this.current = mergeSettings(this.current, settings);
+    this.current = mergeGpuSettings(this.current, settings);
 
-    if (this.current.globalIllumination.denoise !== denoise) this.refilter();
+    if (developing(this.current) !== before) this.refilter();
   }
 
   setEnvironment(environment: RenderEnvironment) {
@@ -507,6 +536,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.buffers?.destroy();
     this.accumulator?.destroy();
     this.denoisePass?.destroy();
+    this.lensPass?.destroy();
+    this.lensPass = null;
     this.imageResolve?.dispose();
     this.imageResolve = null;
     this.gpu?.device.destroy();
@@ -769,10 +800,20 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     height: number,
     image: PackedEnvironment | null) {
     this.pathTrace ??= new PathTracePass(gpu.device);
-    this.pathTrace.setPrograms(assets.programs);
+    const materials = assets.scene.meshes.flatMap(mesh => mesh.materials);
+
+    this.pathTrace.setPrograms(assets.programs,
+      this.current.subsurface.enabled && materials.some(material =>
+        (material.type === "MeshStandardMaterial" || material.type === "MeshPhysicalMaterial")
+        && subsurfaceOf(material) !== null),
+      // Even turned off, a volume's boundary has to stay invisible, which takes the same code.
+      materials.some(material => volumeOf(material) !== null),
+      this.current.bevel.enabled && materials.some(material => bevelOf(material) > 0));
 
     // A procedural sky stands in for the renderer's own environment, as it does in the CPU renderer.
     const environment = assets.sky?.environment ?? image;
+
+    this.environmentAverage = environment ? averageRadiance(environment) : null;
     const matrices = cameraMatrices(camera, width, height);
     const view = `${JSON.stringify(camera)}|${width}|${height}`;
     const moved = (!!this.packed?.cameraDependent || this.planar) && view !== this.packedView;
@@ -902,6 +943,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       skyData,
       volumetricData,
       volumetricCount: Math.min(volumetric.length / VOLUMETRIC_WORDS, 8),
+      volumes: volumeTriangles(geometry),
     };
   }
 
@@ -940,6 +982,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
         const uniforms = {
           ...this.frameUniforms(capture.camera, width, height, assets, target, capture.background),
           lens: [0, 1, 0, 0],
+          lensDistortion: 0,
+          // A capture is a texture of the scene, seen again by the camera, which lays the air over it then.
+          atmosphereColor: [0, 0, 0, 0],
+          cameraVolume: NO_MATERIAL,
           volumetricCount: 0,
           clipPlane: capture.clip ?? [0, 0, 0, 0],
           bandOrigin: [0, 0],
@@ -993,19 +1039,35 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   }
 
   private encodePresent(encoder: GPUCommandEncoder, width: number, height: number) {
-    if (!this.context || !this.present) return;
+    if (!this.context || !this.present || !this.gpu) return;
 
     this.present.encode(encoder, this.context.getCurrentTexture().createView(), {
       width,
       height,
-      exposure: this.current.exposure,
+      exposure: effectiveExposure(this.current),
       toneMapping: this.current.toneMapping,
       vignette: this.current.vignette,
       grain: this.current.grain,
       frameIndex: this.frameIndex,
       transparent: this.current.background.mode === "transparent",
-      denoised: this.denoised ? this.denoisePass?.output : null,
+      denoised: this.encodeLens(this.gpu, encoder, width, height,
+        this.denoised ? this.denoisePass?.output ?? null : null),
     });
+  }
+
+  /**
+   * The lens and the sensor over the radiance (or the denoiser's output), when the settings ask for any of them: the
+   * buffer of graded colour the display transform reads instead, or the input as it was.
+   */
+  private encodeLens(gpu: RenderDevice, encoder: GPUCommandEncoder, width: number, height: number,
+    denoised: GPUBuffer | null): GPUBuffer | null {
+    const effects = lensEffects(this.current);
+
+    if (!effects) return denoised;
+
+    this.lensPass ??= new LensPass(gpu.device);
+
+    return this.lensPass.encode(encoder, (this.accumulator as Accumulator).buffer, denoised, width, height, effects);
   }
 
   /** Denoises the accumulation as it stands, for the canvas and for the finished image. */
@@ -1041,6 +1103,16 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       : 0;
 
     const backgroundMode = background.mode === "color" ? 1 : background.mode === "transparent" ? 2 : 0;
+    const { atmosphere } = this.current;
+    const strength = sky ? sky.intensity : this.environment.intensity ?? 1;
+
+    const airGlow = atmosphere.color
+      ? linearColor(atmosphere.color, [0, 0, 0])
+      : (this.environmentAverage ?? gradientAverage(linearColor(gradient?.topColor, [1, 1, 1]),
+        linearColor(gradient?.bottomColor, [0, 0, 0]), gradient?.exponent ?? 2)).map(channel => channel * strength);
+
+    const extinction = atmosphereExtinction(atmosphere);
+    const sun = brightestSun(assets.scene.lights);
 
     return {
       cameraToWorld: matrices.cameraWorld,
@@ -1069,11 +1141,28 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       resolution: [width, height],
       cameraKind: matrices.orthographic ? 1 : 0,
       bounces: Math.max(1, Math.round(this.current.globalIllumination.bounces)),
+      rouletteThreshold: this.current.globalIllumination.russianRoulette === false ? 0 : ROULETTE_THRESHOLD,
+      rouletteStart: Math.max(0, Math.round(this.current.globalIllumination.rouletteStart ?? 0)),
+      lensDistortion: Number.isFinite(this.current.lens.distortion) ? this.current.lens.distortion : 0,
+      subsurfaceEnabled: this.current.subsurface.enabled,
+      bevelEnabled: this.current.bevel.enabled,
+      volumesEnabled: this.current.volumes.enabled,
+      cameraVolume: this.current.volumes.enabled
+        ? containingVolume(target?.volumes ?? null, matrices.cameraWorld.slice(12, 15))
+        : NO_MATERIAL,
+      atmosphereColor: [...airGlow, extinction.some(value => value > 0) ? 1 : 0],
+      atmosphereExtinction: [...extinction, Math.min(1, Math.max(0, Number(atmosphere.haze) || 0))],
+      atmosphereSun: [...sun?.direction ?? [0, 1, 0], 0],
+      atmosphereSunColor: [...sun?.irradiance ?? [0, 0, 0], 0],
       triangleCount: buffers?.triangleCount ?? 0,
       lightCount: buffers?.lightCount ?? 0,
       areaLightCount: buffers?.areaLightCount ?? 0,
       lightCdf: buffers?.lightCdf ?? 0,
       lightTriangles: buffers?.lightTriangles ?? 0,
+      localLightCount: buffers?.localLightCount ?? 0,
+      localLightPick: buffers?.localLightPick ?? 0,
+      lightTree: this.current.globalIllumination.lightTree === false ? 0 : buffers?.lightTree ?? 0,
+      lightLeaves: buffers?.lightLeaves ?? 0,
       clampIndirect: Math.max(0, this.current.globalIllumination.clamp),
       // The setting is the angular diameter a light covers, in degrees, as it is for the CPU renderer's shadow blur.
       shadowSpread: shadows.enabled ? Math.tan(Math.max(0, shadows.softness) * Math.PI / 360) : 0,
@@ -1108,13 +1197,20 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private async readImage(
     gpu: RenderDevice, width: number, height: number, denoised: GPUBuffer | null): Promise<RenderImage> {
     const accumulator = this.accumulator as Accumulator;
-    const { exposure, toneMapping, vignette } = this.current;
+    const { toneMapping, vignette } = this.current;
+    const exposure = effectiveExposure(this.current);
     const transparent = this.current.background.mode === "transparent";
 
     // Resolved on the device, so the page only copies the bytes of the image.
     this.imageResolve ??= new ImageResolvePass(gpu.device);
 
-    const data = await this.imageResolve.read(accumulator.buffer, denoised, width, height,
+    // The lens's effects are encoded on their own, ahead of the resolve, which reads the colour they leave.
+    const encoder = gpu.device.createCommandEncoder({ label: "lens" });
+    const graded = this.encodeLens(gpu, encoder, width, height, denoised);
+
+    gpu.device.queue.submit([encoder.finish()]);
+
+    const data = await this.imageResolve.read(accumulator.buffer, graded, width, height,
       { exposure, toneMapping, vignette, transparent });
 
     return { width, height, data };
@@ -1135,6 +1231,9 @@ const SERIALIZABLE = new Set([
  */
 async function serializeLive(scene: Scene): Promise<SerializedScene> {
   const renamed = new Map<Material, string>();
+  // The snapshot keeps a material's name but not its media, so the name carries a mark to them.
+  const named = new Map<Material, string>();
+  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown }[] = [];
 
   scene.traverse(object => {
     const value = (object as Object3D & { material?: Material | Material[] }).material;
@@ -1146,15 +1245,60 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
         renamed.set(material, material.type);
         material.type = shader.isRawShaderMaterial ? "RawShaderMaterial" : "ShaderMaterial";
       }
+
+      const data = material.userData?.cpuRenderer as
+        { subsurface?: unknown; volume?: unknown; bevel?: unknown } | undefined;
+
+      if (!named.has(material)
+        && (subsurfaceMedium(data?.subsurface) || volumeMedium(data?.volume) || bevelRadius(data?.bevel) > 0)) {
+        named.set(material, material.name);
+        material.name = `${material.name}${MEDIA_MARK}${media.length}`;
+        media.push({ subsurface: data?.subsurface, volume: data?.volume, bevel: data?.bevel });
+      }
     }
   });
 
+  let snapshot: SerializedScene;
+
   try {
     // The path tracer samples only the base level of a texture: the mip chain would be built and thrown away.
-    return (await serializeScene(scene, { mipmaps: false })).scene;
+    snapshot = (await serializeScene(scene, { mipmaps: false })).scene;
   } finally {
     for (const [material, type] of renamed) material.type = type;
+    for (const [material, name] of named) material.name = name;
   }
+
+  // Materials are shared between the meshes that use them, so each one is unmarked once and seen marked no more.
+  for (const mesh of snapshot.meshes) {
+    for (const material of mesh.materials as (SubsurfaceMaterial & VolumeMaterial & BevelMaterial)[]) {
+      const at = material.name.lastIndexOf(MEDIA_MARK);
+
+      if (at < 0) continue;
+
+      const medium = media[Number(material.name.slice(at + MEDIA_MARK.length))];
+
+      material.name = material.name.slice(0, at) || material.type;
+      if (medium.subsurface !== undefined) material.subsurface = medium.subsurface as SubsurfaceMaterial["subsurface"];
+      if (medium.volume !== undefined) material.volume = medium.volume as VolumeMaterial["volume"];
+      if (medium.bevel !== undefined) material.bevel = medium.bevel as BevelMaterial["bevel"];
+    }
+  }
+
+  return snapshot;
+}
+
+/** Ends a material's name while it is serialized, followed by the index of its media. */
+const MEDIA_MARK = "\u0000media:";
+
+/**
+ * Everything that changes the finished image without tracing it again, as one string: the denoiser switch and what
+ * happens to the light between the radiance and the screen.
+ */
+function developing(settings: GpuRenderSettings): string {
+  const { exposure, toneMapping, vignette, bloom, glare, lens, camera, depthOfField, globalIllumination } = settings;
+
+  return JSON.stringify([globalIllumination.denoise, exposure, toneMapping, vignette, bloom, glare,
+    lens.chromaticAberration, camera, camera.physicalExposure ? depthOfField.aperture : 0]);
 }
 
 /**

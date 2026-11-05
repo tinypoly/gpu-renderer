@@ -47,6 +47,11 @@ export interface SceneBuffers {
   /** Where the lights' cumulative probabilities and the emissive ones' triangles sit in `textures`. */
   lightCdf: number;
   lightTriangles: number;
+  /** The light tree over the lights that sit in the scene: see lightTree.ts. */
+  localLightCount: number;
+  localLightPick: number;
+  lightTree: number;
+  lightLeaves: number;
   /** Radiance an ambient or hemisphere light adds, which no shadow ray can reach. */
   ambient: PackedLights["ambient"];
   /** Where the surrounding image and its distributions ended up, for the frame uniform. */
@@ -197,6 +202,10 @@ export function uploadScene(
     areaLightCount: lights.areaCount,
     lightCdf: lights.cdfAt,
     lightTriangles: lights.trianglesAt,
+    localLightCount: lights.localCount,
+    localLightPick: lights.localPick,
+    lightTree: lights.treeAt,
+    lightLeaves: lights.leavesAt,
     ambient: lights.ambient,
     environment: {
       texture: environment ? textures.indexOf.get(environment.texture.id) ?? NO_TEXTURE : NO_TEXTURE,

@@ -1,4 +1,5 @@
 import type { PackedGeometry } from "./geometry.js";
+import { buildLightTree, type TreeLight } from "./lightTree.js";
 import type { SerializedLight } from "./upstream.js";
 
 /**
@@ -60,6 +61,16 @@ export interface PackedLights {
   cdfAt: number;
   /** Where the emissive entries' triangles start in the texture buffer, one word per emissive entry. */
   trianglesAt: number;
+  /**
+   * How many leading entries sit in the scene (emissive triangles, point, spot and rectangular lights), which the light
+   * tree picks among; the directional lights and the environment follow them.
+   */
+  localCount: number;
+  /** The chance of picking one of those: exactly the cumulative probability of the last of them. */
+  localPick: number;
+  /** Where the light tree's nodes start in the texture buffer, and the leaf of every local entry; zero for no tree. */
+  treeAt: number;
+  leavesAt: number;
 }
 
 const luminance = (color: ArrayLike<number>) => 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
@@ -128,7 +139,14 @@ interface Candidate {
   write(words: Uint32Array, floats: Float32Array, at: number): void;
   /** Area measure density of a point on it, before the pick probability is folded in. */
   density?: number;
+  /** What the light tree knows of a light that sits in the scene; none for a directional light or the environment. */
+  tree?: TreeLight;
 }
+
+const corners = (points: number[][]) => ({
+  low: [0, 1, 2].map(k => Math.min(...points.map(p => p[k]))),
+  high: [0, 1, 2].map(k => Math.max(...points.map(p => p[k]))),
+});
 
 /**
  * Emissive triangles weighted by the power they radiate (area times emitted luminance), so a large or bright panel is
@@ -153,11 +171,24 @@ function emissiveTriangles(geometry: PackedGeometry, bounds: Bounds): Candidate[
     const centroid = [0, 1, 2].map(axis =>
       (geometry.positions[at + axis] + geometry.positions[at + 3 + axis] + geometry.positions[at + 6 + axis]) / 3);
 
+    const p = geometry.positions;
+    const e1 = [p[at + 3] - p[at], p[at + 4] - p[at + 1], p[at + 5] - p[at + 2]];
+    const e2 = [p[at + 6] - p[at], p[at + 7] - p[at + 1], p[at + 8] - p[at + 2]];
+
     candidates.push({
       kind: LIGHT_KIND.area,
       // The irradiance it delivers, so a bright panel and a bright lamp are weighed in the same unit.
       weight: glow * area / reach(centroid, bounds) ** 2,
       density: 1 / area,
+      // It radiates from both sides, so its cone is the whole sphere.
+      tree: {
+        ...corners([0, 3, 6].map(v => [p[at + v], p[at + v + 1], p[at + v + 2]])),
+        power: glow * area,
+        axis: normalize([e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]]),
+        thetaO: Math.PI,
+        thetaE: Math.PI / 2,
+        density: 1 / area,
+      },
       write(words, _floats, at) {
         words[at] = LIGHT_KIND.area;
         words[at + 3] = triangle;
@@ -220,6 +251,8 @@ function analyticLight(
     return {
       kind: LIGHT_KIND.point,
       weight: emitted * falloff,
+      tree: { low: [...light.position], high: [...light.position], power: emitted, axis: [0, 0, 1], thetaO: Math.PI,
+        thetaE: Math.PI / 2, density: 1 },
       write: (words, floats, at) => common(words, floats, at, LIGHT_KIND.point),
     };
   }
@@ -239,6 +272,9 @@ function analyticLight(
       kind: LIGHT_KIND.spot,
       // Only the cone is lit, so only that share of the scene can expect anything from it.
       weight: emitted * falloff * (1 - Math.cos(Math.min(light.angle, Math.PI))) / 2,
+      // It shines from its position towards its target, within its outer cone.
+      tree: { low: [...light.position], high: [...light.position], power: emitted, axis: scale(axis, -1),
+        thetaO: Math.min(light.angle, Math.PI), thetaE: 0, density: 1 },
       write(words, floats, at) {
         common(words, floats, at, LIGHT_KIND.spot);
         floats[at + 15] = outer;
@@ -259,10 +295,25 @@ function analyticLight(
     const up = normalize([matrix[4], matrix[5], matrix[6]]);
     const area = Math.max(light.width * light.height, 1e-12);
 
+    const half = [scale(right, light.width / 2), scale(up, light.height / 2)];
+
+    const facing = normalize([
+      right[1] * up[2] - right[2] * up[1], right[2] * up[0] - right[0] * up[2], right[0] * up[1] - right[1] * up[0]]);
+
     return {
       kind: LIGHT_KIND.rect,
       weight: emitted * area / distance ** 2,
       density: 1 / area,
+      // One sided: it lights the side its axes' cross product turns away from, over a hemisphere.
+      tree: {
+        ...corners([[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, b]) =>
+          [0, 1, 2].map(k => light.position[k] + half[0][k] * a + half[1][k] * b))),
+        power: emitted * area,
+        axis: scale(facing, -1),
+        thetaO: 0,
+        thetaE: Math.PI / 2,
+        density: 1 / area,
+      },
       write(words, floats, at) {
         common(words, floats, at, LIGHT_KIND.rect);
         floats.set(scale(right, light.width / 2), at + 16);
@@ -342,7 +393,11 @@ export function packLights(
     }]
     : [];
 
-  const candidates = [...areas, ...analytic, ...surrounding];
+  // What sits in the scene first, so the tree's lights are the leading entries; then what lies outside it.
+  const local = analytic.filter(candidate => candidate.tree);
+  const distant = analytic.filter(candidate => !candidate.tree);
+  const candidates = [...areas, ...local, ...distant, ...surrounding];
+  const localCount = areas.length + local.length;
   const total = candidates.reduce((sum, candidate) => sum + candidate.weight, 0);
   const entries = new ArrayBuffer(Math.max(1, candidates.length) * LIGHT_WORDS * 4);
   const words = new Uint32Array(entries);
@@ -370,7 +425,22 @@ export function packLights(
 
   for (let index = 0; index < areas.length; index++) extra.push(words[index * LIGHT_WORDS + 3]);
 
+  let treeAt = 0, leavesAt = 0;
+
+  if (localCount > 0) {
+    const tree = buildLightTree(candidates.slice(0, localCount).map(candidate => candidate.tree as TreeLight));
+
+    treeAt = base + extra.length;
+    for (const word of tree.words) extra.push(word);
+    leavesAt = base + extra.length;
+    for (const leaf of tree.leafOf) extra.push(leaf);
+  }
+
   return {
+    localCount,
+    localPick: localCount > 0 ? floats[(localCount - 1) * LIGHT_WORDS + 1] : 0,
+    treeAt,
+    leavesAt,
     cdfAt,
     trianglesAt,
     entries,

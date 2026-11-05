@@ -60,6 +60,13 @@
         return scene;
       }
 
+      // The lens's halo and fringes move light between pixels, which a reading of one pixel against paper cannot allow.
+      // The air does too, a little, over the few units these scenes span.
+      // So does the clamp on indirect light, which trades a little bias for fewer fireflies.
+      const RAW = { bloom: { enabled: false }, glare: { enabled: false }, lens: { chromaticAberration: 0 },
+        atmosphere: { enabled: false } };
+      const UNCLAMPED = { clamp: 0 };
+
       const measure = (scene, settings = {}) => measureWith(scene, camera, settings);
 
       async function measureWith(scene, viewpoint, settings = {}, environment) {
@@ -69,8 +76,8 @@
           scene,
           camera: viewpoint,
           // The estimator is what these checks measure: the denoiser has checks of its own, below.
-          settings: { samples: 512, toneMapping: "linear", exposure: 1, ...settings,
-            globalIllumination: { bounces: 2, denoise: false, ...settings.globalIllumination } },
+          settings: { samples: 512, toneMapping: "linear", exposure: 1, ...RAW, ...settings,
+            globalIllumination: { bounces: 2, denoise: false, ...UNCLAMPED, ...settings.globalIllumination } },
           environment: environment ?? { kind: "gradient", topColor: "#000000", bottomColor: "#000000" },
         });
         const { data } = await renderer.render();
@@ -741,7 +748,8 @@
         // The accumulation buffer has to start from nothing every frame, or a second render() adds to the first.
         const again = new GpuRenderer({
           width: SIZE, height: SIZE, scene: lit(white()), camera,
-          settings: { samples: 64, globalIllumination: { bounces: 2 }, toneMapping: "linear", exposure: 1 },
+          settings: { samples: 64, globalIllumination: { bounces: 2, ...UNCLAMPED }, toneMapping: "linear", exposure: 1,
+            ...RAW },
           environment: { kind: "gradient", topColor: "#000000", bottomColor: "#000000" },
         });
         await again.render();
@@ -761,6 +769,225 @@
         check("denoising removes most of the noise", smooth.deviation < raw.deviation * 0.5 ? 1 : 0, 1);
         check("a one pixel line stays one pixel wide, denoised", await measure(lineScene,
           { samples: 1024, globalIllumination: { denoise: true } }), 1 / 6, 6);
+
+        // ---- what a photograph adds: light inside materials, the lens and the sensor ----
+        log("subsurface");
+        const { whiteBalanceMatrix } = await import("/dist/index.js");
+        const furnace = { kind: "hdri", url: radianceUrl(64, 32, () => [0.25, 0.25, 0.25]) };
+        const darkness = { kind: "gradient", topColor: "#000000", bottomColor: "#000000" };
+        const ballScene = material => {
+          const scene = new THREE.Scene();
+          scene.add(new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), material));
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        // No specular layer at all, so everything the surface returns comes through its diffuse layer.
+        const matte = (albedo, subsurface) => {
+          const material = new THREE.MeshPhysicalMaterial({ roughness: 1, specularIntensity: 0 });
+          material.color.setRGB(albedo, albedo, albedo, THREE.LinearSRGBColorSpace);
+          if (subsurface) material.userData.cpuRenderer = { subsurface };
+          return material;
+        };
+        // The white furnace: a convex body in a uniform sky that absorbs nothing returns exactly the sky's radiance,
+        // however the light wandered inside it before leaving.
+        check("lambert ball in a uniform sky", await measureWith(ballScene(matte(1)), camera, {}, furnace), 0.25);
+        check("subsurface ball of unit albedo loses nothing",
+          await measureWith(ballScene(matte(1, { radius: 1, scale: 0.3 })), camera,
+            { globalIllumination: { bounces: 4 } }, furnace), 0.25, 3);
+        check("subsurface ball of half albedo, about half",
+          await measureWith(ballScene(matte(0.5, { radius: 1, scale: 0.05 })), camera,
+            { globalIllumination: { bounces: 4 } }, furnace), 0.125, 10);
+        // A thin sheet lit only from behind: light reaches the camera through it only if it scatters inside.
+        const backlit = subsurface => {
+          const scene = new THREE.Scene();
+          scene.add(new THREE.Mesh(new THREE.BoxGeometry(4, 4, 0.02), matte(0.8, subsurface)));
+          const light = new THREE.DirectionalLight(0xffffff, Math.PI);
+          light.position.set(0, 0, -1);
+          scene.add(light);
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        const through = await measureWith(backlit({ radius: 1, scale: 0.05 }), camera,
+          { globalIllumination: { bounces: 4 } }, darkness);
+        check("a backlit sheet glows through when it scatters inside", through.mean > 0.01 ? 1 : 0, 1);
+        check("and stays dark with subsurface turned off", await measureWith(backlit({ radius: 1, scale: 0.05 }), camera,
+          { globalIllumination: { bounces: 4 }, subsurface: { enabled: false } }, darkness), 0, 1);
+
+        log("lens");
+        /** The whole image, linear, as rendered over darkness. */
+        const wholeFrame = async(scene, settings) => {
+          const renderer = new GpuRenderer({
+            width: SIZE, height: SIZE, scene, camera,
+            settings: { samples: 64, toneMapping: "linear", exposure: 1, ...RAW, ...settings,
+              globalIllumination: { bounces: 2, denoise: false, ...UNCLAMPED } },
+            environment: darkness,
+          });
+          const { data } = await renderer.render();
+          renderer.dispose();
+          return data;
+        };
+        const channelSum = (data, channel) => {
+          let sum = 0;
+          for (let i = channel; i < data.length; i += 4) sum += toLinear(data[i] / 255);
+          return sum;
+        };
+        const emitterSquare = side => {
+          const scene = new THREE.Scene();
+          const material = new THREE.MeshBasicMaterial();
+          material.color.setRGB(0.8, 0.8, 0.8, THREE.LinearSRGBColorSpace);
+          scene.add(new THREE.Mesh(new THREE.PlaneGeometry(side, side), material));
+          scene.updateMatrixWorld(true);
+          return scene;
+        };
+        const sharp = await wholeFrame(emitterSquare(0.4), {});
+        const haloed = await wholeFrame(emitterSquare(0.4), { bloom: { enabled: true, intensity: 0.5, radius: 0.65 } });
+        check("bloom keeps the light it spreads", channelSum(haloed, 1) / channelSum(sharp, 1), 1, 4);
+        const outside = (SIZE / 2) * SIZE + SIZE / 2 + 12;
+        check("bloom reaches past the edge of what glows",
+          toLinear(haloed[outside * 4 + 1] / 255) > 0.002 && sharp[outside * 4 + 1] === 0 ? 1 : 0, 1);
+        // Red is magnified by 1 / (1 - a) and blue by 1 / (1 + a), so their areas differ by the square of the ratio.
+        const shift = 10 * 0.005;
+        const fringed = await wholeFrame(emitterSquare(0.6), { lens: { chromaticAberration: 10 } });
+        check("chromatic aberration magnifies red over blue", channelSum(fringed, 0) / channelSum(fringed, 2),
+          ((1 + shift) / (1 - shift)) ** 2, 4);
+        // Barrel distortion: a pixel at a radius r sees the scene at r (1 + k r^2 / 2), which shrinks a centred square.
+        const k = 0.3, half = 0.3 / (3 * Math.tan(15 * Math.PI / 180));
+        let covered = 0;
+        for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) for (let s = 0; s < 16; s++) {
+          const px = ((x + (s % 4 + 0.5) / 4) / SIZE) * 2 - 1, py = ((y + (Math.floor(s / 4) + 0.5) / 4) / SIZE) * 2 - 1;
+          const scale = 1 + k * (px * px + py * py) / 2;
+          if (Math.abs(px * scale) < half && Math.abs(py * scale) < half) covered += 0.8 / 16;
+        }
+        check("barrel distortion shrinks a centred square as its mapping says",
+          channelSum(await wholeFrame(emitterSquare(0.6), { lens: { distortion: k } }), 1), covered, 3);
+
+        // The aperture's rays move light along lines, and only move it.
+        const rayed = await wholeFrame(emitterSquare(0.4), { glare: { enabled: true, intensity: 0.5, blades: 6 } });
+        check("glare keeps the light it spreads", channelSum(rayed, 1) / channelSum(sharp, 1), 1, 4);
+
+        log("volumes");
+        // A slab of medium that only absorbs, between the light, the plane and the camera: both crossings take half.
+        const absorbingSlab = (density, depth, z) => planeScene(white(), scene => {
+          const light = new THREE.DirectionalLight(0xffffff, I);
+          light.position.set(0, 0, 1);
+          scene.add(light);
+          const medium = new THREE.Mesh(new THREE.BoxGeometry(40, 40, depth), new THREE.MeshBasicMaterial());
+          medium.material.userData.cpuRenderer = { volume: { density, color: "#000000" } };
+          medium.position.z = z;
+          scene.add(medium);
+        });
+        check("an absorbing slab, crossed by the light and the view", await measure(absorbingSlab(Math.LN2, 1, 1)), 0.25 / 4);
+        check("turned off, a volume leaves no trace", await measure(absorbingSlab(Math.LN2, 1, 1), { volumes: { enabled: false } }),
+          0.25);
+        // The camera at z = 3 stands inside this one, which spans 0.5 to 3.5: 2.5 units of view, 3 of light.
+        check("a camera inside a volume sees through it", await measure(absorbingSlab(0.1, 3, 2)), 0.25 * Math.exp(-0.1 * 5.5));
+        // The white furnace again: a ball of white fog in a uniform sky scatters every path out to that sky in the end.
+        const fogBall = () => {
+          const material = new THREE.MeshBasicMaterial();
+          material.userData.cpuRenderer = { volume: { density: 1, color: "#ffffff", anisotropy: 0.3 } };
+          return ballScene(material);
+        };
+        check("a ball of white fog in a uniform sky", await measureWith(fogBall(), camera,
+          { globalIllumination: { bounces: 64 } }, furnace), 0.25, 3);
+
+        log("atmosphere");
+        // Over black surroundings the air only takes: at half the visibility green keeps the square root of 2 percent.
+        // These checks read red, which haze takes as (550 / 680)^1.3 of green: Angstrom's law. The light behind the
+        // camera lights the air too, by haze's phase function turned all the way back: Henyey-Greenstein at 0.76.
+        const redThrough = Math.exp(-Math.log(50) / 6 * (550 / 680) ** 1.3 * 3);
+        const backwards = (1 - 0.76 ** 2) / (4 * Math.PI * (1 + 0.76 ** 2 + 2 * 0.76) ** 1.5);
+        check("aerial perspective fades by Koschmieder's law", (await measure(lit(white()),
+          { atmosphere: { enabled: true, visibility: 6, haze: 1 } })).mean,
+          0.25 * redThrough + I * backwards * (1 - redThrough), 4);
+        const glowAir = await wholeFrame(lit(white()),
+          { atmosphere: { enabled: true, visibility: 6, haze: 1, color: "#808080" } });
+        const centreGreen = ((SIZE / 2) * SIZE + SIZE / 2) * 4 + 1;
+        check("and glows with its colour over what it takes", toLinear(glowAir[centreGreen] / 255),
+          0.25 * Math.sqrt(0.02) + (srgbToLinear(128 / 255) + I * backwards) * (1 - Math.sqrt(0.02)), 4);
+
+        log("light tree");
+        // A small bright bulb near the plane and a large dim panel far off, which weighing by power alone gets wrong:
+        // both estimators are exact, so their means agree, and the tree's has less noise at few samples.
+        // Emissive standard materials, which are lights direct sampling aims at; an unlit one is only found by bounces.
+        const emitting = radiance => {
+          const material = new THREE.MeshStandardMaterial({ roughness: 1 });
+          material.color.setRGB(0, 0, 0, THREE.LinearSRGBColorSpace);
+          material.emissive.setRGB(radiance, radiance, radiance, THREE.LinearSRGBColorSpace);
+          return material;
+        };
+        const twoLights = () => planeScene(white(), scene => {
+          const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.05, 24, 12), emitting(60));
+          bulb.position.set(0.3, 0.2, 0.4);
+          scene.add(bulb);
+          const panel = new THREE.Mesh(new THREE.PlaneGeometry(8, 8), emitting(0.4));
+          panel.position.set(0, 0, 12);
+          panel.rotation.y = Math.PI;
+          scene.add(panel);
+        });
+        const byPower = await measure(twoLights(), { globalIllumination: { lightTree: false } });
+        const byTree = await measure(twoLights());
+        check("the light tree keeps the mean of picking by power", byTree.mean, byPower.mean, 3);
+        const fewByPower = await measure(twoLights(), { samples: 16, globalIllumination: { lightTree: false } });
+        const fewByTree = await measure(twoLights(), { samples: 16 });
+        lines.push(`two lights at 16 samples: deviation ${fewByPower.deviation.toFixed(4)} by power, `
+          + `${fewByTree.deviation.toFixed(4)} by the tree`);
+        check("and leaves less noise", fewByTree.deviation < fewByPower.deviation ? 1 : 0, 1);
+        // The same two lights drawn unlit: they show their colour, emit it, and are aimed at all the same.
+        const unlitLights = () => {
+          const scene = twoLights();
+          scene.traverse(object => {
+            if (object.material?.emissive && object.material.emissive.r > 0) {
+              const unlit = new THREE.MeshBasicMaterial();
+              unlit.color.copy(object.material.emissive);
+              object.material = unlit;
+            }
+          });
+          return scene;
+        };
+        check("an unlit lamp lights as an emissive one does", await measure(unlitLights()), byTree.mean, 3);
+        const fewUnlit = await measure(unlitLights(), { samples: 16 });
+        check("and is aimed at too, as quiet as it", fewUnlit.deviation < fewByTree.deviation * 1.5 ? 1 : 0, 1);
+
+        log("bevel");
+        // A box face on, lit head on: far from its edges a bevel changes nothing; at an edge it turns the normal.
+        const bevelled = radius => planeScene(white(), scene => {
+          scene.children[0].visible = false;
+          const material = new THREE.MeshLambertMaterial();
+          material.color.setRGB(1, 1, 1, THREE.LinearSRGBColorSpace);
+          if (radius) material.userData.cpuRenderer = { bevel: radius };
+          scene.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), material));
+          const light = new THREE.DirectionalLight(0xffffff, I);
+          light.position.set(0, 0, 1);
+          scene.add(light);
+        });
+        check("a bevel leaves the middle of a face as it was", await measure(bevelled(0.05)), 0.25);
+        const edgeView = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
+        edgeView.position.set(1, 0, 4);
+        edgeView.lookAt(1, 0, 1);
+        edgeView.updateMatrixWorld(true);
+        const sharpEdge = await measureWith(bevelled(0), edgeView);
+        const roundEdge = await measureWith(bevelled(0.2), edgeView);
+        lines.push(`a box edge seen head on: ${sharpEdge.mean.toFixed(4)} sharp, ${roundEdge.mean.toFixed(4)} bevelled`);
+        // The front face's side of the edge turns from the light and the side face's towards it: the edge changes.
+        check("a bevel turns the normal at an edge", Math.abs(roundEdge.mean - sharpEdge.mean) > sharpEdge.mean * 0.03 ? 1 : 0,
+          1);
+        check("turned off, a bevel changes nothing", await measureWith(bevelled(0.2), edgeView,
+          { bevel: { enabled: false } }), sharpEdge.mean, 2);
+
+        log("camera");
+        const balanced = await wholeFrame(lit(white()), { camera: { whiteBalance: 3200 } });
+        const warmMatrix = whiteBalanceMatrix(3200);
+        const middle = ((SIZE / 2) * SIZE + SIZE / 2) * 4;
+        check("white balance at 3200 K, red", toLinear(balanced[middle] / 255),
+          0.25 * (warmMatrix[0] + warmMatrix[1] + warmMatrix[2]));
+        check("white balance at 3200 K, blue", toLinear(balanced[middle + 2] / 255),
+          0.25 * (warmMatrix[6] + warmMatrix[7] + warmMatrix[8]));
+        check("white balance at 6500 K changes nothing",
+          await measure(lit(white()), { camera: { whiteBalance: 6500 } }), 0.25);
+        // At f/1, one second and ISO 100 the exposure value is zero, which leaves one over 1.2 of the luminance.
+        check("physical exposure at EV 0", await measure(lit(white()), {
+          camera: { physicalExposure: true, iso: 100, shutterSpeed: 1 },
+          depthOfField: { enabled: false, aperture: 1 } }), 0.25 / 1.2);
 
         const W = 64, H = 32;
 

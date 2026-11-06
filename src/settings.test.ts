@@ -148,6 +148,16 @@ it("counts the aperture's rays as a lens does: as many as an even count of blade
   expect(lensEffects(mergeGpuSettings(DEFAULT_GPU_RENDER_SETTINGS, { glare: { blades: 7 } }))?.rays).toBe(14);
 });
 
+it("hands the meter how much of a dark scene's darkness to keep, held between nothing and all of it", () => {
+  const metered = (darkAdaptation: number) =>
+    lensEffects(mergeGpuSettings(DEFAULT_GPU_RENDER_SETTINGS, { camera: { autoExposure: true, darkAdaptation } }));
+
+  expect(DEFAULT_GPU_RENDER_SETTINGS.camera.darkAdaptation).toBe(0);
+  expect(metered(0.6)?.darkAdaptation).toBe(0.6);
+  expect(metered(-1)?.darkAdaptation).toBe(0);
+  expect(metered(3)?.darkAdaptation).toBe(1);
+});
+
 it("fades green over the visibility to 2 percent, blue faster in clean air and alike in haze", () => {
   const clean = atmosphereExtinction({ enabled: true, visibility: 1000, haze: 0, color: "" });
   const hazy = atmosphereExtinction({ enabled: true, visibility: 1000, haze: 1, color: "" });

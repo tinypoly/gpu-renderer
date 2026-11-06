@@ -199,6 +199,7 @@ Groups only this renderer reads, all on by default except the physical exposure,
 | `lens.distortion` | `0` | Radial distortion of the camera rays: positive is barrel, negative pincushion. |
 | `camera.whiteBalance` | `6500` | Kelvin the camera takes as white; `6500` is neutral, lower cools the image. |
 | `camera.autoExposure` | `false` | Meters the image as a camera in automatic does, the mean of the logarithms of its luminance weighed towards the centre, and exposes it to middle grey: a window or the sky cannot darken the room. Takes the place of `exposure`. |
+| `camera.darkAdaptation` | `0` | How much of a dark scene's darkness the automatic exposure keeps, `0` to `1`. Below an average about three stops under middle grey, it keeps that share of the missing stops, so a night lit by a few lamps stays a night. `0` exposes every scene alike. |
 | `camera.exposureCompensation` | `0` | Stops over the metered exposure. |
 | `camera.physicalExposure` | `false` | Exposes from `iso`, `shutterSpeed` and `depthOfField.aperture`, with `exposure` as compensation. |
 | `camera.iso`, `camera.shutterSpeed` | `100`, `1/125` | Seconds for the shutter. |

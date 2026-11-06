@@ -84,6 +84,12 @@ export interface GpuRenderSettings extends Omit<RenderSettings, "globalIlluminat
     autoExposure: boolean;
     /** Stops added to the metered exposure: positive brightens, as on a camera's dial. */
     exposureCompensation: number;
+    /**
+     * How much of a dark scene's darkness the automatic exposure keeps, `0` to `1`. The meter brings any image to
+     * middle grey, so a night lit by a few lamps comes out as dusk; below a dim average this keeps that share of the
+     * missing stops, as the eye does at night. `0` exposes every scene alike; `1` brightens nothing below that average.
+     */
+    darkAdaptation: number;
     iso: number;
     /** Seconds. */
     shutterSpeed: number;
@@ -154,7 +160,7 @@ export const DEFAULT_GPU_RENDER_SETTINGS: Readonly<GpuRenderSettings> = Object.f
     glare: { enabled: true, intensity: 0.06, blades: 6, length: 0.25, rotation: 15 },
     lens: { chromaticAberration: 0.05, distortion: 0 },
     camera: {
-      contrast: 1, physicalExposure: false, autoExposure: false, exposureCompensation: 0, iso: 100,
+      contrast: 1, physicalExposure: false, autoExposure: false, exposureCompensation: 0, darkAdaptation: 0, iso: 100,
       shutterSpeed: 1 / 125, whiteBalance: 6500,
     },
     subsurface: { enabled: true, depth: 2 },

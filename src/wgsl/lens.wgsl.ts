@@ -48,6 +48,8 @@ struct Lens {
   glareAngle: f32,
   // Whether the camera meters the image and exposes it to middle grey, which the meter pass works out.
   autoExposure: f32,
+  // The share of a dark scene's darkness the meter keeps.
+  darkAdaptation: f32,
 };
 
 const PI: f32 = 3.14159265358979;
@@ -77,6 +79,11 @@ const METER_THREADS: u32 = 256u;
 const HIGHLIGHT_CEILING: f32 = 8.0;
 /** The share of the metered points that counts as the bright end: the light through a window, not a lamp's own pixels. */
 const HIGHLIGHT_SHARE: f32 = 0.03;
+/**
+ * The average below which a scene counts as dark: about three stops under middle grey, a room lit by a window on a
+ * grey day. Above it the meter exposes fully; below it, only for the stops the dark adaptation lets go.
+ */
+const DIM_AVERAGE: f32 = 0.02;
 /** Half stops of luminance, from 2^-16 to 2^16, which the bright end is found in. */
 const METER_BINS: u32 = 64u;
 
@@ -137,6 +144,11 @@ fn meter(@builtin(local_invocation_index) thread: u32) {
     let total = meterSums[0];
     let average = select(MIDDLE_GREY, exp(total.x / max(total.y, 1e-6)), total.y > 0.0);
     var exposure = MIDDLE_GREY / average;
+
+    // A dark scene keeps a share of its missing stops: a night stays a night instead of turning into dusk.
+    if (average < DIM_AVERAGE) {
+      exposure = exposure * pow(average / DIM_AVERAGE, lens.darkAdaptation);
+    }
 
     // From the top down, the first half stop by which the bright share is reached; its upper edge is that end.
     var points = 0u;

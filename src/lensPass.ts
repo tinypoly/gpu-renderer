@@ -2,7 +2,7 @@ import { createShaderModule } from "./shaderModule.js";
 import { NEUTRAL_WHITE_BALANCE, whiteBalanceMatrix, type GpuRenderSettings } from "./settings.js";
 import { LENS_WGSL } from "./wgsl/lens.wgsl.js";
 
-const UNIFORM_BYTES = 144;
+const UNIFORM_BYTES = 160;
 
 const WORKGROUP = 8;
 
@@ -29,6 +29,8 @@ export interface LensEffects {
   whiteBalance: number[] | null;
   /** Whether the image is metered and exposed to middle grey before the display transform. */
   autoExposure: boolean;
+  /** The share of a dark scene's darkness the meter keeps, `0` to `1`. */
+  darkAdaptation: number;
 }
 
 /** The lens effects these settings ask for, or `null` when they ask for none and the pass can be skipped. */
@@ -55,6 +57,7 @@ export function lensEffects(settings: GpuRenderSettings): LensEffects | null {
     glareAngle: (Number(glare.rotation) || 0) * Math.PI / 180,
     whiteBalance: neutral ? null : whiteBalanceMatrix(camera.whiteBalance),
     autoExposure,
+    darkAdaptation: Math.min(1, Math.max(0, Number(camera.darkAdaptation) || 0)),
   };
 }
 
@@ -212,6 +215,7 @@ export class LensPass {
       integers[33] = streak.height;
       floats[34] = effects.glareAngle;
       floats[35] = effects.autoExposure ? 1 : 0;
+      floats[36] = effects.darkAdaptation;
       for (let row = 0; row < 3; row++) for (let column = 0; column < 3; column++)
         floats[20 + row * 4 + column] = white[row * 3 + column];
       fill();

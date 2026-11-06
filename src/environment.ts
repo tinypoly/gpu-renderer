@@ -151,6 +151,22 @@ export function environmentDistribution(grid: Float32Array, width: number, heigh
 }
 
 /**
+ * The distribution of an image with no light in it. Its total is zero, which the shader reads as nothing to sample;
+ * the rows and columns are uniform only so that the buffer keeps its layout.
+ */
+function darkDistribution(width: number, height: number) {
+  const distribution = new Float32Array(height + width * height * 2);
+
+  for (let y = 0; y < height; y++) {
+    distribution[y] = (y + 1) / height;
+
+    for (let x = 0; x < width; x++) distribution[height + y * width + x] = (x + 1) / width;
+  }
+
+  return { distribution, total: 0 };
+}
+
+/**
  * Loads an equirectangular image and builds everything the shader needs from it. Returns null for an environment that
  * is not an image, or one whose file could not be read, which leaves the renderer on its gradient.
  */
@@ -209,9 +225,9 @@ export function environmentFromImage(
 
   const gridWidth = Math.min(GRID_WIDTH, width);
   const gridHeight = Math.min(GRID_HEIGHT, height);
-  const built = environmentDistribution(reduce(scaled, width, height, gridWidth, gridHeight), gridWidth, gridHeight);
-
-  if (!built) return null;
+  // A black image is still an environment: a night sky lights nothing, and it must not give way to the default one.
+  const built = environmentDistribution(reduce(scaled, width, height, gridWidth, gridHeight), gridWidth, gridHeight)
+    ?? darkDistribution(gridWidth, gridHeight);
 
   const texture: SerializedTexture = {
     id,

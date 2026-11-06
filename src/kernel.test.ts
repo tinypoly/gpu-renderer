@@ -25,10 +25,14 @@ it("validates the path tracing kernel without any shader", () => {
 });
 
 it("validates the kernel without the subsurface walk or volumes, as a plain scene compiles it", () => {
-  expect(() => check(pathTraceSource(null, false, false, false, false))).not.toThrow();
-  expect(() => check(pathTraceSource(null, false, false, true))).not.toThrow();
-  expect(() => check(pathTraceSource(null, true, false))).not.toThrow();
-  expect(() => check(pathTraceSource(null, false, true))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, false, false, false, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, false, true, false, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, true, false, false, false, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, true, false, false, false))).not.toThrow();
+});
+
+it("validates the kernel with grass and nothing else", () => {
+  expect(() => check(pathTraceSource(null, false, false, false, false, true))).not.toThrow();
 });
 
 it("validates the presentation pass", () => {
@@ -172,5 +176,41 @@ it("translates what a hook does after <opaque_fragment> into a second program", 
 
   expect(programs.failures).toEqual([]);
   expect(programs.after(patched)?.kind).toBe("after");
+  expect(() => check(pathTraceSource(programs))).not.toThrow();
+});
+
+it("compiles a hook that wraps Three's physical direct light and samples the material's maps", async() => {
+  const patched: SerializedMaterial = {
+    type: "MeshStandardMaterial",
+    name: "relief",
+    values: {},
+    maps: {},
+    shader: {
+      vertex: "void main() {}",
+      fragment: `uniform sampler2D map;
+varying vec2 vMapUv;
+void reliefDirect(const in IncidentLight directLight, const in vec3 geometryPosition, const in vec3 geometryNormal,
+  const in vec3 geometryViewDir, const in vec3 geometryClearcoatNormal, const in PhysicalMaterial material,
+  inout ReflectedLight reflectedLight) {
+  RE_Direct_Physical(directLight, geometryPosition, geometryNormal, geometryViewDir, geometryClearcoatNormal, material,
+    reflectedLight);
+}
+#undef RE_Direct
+#define RE_Direct reliefDirect
+void main() {
+#ifdef USE_MAP
+diffuseColor.rgb = texture2D(map, vMapUv * 2.0).rgb;
+#endif
+}`,
+      uniforms: { map: { texture: "map" } },
+      defines: { USE_MAP: "" },
+      patched: true,
+    },
+  };
+
+  const programs = await compileShaderPrograms(shaderScene([patched]));
+
+  expect(programs.failures).toEqual([]);
+  expect(programs.fragment(patched)?.varyings.map(varying => varying.name)).toEqual(["vMapUv"]);
   expect(() => check(pathTraceSource(programs))).not.toThrow();
 });

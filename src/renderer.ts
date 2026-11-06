@@ -31,6 +31,7 @@ import {
   type SubsurfaceMaterial,
   type VolumeMaterial,
 } from "./subsurface.js";
+import { GRASS_NONE, grassField, grassOf, packGrass, type GrassMaterial } from "./grass.js";
 import { containingVolume, NO_MATERIAL, volumeTriangles, type VolumeTriangles } from "./volumeContainment.js";
 import {
   CONVERGED_ERROR,
@@ -252,6 +253,9 @@ interface PackedTarget {
   volumetricCount: number;
   /** The boundaries of the scene's volumes, which say whether the camera stands inside one. */
   volumes: VolumeTriangles | null;
+  /** Where the lawns' hierarchy and entries start in the texture buffer: see grass.ts. */
+  grassShells: number;
+  grassEntries: number;
 }
 
 /**
@@ -887,7 +891,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       // Portals need windows: thin glass, which is what a physical material with transmission and no thickness is.
       this.current.globalIllumination.portals !== false && materials.some(material =>
         material.type === "MeshPhysicalMaterial" && Number(material.values.transmission) > 0
-        && !(Number(material.values.thickness) > 0)));
+        && !(Number(material.values.thickness) > 0)),
+      materials.some(material => grassOf(material) !== null));
 
     // A procedural sky stands in for the renderer's own environment, as it does in the CPU renderer.
     const environment = assets.sky?.environment ?? image;
@@ -998,6 +1003,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
     const volumetric = packVolumetricLights(scene.lights);
     const volumetricData = append(new Uint32Array(volumetric.buffer));
+    const grass = packGrass(geometry, plan.extraOffset + extra.length);
+
+    if (grass) append(grass.words);
+
     const textures = writeTextures(plan, new Uint32Array(extra));
     const bvh = await this.bvh.build(geometry.positions, geometry.triangleCount);
 
@@ -1023,6 +1032,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       volumetricData,
       volumetricCount: Math.min(volumetric.length / VOLUMETRIC_WORDS, 8),
       volumes: volumeTriangles(geometry),
+      grassShells: grass?.shells ?? GRASS_NONE,
+      grassEntries: grass?.entries ?? 0,
     };
   }
 
@@ -1342,6 +1353,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       pixelCount: width * height,
       volumetricCount: target?.volumetricCount ?? 0,
       volumetricData: target?.volumetricData ?? 0,
+      grassShells: target?.grassShells ?? GRASS_NONE,
+      grassEntries: target?.grassEntries ?? 0,
     };
   }
 
@@ -1388,7 +1401,7 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
   const renamed = new Map<Material, string>();
   // The snapshot keeps a material's name but not its media, so the name carries a mark to them.
   const named = new Map<Material, string>();
-  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown }[] = [];
+  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown }[] = [];
 
   scene.traverse(object => {
     const value = (object as Object3D & { material?: Material | Material[] }).material;
@@ -1402,13 +1415,14 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       }
 
       const data = material.userData?.cpuRenderer as
-        { subsurface?: unknown; volume?: unknown; bevel?: unknown } | undefined;
+        { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown } | undefined;
 
       if (!named.has(material)
-        && (subsurfaceMedium(data?.subsurface) || volumeMedium(data?.volume) || bevelRadius(data?.bevel) > 0)) {
+        && (subsurfaceMedium(data?.subsurface) || volumeMedium(data?.volume) || bevelRadius(data?.bevel) > 0
+          || grassField(data?.grass))) {
         named.set(material, material.name);
         material.name = `${material.name}${MEDIA_MARK}${media.length}`;
-        media.push({ subsurface: data?.subsurface, volume: data?.volume, bevel: data?.bevel });
+        media.push({ subsurface: data?.subsurface, volume: data?.volume, bevel: data?.bevel, grass: data?.grass });
       }
     }
   });
@@ -1425,7 +1439,7 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
 
   // Materials are shared between the meshes that use them, so each one is unmarked once and seen marked no more.
   for (const mesh of snapshot.meshes) {
-    for (const material of mesh.materials as (SubsurfaceMaterial & VolumeMaterial & BevelMaterial)[]) {
+    for (const material of mesh.materials as (SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial)[]) {
       const at = material.name.lastIndexOf(MEDIA_MARK);
 
       if (at < 0) continue;
@@ -1436,6 +1450,7 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       if (medium.subsurface !== undefined) material.subsurface = medium.subsurface as SubsurfaceMaterial["subsurface"];
       if (medium.volume !== undefined) material.volume = medium.volume as VolumeMaterial["volume"];
       if (medium.bevel !== undefined) material.bevel = medium.bevel as BevelMaterial["bevel"];
+      if (medium.grass !== undefined) material.grass = medium.grass as GrassMaterial["grass"];
     }
   }
 

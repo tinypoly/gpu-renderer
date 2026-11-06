@@ -33,6 +33,8 @@ export {
 
 export type { GpuRenderSettings, GpuRenderSettingsInput } from "./settings.js";
 export { subsurfaceMedium } from "./subsurface.js";
+export { grassField } from "./grass.js";
+export type { GrassField, GrassInput, GrassMaterial } from "./grass.js";
 export type { SubsurfaceInput, SubsurfaceMaterial, SubsurfaceMedium } from "./subsurface.js";
 
 export type { Bucket, Listener } from "./upstream.js";

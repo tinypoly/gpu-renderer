@@ -1,6 +1,6 @@
 {
   "name": "@tinypoly/gpu-renderer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "WebGPU path tracer for Three.js scenes: BVH traversal, progressive accumulation and tone mapping in WGSL compute shaders.",
   "keywords": [
     "three",
@@ -59,7 +59,7 @@
     "prepublishOnly": "pnpm run build && pnpm run lint && pnpm run typecheck && pnpm run test"
   },
   "dependencies": {
-    "@tinypoly/cpu-renderer": "^0.3.1",
+    "@tinypoly/cpu-renderer": "^0.3.3",
     "naga-wasm": "30.2.0",
     "oidn-webgpu": "0.6.0"
   },

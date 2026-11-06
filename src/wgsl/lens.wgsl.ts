@@ -81,10 +81,11 @@ const METER_GRID: vec2<u32> = vec2<u32>(64u, 36u);
 const METER_THREADS: u32 = 256u;
 
 /**
- * How far above middle grey the meter lets the bright end of the image land: three stops, where AgX still shows
- * detail, three and a half under where it reaches white.
+ * How far above middle grey the meter lets the bright end of the image land: six stops. A room lit by its windows sits
+ * five or six stops under the daylight outside, and an architectural photograph exposes for the room and lets the
+ * windows go white; the ceiling only steps in when a small bright patch would otherwise pull the whole image down.
  */
-const HIGHLIGHT_CEILING: f32 = 8.0;
+const HIGHLIGHT_CEILING: f32 = 64.0;
 /** The share of the metered points that counts as the bright end: the light through a window, not a lamp's own pixels. */
 const HIGHLIGHT_SHARE: f32 = 0.03;
 /**

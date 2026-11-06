@@ -158,6 +158,18 @@ it("hands the meter how much of a dark scene's darkness to keep, held between no
   expect(metered(3)?.darkAdaptation).toBe(1);
 });
 
+it("limits the aperture's rays against the exposure the image ends with", () => {
+  const glare = { enabled: true, intensity: 0.06 };
+  const manual = lensEffects(mergeGpuSettings(DEFAULT_GPU_RENDER_SETTINGS, { exposure: 2, glare }));
+
+  const metered = lensEffects(mergeGpuSettings(DEFAULT_GPU_RENDER_SETTINGS,
+    { exposure: 2, glare, camera: { autoExposure: true, exposureCompensation: 1 } }));
+
+  expect(manual?.exposure).toBe(2);
+  // With the meter, only the compensation is left: the meter's own exposure is read on the device.
+  expect(metered?.exposure).toBe(2);
+});
+
 it("fades green over the visibility to 2 percent, blue faster in clean air and alike in haze", () => {
   const clean = atmosphereExtinction({ enabled: true, visibility: 1000, haze: 0, color: "" });
   const hazy = atmosphereExtinction({ enabled: true, visibility: 1000, haze: 1, color: "" });

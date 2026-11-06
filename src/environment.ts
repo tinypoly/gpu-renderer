@@ -225,6 +225,7 @@ export function environmentFromImage(
 
   const gridWidth = Math.min(GRID_WIDTH, width);
   const gridHeight = Math.min(GRID_HEIGHT, height);
+
   // A black image is still an environment: a night sky lights nothing, and it must not give way to the default one.
   const built = environmentDistribution(reduce(scaled, width, height, gridWidth, gridHeight), gridWidth, gridHeight)
     ?? darkDistribution(gridWidth, gridHeight);

@@ -1,4 +1,5 @@
 import { layoutStruct, writeStruct, type StructField } from "./structLayout.js";
+import { grassOf, type GrassField } from "./grass.js";
 import { bevelOf, subsurfaceOf, volumeOf } from "./subsurface.js";
 import { NO_TEXTURE } from "./texturePack.js";
 import type { SerializedMaterial, UniformValue } from "./upstream.js";
@@ -74,6 +75,11 @@ export interface MaterialProperties {
   volumeAnisotropy: number;
   /** The radius over which edges are rounded at shading time, in scene units; zero leaves them sharp. */
   bevel: number;
+  /**
+   * The lawn grown on the surface, from `userData.cpuRenderer.grass`. It lives in the texture buffer's extra words
+   * rather than in the struct: see grass.ts.
+   */
+  grass?: GrassField | null;
   /** An index into the texture table per slot, or `NO_TEXTURE`. */
   maps: Record<MaterialMap, number>;
 }
@@ -376,6 +382,7 @@ export function materialProperties(
     volumeDensity: volume?.density ?? 0,
     volumeAnisotropy: volume?.anisotropy ?? 0,
     bevel: LIT.has(type) ? bevelOf(material) : 0,
+    grass: LIT.has(type) ? grassOf(material) : null,
     maps,
   };
 }

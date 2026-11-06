@@ -76,6 +76,8 @@ export const FRAME_LAYOUT = layoutStruct("Frame", [
   { name: "atmosphereExtinction", type: "vec4f", doc: "rgb is how much of each colour the air takes per scene unit, w the haze." },
   { name: "atmosphereSun", type: "vec4f", doc: "xyz is the direction towards the brightest directional light." },
   { name: "atmosphereSunColor", type: "vec4f", doc: "rgb is that light's irradiance, which the air scatters." },
+  { name: "grassShells", type: "u32", doc: "Where the hierarchy of the triangles that grow grass starts in the texture buffer, or GRASS_NONE." },
+  { name: "grassEntries", type: "u32", doc: "Where those triangles' entries start in the texture buffer." },
   { name: "clipPlane", type: "vec4f", doc: "A plane the camera ray drops surfaces behind, for planar captures; w = 0 and xyz = 0 is none." },
 ]);
 

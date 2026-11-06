@@ -64,6 +64,8 @@ struct Surface {
   material: u32,
   // Share of the diffuse layer that scatters inside the material instead of at its surface.
   subsurface: f32,
+  // What a translucent surface lets through to its far side, diffusely: grass blades. Zero for everything else.
+  translucent: vec3<f32>,
 };
 
 /** Barycentric weights of the two trailing vertices, for a point drawn uniformly over a triangle's area. */

@@ -6,6 +6,7 @@ import { writeStruct } from "./structLayout.js";
 import { BSDF_WGSL } from "./wgsl/bsdf.wgsl.js";
 import { BVH_WGSL } from "./wgsl/bvh.wgsl.js";
 import { COMMON_WGSL } from "./wgsl/common.wgsl.js";
+import { GRASS_STUB_WGSL, GRASS_WGSL } from "./wgsl/grass.wgsl.js";
 import { ENVIRONMENT_WGSL } from "./wgsl/environment.wgsl.js";
 import { LIGHTS_WGSL } from "./wgsl/lights.wgsl.js";
 import { PATH_TRACE_WGSL } from "./wgsl/pathTrace.wgsl.js";
@@ -25,12 +26,13 @@ export type FrameUniforms = Record<keyof typeof FRAME_LAYOUT.offsets & string, n
  */
 export function pathTraceSource(
   programs: ShaderPrograms | null = null, subsurface = true, volumes = true, bevel = true,
-  portals = true): string {
+  portals = true, grass = true): string {
   // The random walk inside materials and the media inside volumes are compiled in only for a scene that has them: the
   // kernel is bound by its size, and either would cost every other scene a few percent for code that never runs.
   return `const SUBSURFACE_WALK: bool = ${subsurface};\nconst VOLUMES: bool = ${volumes};\nconst BEVEL: bool = ${bevel};\n`
-    + `const PORTALS: bool = ${portals};\n` + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL
-    + programsWgsl(programs) + ENVIRONMENT_WGSL + SURFACE_WGSL + BSDF_WGSL + LIGHTS_WGSL + PATH_TRACE_WGSL;
+    + `const PORTALS: bool = ${portals};\nconst GRASS: bool = ${grass};\n` + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL
+    + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL + programsWgsl(programs) + ENVIRONMENT_WGSL + SURFACE_WGSL
+    + (grass ? GRASS_WGSL : GRASS_STUB_WGSL) + BSDF_WGSL + LIGHTS_WGSL + PATH_TRACE_WGSL;
 }
 
 const FRAME_BYTES = FRAME_WORDS * 4;
@@ -45,7 +47,7 @@ export class PathTracePass {
   private programKey = "|false|false|false|false|false";
 
   constructor(private readonly device: GPUDevice) {
-    this.pipeline = this.build(null, false, false, false, false);
+    this.pipeline = this.build(null, false, false, false, false, false);
     this.uniforms = device.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
 
@@ -54,20 +56,20 @@ export class PathTracePass {
    * the same set keeps the pipeline it has.
    */
   setPrograms(programs: ShaderPrograms | null, subsurface = false, volumes = false, bevel = false,
-    portals = false) {
-    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}|${portals}`;
+    portals = false, grass = false) {
+    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}|${portals}|${grass}`;
 
     if (key === this.programKey) return;
 
     this.programKey = key;
-    this.pipeline = this.build(programs, subsurface, volumes, bevel, portals);
+    this.pipeline = this.build(programs, subsurface, volumes, bevel, portals, grass);
     this.bindGroup = null;
   }
 
   private build(programs: ShaderPrograms | null, subsurface: boolean, volumes: boolean,
-    bevel: boolean, portals: boolean): GPUComputePipeline {
+    bevel: boolean, portals: boolean, grass: boolean): GPUComputePipeline {
     const module = createShaderModule(this.device, "path trace",
-      pathTraceSource(programs, subsurface, volumes, bevel, portals));
+      pathTraceSource(programs, subsurface, volumes, bevel, portals, grass));
 
     return this.device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
   }

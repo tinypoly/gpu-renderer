@@ -178,6 +178,16 @@ const PATCHED_CONTEXT: [string, string][] = [
   ["vec3", "vNormal"],
 ];
 
+/**
+ * Three's physical light function, which a hook may wrap to change its direct light (a relief shadowing its own
+ * joints). The integrator lights the surface, so the function is only there for the hook to compile and does nothing.
+ */
+const PHYSICAL_LIGHT_STUB = `
+struct PhysicalMaterial { vec3 diffuseColor; float roughness; vec3 specularColor; float specularF90; float dispersion; };
+void RE_Direct_Physical(IncidentLight directLight, vec3 geometryPosition, vec3 geometryNormal, vec3 geometryViewDir,
+  vec3 geometryClearcoatNormal, PhysicalMaterial material, inout ReflectedLight reflectedLight) {}
+`;
+
 /** Light helpers Three's hooks expect from its lighting chunks, which a patched shader no longer includes. */
 const PATCHED_HELPERS = `
 float getDistanceAttenuation(float lightDistance, float cutoffDistance, float decayExponent) {
@@ -374,7 +384,7 @@ export function prepareFragmentShader(
 
   let body = shader.fragment;
 
-  if (kind === "patched" || kind === "after") body = `${SHADER_CHUNKS.common}\n${body}`;
+  if (kind === "patched" || kind === "after") body = `${SHADER_CHUNKS.common}\n${PHYSICAL_LIGHT_STUB}\n${body}`;
 
   body = unrollLoops(expandIncludes(body));
   body = stripComments(body)

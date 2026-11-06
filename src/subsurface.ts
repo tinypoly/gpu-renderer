@@ -96,7 +96,8 @@ export type VolumeMaterial = SerializedMaterial & { volume?: VolumeInput };
 
 const srgbToLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
 
-function albedoOf(color: unknown): [number, number, number] {
+/** A colour as `#rrggbb` or linear rgb, in linear rgb clamped to one; white when it reads as neither. */
+export function linearAlbedo(color: unknown): [number, number, number] {
   if (Array.isArray(color) && color.length >= 3) {
     return [0, 1, 2].map(k => Math.min(1, Math.max(0, finite(color[k], 1)))) as [number, number, number];
   }
@@ -123,7 +124,7 @@ export function volumeMedium(input: unknown): VolumeMedium | null {
 
   return {
     density,
-    albedo: albedoOf(value.color),
+    albedo: linearAlbedo(value.color),
     anisotropy: Math.min(0.95, Math.max(-0.95, finite(value.anisotropy, 0))),
   };
 }

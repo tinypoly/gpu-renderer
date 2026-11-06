@@ -660,6 +660,11 @@ fn lightTransmittance(position: vec3<f32>, chosen: LightSample, rng: ptr<functio
     return vec3<f32>(1.0);
   }
 
+  // A blade of grass on the way blocks the light.
+  if (GRASS && chosen.occlude && traceGrass(position, chosen.direction, chosen.distance).found) {
+    return vec3<f32>(0.0);
+  }
+
   if (chosen.occlude) {
     // Most blockers are plainly opaque, and for those any triangle on the way settles it: the search stops at the
     // first one found instead of looking for the closest. Anything that lets light through goes the long way below.

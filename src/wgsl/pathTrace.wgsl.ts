@@ -132,7 +132,8 @@ fn emissionWeight(hit: Hit, direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect:
  * volume, a toon ramp read all round, a clearcoat that may face what its base turns from, and transmission.
  */
 fn treeNormal(surface: Surface) -> vec3<f32> {
-  if (surface.kind == KIND_VOLUME || surface.kind == KIND_TOON || surface.clearcoat > 0.0 || surface.transmission > 0.0) {
+  if (surface.kind == KIND_VOLUME || surface.kind == KIND_TOON || surface.clearcoat > 0.0 || surface.transmission > 0.0
+    || (GRASS && any(surface.translucent > vec3<f32>(0.0)))) {
     return vec3<f32>(0.0);
   }
 
@@ -171,7 +172,14 @@ fn directLight(
   let toon = surface.kind == KIND_TOON;
   // Three's shadow map leaves a toon mesh's own far side unshadowed; tracing through the mesh would not.
   let skip = select(NO_MATERIAL, surface.material, toon && dot(surface.normal, chosen.direction) < 0.1);
-  let through = lightTransmittance(position, chosen, rng, skip, medium);
+  var shadowFrom = position;
+
+  // Light from behind a translucent surface is looked for from its far side, past the surface itself.
+  if (GRASS && any(surface.translucent > vec3<f32>(0.0)) && dot(chosen.direction, surface.facing) < 0.0) {
+    shadowFrom = position - (surface.normal + surface.facing) * RAY_EPSILON;
+  }
+
+  let through = lightTransmittance(shadowFrom, chosen, rng, skip, medium);
 
   if (all(through <= vec3<f32>(0.0))) {
     return vec3<f32>(0.0);
@@ -457,7 +465,20 @@ fn traceRadiance(
   }
 
   for (var step = 0u; step < MAX_STEPS + MAX_WALK; step = step + 1u) {
-    let hit = traceScene(origin, direction, limit);
+    var hit = traceScene(origin, direction, limit);
+    // A blade of grass in front of whatever the ray hit. A walk inside a material never meets one.
+    var grass: GrassHit;
+
+    if (GRASS && !(SUBSURFACE_WALK && inMedium)) {
+      grass = traceGrass(origin, direction, hit.distance);
+
+      if (grass.found) {
+        hit.distance = grass.distance;
+        hit.triangle = GRASS_TRIANGLE;
+        hit.u = 0.0;
+        hit.v = 0.0;
+      }
+    }
 
     // A step of the walk inside a material that ends in the medium: the light scatters there, keeping each colour's
     // share of it. It needs three numbers, which a plain hash gives for a fraction of what the sequence costs.
@@ -570,7 +591,7 @@ fn traceRadiance(
     let point = origin + direction * travel;
     var m = 0u;
 
-    if (!scattering) {
+    if (!scattering && !(GRASS && grass.found)) {
       m = materialIndexOf(hit.triangle);
     }
 
@@ -582,6 +603,8 @@ fn traceRadiance(
       direction = -surface.normal;
     } else if (VOLUMES && scattering) {
       surface = volumePoint(direction, volumeAlbedo, volumeG);
+    } else if (GRASS && grass.found) {
+      surface = grassSurface(grass, direction);
     } else {
 
     // A volume's boundary is not a surface: the ray goes in or out, and the medium is what it meets.
@@ -730,7 +753,8 @@ fn traceRadiance(
     if (primary) {
       alpha = 1.0;
 
-      if (!scattering && !fogged && afterMaterial == NO_MATERIAL && materials[m].afterProgram != NO_PROGRAM) {
+      if (!scattering && !(GRASS && grass.found) && !fogged && afterMaterial == NO_MATERIAL
+        && materials[m].afterProgram != NO_PROGRAM) {
         afterMaterial = m;
         afterTriangle = hit.triangle;
         afterBary = bary;
@@ -893,6 +917,11 @@ fn traceRadiance(
         escapeIntensity = surface.envMapIntensity;
         next = scattered.direction;
         nextOrigin = position;
+
+        // Through a translucent surface, the path carries on from its far side.
+        if (GRASS && dot(next, surface.facing) < 0.0 && any(surface.translucent > vec3<f32>(0.0))) {
+          nextOrigin = point - surface.facing * RAY_EPSILON;
+        }
         primary = false;
         straight = false;
         bounce = bounce + 1u;

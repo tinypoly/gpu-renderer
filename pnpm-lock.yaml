@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@tinypoly/cpu-renderer':
-        specifier: ^0.3.1
-        version: 0.3.1(three@0.185.1)
+        specifier: ^0.3.3
+        version: 0.3.3(three@0.185.1)
       naga-wasm:
         specifier: 30.2.0
         version: 30.2.0
@@ -404,8 +404,8 @@ packages:
     peerDependencies:
       eslint: ^9.0.0 || ^10.0.0
 
-  '@tinypoly/cpu-renderer@0.3.1':
-    resolution: {integrity: sha512-qrUHtDFaV08c8YOsWELM76+oRJbaUkPdAM78yREKINRT8oHYHM9lodjYmCRE1xkKtdoTJrqb+Egsu2kd0eRWpQ==}
+  '@tinypoly/cpu-renderer@0.3.3':
+    resolution: {integrity: sha512-yDbQKVpnpis84z77YjK+NLIzy4nKUBhmoEbDGqV2NkBXM3OdNH42Wevh3N+rEm+gX6rj/yRgLeeAPSft7llePA==}
     engines: {node: '>=20'}
     peerDependencies:
       three: '>=0.185.0'
@@ -1301,7 +1301,7 @@ snapshots:
       estraverse: 5.3.0
       picomatch: 4.0.7
 
-  '@tinypoly/cpu-renderer@0.3.1(three@0.185.1)':
+  '@tinypoly/cpu-renderer@0.3.3(three@0.185.1)':
     dependencies:
       three: 0.185.1
 

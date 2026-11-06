@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { environmentDistribution, loadEnvironment } from "./environment.js";
+import { environmentDistribution, environmentFromImage, loadEnvironment } from "./environment.js";
 
 /** A grid of linear rgb, three floats per texel, from a function of its position. */
 function grid(width: number, height: number, value: (x: number, y: number) => number) {
@@ -83,6 +83,18 @@ it("gives every texel some chance, so no direction arrives through a bounce alon
 
 it("refuses a sky with nothing in it, which nothing could be aimed at", () => {
   expect(environmentDistribution(grid(4, 2, () => 0), 4, 2)).toBeNull();
+});
+
+it("keeps a black image as an environment that lights nothing, so a night sky does not fall back to another", () => {
+  const image = new Float32Array(8 * 4 * 4);
+
+  for (let texel = 0; texel < 8 * 4; texel++) image[texel * 4 + 3] = 1;
+
+  const environment = environmentFromImage(image, 8, 4);
+
+  expect(environment).not.toBeNull();
+  expect(environment!.total).toBe(0);
+  expect(environment!.distribution).toHaveLength(environment!.height + environment!.width * environment!.height * 2);
 });
 
 it("leaves a gradient environment alone: there is no image to read", async() => {

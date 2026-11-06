@@ -1,5 +1,5 @@
 import { createShaderModule } from "./shaderModule.js";
-import { NEUTRAL_WHITE_BALANCE, whiteBalanceMatrix, type GpuRenderSettings } from "./settings.js";
+import { effectiveExposure, NEUTRAL_WHITE_BALANCE, whiteBalanceMatrix, type GpuRenderSettings } from "./settings.js";
 import { LENS_WGSL } from "./wgsl/lens.wgsl.js";
 
 const UNIFORM_BYTES = 160;
@@ -31,6 +31,8 @@ export interface LensEffects {
   autoExposure: boolean;
   /** The share of a dark scene's darkness the meter keeps, `0` to `1`. */
   darkAdaptation: number;
+  /** What the image is multiplied by after the lens, the meter's own exposure aside: the rays are limited against it. */
+  exposure: number;
 }
 
 /** The lens effects these settings ask for, or `null` when they ask for none and the pass can be skipped. */
@@ -58,6 +60,7 @@ export function lensEffects(settings: GpuRenderSettings): LensEffects | null {
     whiteBalance: neutral ? null : whiteBalanceMatrix(camera.whiteBalance),
     autoExposure,
     darkAdaptation: Math.min(1, Math.max(0, Number(camera.darkAdaptation) || 0)),
+    exposure: Math.max(effectiveExposure(settings), 0),
   };
 }
 
@@ -216,6 +219,7 @@ export class LensPass {
       floats[34] = effects.glareAngle;
       floats[35] = effects.autoExposure ? 1 : 0;
       floats[36] = effects.darkAdaptation;
+      floats[37] = effects.exposure;
       for (let row = 0; row < 3; row++) for (let column = 0; column < 3; column++)
         floats[20 + row * 4 + column] = white[row * 3 + column];
       fill();
@@ -256,6 +260,10 @@ export class LensPass {
       integers[10] = level.offset;
     };
 
+    // The meter is one workgroup, whatever the size: dispatched as a single tile of the grid it reads. It goes first,
+    // since the rays are limited against the exposure it finds.
+    if (effects.autoExposure) dispatch(this.meter, { width: 1, height: 1 }, () => {});
+
     // The rays are gathered from a level of the same pyramid, so either effect builds it.
     if (effects.bloom > 0 || effects.glare > 0) {
       levels.forEach((level, k) => dispatch(this.downsample, level, () => {
@@ -293,9 +301,6 @@ export class LensPass {
           levels[0].width * levels[0].height * 16);
       }
     }
-
-    // The meter is one workgroup, whatever the size: dispatched as a single tile of the grid it reads.
-    if (effects.autoExposure) dispatch(this.meter, { width: 1, height: 1 }, () => {});
 
     dispatch(this.composite, { width, height }, () => {});
 

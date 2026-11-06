@@ -50,12 +50,20 @@ struct Lens {
   autoExposure: f32,
   // The share of a dark scene's darkness the meter keeps.
   darkAdaptation: f32,
+  // The exposure applied after the lens, the meter's aside, which the rays are limited against.
+  exposure: f32,
 };
 
 const PI: f32 = 3.14159265358979;
 
 /** Taps along each of the aperture's rays. */
 const STREAK_TAPS: i32 = 24;
+
+/**
+ * The brightest a tap of the rays counts as, in multiples of the exposed white. A lamp is thousands of times white,
+ * which would carry its rays across the frame at full length; past this they stay as short as a camera shows them.
+ */
+const GLARE_CEILING: f32 = 4.0;
 
 @group(0) @binding(0) var<uniform> lens: Lens;
 @group(0) @binding(1) var<storage, read> accumulation: array<vec4<f32>>;
@@ -342,6 +350,8 @@ fn streaks(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 
   let centre = vec2<f32>(id.xy) + 0.5;
+  // The exposure the image will have: the setting's, and the meter's when it meters.
+  let exposure = lens.exposure * select(1.0, metered[0].x, lens.autoExposure > 0.0);
   var sum = vec3<f32>(0.0);
   var total = 0.0;
 
@@ -351,9 +361,11 @@ fn streaks(@builtin(global_invocation_id) id: vec3<u32>) {
 
     for (var j = 1; j <= STREAK_TAPS; j = j + 1) {
       let t = f32(j) / f32(STREAK_TAPS);
-      let weight = exp(-4.0 * t);
+      let weight = exp(-6.0 * t);
 
-      sum = sum + downBilinear(lens.sourceOffset, lens.sourceSize, centre - along * (t * lens.glareLength)) * weight;
+      let light = downBilinear(lens.sourceOffset, lens.sourceSize, centre - along * (t * lens.glareLength));
+
+      sum = sum + light * (weight / max(1.0, luminance(light) * exposure / GLARE_CEILING));
       total = total + weight;
     }
   }

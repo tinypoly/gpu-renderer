@@ -12,6 +12,7 @@ const TEXTURE_FLOAT: u32 = 1u;
 const TEXTURE_SRGB: u32 = 2u;
 const TEXTURE_NEAREST: u32 = 4u;
 const TEXTURE_FLIP_Y: u32 = 8u;
+const TEXTURE_SINGLE: u32 = 32u;
 
 // Three's own wrap constants. Anything else clamps, as it does in the CPU renderer.
 const WRAP_REPEAT: u32 = 1000u;
@@ -45,6 +46,16 @@ fn readTexel(info: TextureInfo, x: i32, y: i32) -> vec4<f32> {
       bitcast<f32>(textures[at + 1u]),
       bitcast<f32>(textures[at + 2u]),
       bitcast<f32>(textures[at + 3u]));
+  }
+
+  // The only channel the scene reads, four texels to a word, handed back in every channel: alpha as it is, the colour
+  // decoded where the texture is sRGB, as a full texel's would be.
+  if ((info.flags & TEXTURE_SINGLE) != 0u) {
+    let code = (textures[info.offset + (index >> 2u)] >> ((index & 3u) * 8u)) & 0xffu;
+    let raw = f32(code) / 255.0;
+    let colour = select(raw, bitcast<f32>(textures[SRGB_TABLE + code]), (info.flags & TEXTURE_SRGB) != 0u);
+
+    return vec4<f32>(colour, colour, colour, raw);
   }
 
   let word = textures[info.offset + index];

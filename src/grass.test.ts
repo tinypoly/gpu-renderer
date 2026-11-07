@@ -28,7 +28,10 @@ function ground(grass: GrassField | null): PackedGeometry {
 
   return {
     positions,
+    // One vertex per corner, as a mesh without shared vertices packs.
+    corners: Uint32Array.from({ length: 9 }, (_, k) => k),
     normals,
+    vertexCount: 9,
     triangleCount: 3,
     materials: new Uint32Array([0, 0, 0]),
     materialProperties: [{ grass } as PackedGeometry["materialProperties"][number]],

@@ -82,15 +82,19 @@ fn trianglePointAt(triangle: u32, bary: vec2<f32>) -> vec3<f32> {
 }
 
 fn triangleUv(triangle: u32, bary: vec2<f32>, channel: u32) -> vec2<f32> {
-  return attributeUv(triangle, 0u, channel) * (1.0 - bary.x - bary.y)
-    + attributeUv(triangle, 1u, channel) * bary.x
-    + attributeUv(triangle, 2u, channel) * bary.y;
+  let corners = triangleCorners(triangle);
+
+  return vertexUv(corners.x, channel) * (1.0 - bary.x - bary.y)
+    + vertexUv(corners.y, channel) * bary.x
+    + vertexUv(corners.z, channel) * bary.y;
 }
 
 fn triangleColor(triangle: u32, bary: vec2<f32>) -> vec4<f32> {
-  return attributeColor(triangle, 0u) * (1.0 - bary.x - bary.y)
-    + attributeColor(triangle, 1u) * bary.x
-    + attributeColor(triangle, 2u) * bary.y;
+  let corners = triangleCorners(triangle);
+
+  return vertexColor(corners.x) * (1.0 - bary.x - bary.y)
+    + vertexColor(corners.y) * bary.x
+    + vertexColor(corners.z) * bary.y;
 }
 
 /** A map slot, sampled through the UV set the texture asks for. Missing maps read as one, so a multiply is always safe. */
@@ -362,9 +366,10 @@ fn tangentFrame(triangle: u32, channel: u32, normal: vec3<f32>) -> TangentFrame 
   let p0 = triangleVertex(triangle, 0u);
   let edge1 = triangleVertex(triangle, 1u) - p0;
   let edge2 = triangleVertex(triangle, 2u) - p0;
-  let uv0 = attributeUv(triangle, 0u, channel);
-  let delta1 = attributeUv(triangle, 1u, channel) - uv0;
-  let delta2 = attributeUv(triangle, 2u, channel) - uv0;
+  let corners = triangleCorners(triangle);
+  let uv0 = vertexUv(corners.x, channel);
+  let delta1 = vertexUv(corners.y, channel) - uv0;
+  let delta2 = vertexUv(corners.z, channel) - uv0;
   let determinant = delta1.x * delta2.y - delta2.x * delta1.y;
 
   // A triangle with no UV area has no tangent frame to offer.
@@ -460,12 +465,17 @@ fn mappedNormal(m: u32, triangle: u32, bary: vec2<f32>, normal: vec3<f32>) -> ve
 
 /** The interpolated vertex normal as the mesh authored it, pointing out of a closed volume. */
 fn authoredNormal(triangle: u32, bary: vec2<f32>) -> vec3<f32> {
-  let base = triangle * 9u;
-  let n0 = vec3<f32>(attributes[base], attributes[base + 1u], attributes[base + 2u]);
-  let n1 = vec3<f32>(attributes[base + 3u], attributes[base + 4u], attributes[base + 5u]);
-  let n2 = vec3<f32>(attributes[base + 6u], attributes[base + 7u], attributes[base + 8u]);
+  let instance = instanceOf(triangle);
+  let at = frame.cornerOffset + storedTriangle(triangle, instance) * 3u;
+  let n = vertexNormal(indices[at]) * (1.0 - bary.x - bary.y)
+    + vertexNormal(indices[at + 1u]) * bary.x
+    + vertexNormal(indices[at + 2u]) * bary.y;
 
-  return normalize(n0 * (1.0 - bary.x - bary.y) + n1 * bary.x + n2 * bary.y);
+  if (instance != NO_INSTANCE) {
+    return normalize(instanceNormal(instance, n));
+  }
+
+  return normalize(n);
 }
 
 /** The interpolated vertex normal, or the face's for flat shading, turned to face the ray. */

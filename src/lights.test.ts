@@ -27,8 +27,11 @@ function geometry(
 
   return {
     positions,
+    corners: Uint32Array.from({ length: triangles.length * 3 }, (_, k) => k),
     normals: new Float32Array(triangles.length * 9),
     uvs: new Float32Array(triangles.length * 12),
+    vertexCount: triangles.length * 3,
+    instancing: null,
     materials,
     triangleCount: triangles.length,
     materialColors: new Float32Array(properties.flatMap(m => [...m.color, m.opacity])),

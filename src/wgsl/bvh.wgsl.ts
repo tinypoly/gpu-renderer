@@ -4,6 +4,10 @@
  * The positions are uploaded in the hierarchy's leaf order, so a leaf is a run of triangles read straight off the
  * buffer; the scene's own triangle number is looked up once, for the hit a trace returns. Every other reader goes the
  * other way, from a triangle number to where its corners sit.
+ *
+ * With INSTANCES compiled in, a leaf with a count of -1 is an instance: the ray is taken into its object space and
+ * the traversal goes on in its prototype's hierarchy, with a marker on the stack that brings it back to world space.
+ * The distance along the ray is the same in both spaces, since the direction is transformed and not normalized.
  */
 export const BVH_WGSL = /* wgsl */ `
 /** A corner of the triangle at this position of the hierarchy's leaf order. */
@@ -18,8 +22,37 @@ fn leafOf(triangle: u32) -> u32 {
   return indices[frame.leafOffset + triangle];
 }
 
+/** A corner of a triangle a hit named, in world space. */
 fn triangleVertex(triangle: u32, corner: u32) -> vec3<f32> {
-  return leafVertex(leafOf(triangle), corner);
+  let instance = instanceOf(triangle);
+  let p = leafVertex(leafOf(storedTriangle(triangle, instance)), corner);
+
+  if (instance != NO_INSTANCE) {
+    return instancePoint(instance, p);
+  }
+
+  return p;
+}
+
+/** The stack entry that leaves an instance: the traversal goes back to world space. */
+const RETURN_ENTRY: u32 = 0xffffffffu;
+
+/** A huge finite reciprocal instead of an infinite one: an axis aligned slab would otherwise produce 0 * inf. */
+fn rayInverse(direction: vec3<f32>) -> vec3<f32> {
+  let signs = select(vec3<f32>(-1.0), vec3<f32>(1.0), direction >= vec3<f32>(0.0));
+
+  return signs / max(abs(direction), vec3<f32>(1e-20));
+}
+
+/** The number a hit goes by, from where it sits in the leaf order and the instance it was found in. */
+fn namedTriangle(at: u32, instance: u32) -> u32 {
+  let stored = orderedTriangle(at);
+
+  if (INSTANCES && instance != NO_INSTANCE) {
+    return instanceWord(instance, 26u) + stored - instanceWord(instance, 25u);
+  }
+
+  return stored;
 }
 
 /** Moller-Trumbore. Returns the distance in x and the barycentric coordinates in yz, or a negative distance. */
@@ -127,7 +160,7 @@ fn waitingLeaf(entry: u32) -> vec2<i32> {
  * A leaf is tested at the top of the next step, the one place the loop tests triangles, which keeps the kernel small.
  * This visits what the binary tree's traversal visited, in the same order, so it finds the same hit.
  */
-fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit {
+fn traceScene(worldOrigin: vec3<f32>, worldDirection: vec3<f32>, maxDistance: f32) -> Hit {
   var hit: Hit;
   hit.distance = maxDistance;
   hit.triangle = NO_HIT;
@@ -138,12 +171,15 @@ fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit 
     return hit;
   }
 
-  // A huge finite reciprocal instead of an infinite one: an axis aligned slab would otherwise produce 0 * inf.
-  let signs = select(vec3<f32>(-1.0), vec3<f32>(1.0), direction >= vec3<f32>(0.0));
-  let inverse = signs / max(abs(direction), vec3<f32>(1e-20));
+  var origin = worldOrigin;
+  var direction = worldDirection;
+  var inverse = rayInverse(direction);
+  // The instance the traversal is inside, and the one the closest hit so far was found in.
+  var instance = NO_INSTANCE;
+  var hitInstance = NO_INSTANCE;
 
-  var stack: array<u32, 32>;
-  var enters: array<f32, 32>;
+  var stack: array<u32, BVH_STACK>;
+  var enters: array<f32, BVH_STACK>;
   var depth = 0u;
   var current = 0u;
   // A leaf to test before anything else: its link, and its triangle count, zero when there is none.
@@ -151,8 +187,30 @@ fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit 
 
   loop {
     if (leaf.y > 0) {
+      let before = hit.distance;
+
       intersectLeaf(leaf.x, leaf.y, origin, direction, &hit);
+
+      if (INSTANCES && hit.distance < before) {
+        hitInstance = instance;
+      }
+
       leaf.y = 0;
+    }
+
+    if (INSTANCES && leaf.y < 0) {
+      leaf.y = 0;
+
+      if (depth < BVH_STACK) {
+        instance = u32(-1 - leaf.x);
+        stack[depth] = RETURN_ENTRY;
+        enters[depth] = -1.0;
+        depth = depth + 1u;
+        origin = instanceToObject(instance, worldOrigin, 1.0);
+        direction = instanceToObject(instance, worldDirection, 0.0);
+        inverse = rayInverse(direction);
+        current = instanceWord(instance, 24u);
+      }
     }
 
     if (current == NO_NODE) {
@@ -168,6 +226,14 @@ fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit 
       }
 
       let entry = stack[depth];
+
+      if (INSTANCES && entry == RETURN_ENTRY) {
+        instance = NO_INSTANCE;
+        origin = worldOrigin;
+        direction = worldDirection;
+        inverse = rayInverse(direction);
+        continue;
+      }
 
       if ((entry & LEAF_ENTRY) != 0u) {
         leaf = waitingLeaf(entry);
@@ -198,7 +264,7 @@ fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit 
     }
 
     // The builder caps its depth so the far children always fit; the guard keeps a malformed tree inside the stack.
-    if (farEnter < 1e30 && depth < 32u) {
+    if (farEnter < 1e30 && depth < BVH_STACK) {
       stack[depth] = select(u32(farLink), leafEntry(parent, leftFirst), farLink < 0);
       enters[depth] = farEnter;
       depth = depth + 1u;
@@ -206,7 +272,7 @@ fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit 
   }
 
   if (hit.triangle != NO_HIT) {
-    hit.triangle = orderedTriangle(hit.triangle);
+    hit.triangle = namedTriangle(hit.triangle, hitInstance);
   }
 
   return hit;
@@ -217,15 +283,17 @@ fn traceScene(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Hit 
  * closest: what a shadow ray asks when every surface it could meet blocks it. Returns that triangle, or NO_HIT. The
  * right child goes first and the left one waits, the order the binary tree's traversal took.
  */
-fn traceAny(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> u32 {
+fn traceAny(worldOrigin: vec3<f32>, worldDirection: vec3<f32>, maxDistance: f32) -> u32 {
   if (frame.triangleCount == 0u) {
     return NO_HIT;
   }
 
-  let signs = select(vec3<f32>(-1.0), vec3<f32>(1.0), direction >= vec3<f32>(0.0));
-  let inverse = signs / max(abs(direction), vec3<f32>(1e-20));
+  var origin = worldOrigin;
+  var direction = worldDirection;
+  var inverse = rayInverse(direction);
+  var instance = NO_INSTANCE;
 
-  var stack: array<u32, 32>;
+  var stack: array<u32, BVH_STACK>;
   var depth = 0u;
   var current = 0u;
   var leaf = vec2<i32>(0, 0);
@@ -235,10 +303,24 @@ fn traceAny(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> u32 {
       let found = anyInLeaf(leaf.x, leaf.y, origin, direction, maxDistance);
 
       if (found != NO_HIT) {
-        return orderedTriangle(found);
+        return namedTriangle(found, instance);
       }
 
       leaf.y = 0;
+    }
+
+    if (INSTANCES && leaf.y < 0) {
+      leaf.y = 0;
+
+      if (depth < BVH_STACK) {
+        instance = u32(-1 - leaf.x);
+        stack[depth] = RETURN_ENTRY;
+        depth = depth + 1u;
+        origin = instanceToObject(instance, worldOrigin, 1.0);
+        direction = instanceToObject(instance, worldDirection, 0.0);
+        inverse = rayInverse(direction);
+        current = instanceWord(instance, 24u);
+      }
     }
 
     if (current == NO_NODE) {
@@ -249,6 +331,14 @@ fn traceAny(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> u32 {
       depth = depth - 1u;
 
       let entry = stack[depth];
+
+      if (INSTANCES && entry == RETURN_ENTRY) {
+        instance = NO_INSTANCE;
+        origin = worldOrigin;
+        direction = worldDirection;
+        inverse = rayInverse(direction);
+        continue;
+      }
 
       if ((entry & LEAF_ENTRY) != 0u) {
         leaf = waitingLeaf(entry);
@@ -277,7 +367,7 @@ fn traceAny(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> u32 {
       }
     }
 
-    if (rightHit && leftHit && depth < 32u) {
+    if (rightHit && leftHit && depth < BVH_STACK) {
       stack[depth] = select(u32(node.leftLink), leafEntry(parent, false), node.leftLink < 0);
       depth = depth + 1u;
     }

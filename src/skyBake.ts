@@ -1,6 +1,7 @@
 import { compileProgram, type ShaderProgram } from "./shaderProgram.js";
 import { createShaderModule } from "./shaderModule.js";
 import type { UniformValue } from "./upstream.js";
+import { traversalConstants } from "./pathTracePass.js";
 import { BVH_WGSL } from "./wgsl/bvh.wgsl.js";
 import { COMMON_WGSL } from "./wgsl/common.wgsl.js";
 import { RANDOM_WGSL } from "./wgsl/random.wgsl.js";
@@ -16,7 +17,7 @@ const WORKGROUP = 8;
  * goes to the binding the path tracer accumulates into, which is the one read-write buffer the support code declares.
  */
 export function skyBakeSource(program: ShaderProgram, width: number, height: number): string {
-  return `${COMMON_WGSL}${RANDOM_WGSL}${BVH_WGSL}${SAMPLING_WGSL}${TEXTURE_WGSL}${SHADER_SUPPORT_WGSL}
+  return `${traversalConstants(false)}${COMMON_WGSL}${RANDOM_WGSL}${BVH_WGSL}${SAMPLING_WGSL}${TEXTURE_WGSL}${SHADER_SUPPORT_WGSL}
 ${program.wgsl}
 
 @compute @workgroup_size(${WORKGROUP}, ${WORKGROUP})
@@ -72,13 +73,14 @@ export async function bakeSkyOnDevice(
     compute: { module, entryPoint: "main" },
   });
 
-  const output = device.createBuffer({ size: texels * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const output = device.createBuffer({ label: "sky bake", size: texels * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
 
   const data = device.createBuffer({
+    label: "sky bake",
     size: Math.max(16, words.byteLength), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
-  const staging = device.createBuffer({ size: texels * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const staging = device.createBuffer({ label: "sky bake", size: texels * 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
   try {
     device.queue.writeBuffer(data, 0, words);

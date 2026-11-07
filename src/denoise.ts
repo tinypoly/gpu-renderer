@@ -503,9 +503,9 @@ export class DenoisePass {
     const size = Math.max(16, width * height * 16);
 
     this.buffers = Array.from({ length: 6 }, () =>
-      this.device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }));
+      this.device.createBuffer({ label: "svgf", size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }));
     this.buffers.push(
-      this.device.createBuffer({ size: Math.max(16, width * height * 4), usage: GPUBufferUsage.STORAGE }));
+      this.device.createBuffer({ label: "svgf", size: Math.max(16, width * height * 4), usage: GPUBufferUsage.STORAGE }));
     this.output = this.buffers[4];
     this.groups.clear();
     this.width = width;

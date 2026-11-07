@@ -21,6 +21,7 @@ It is the GPU sibling of [@tinypoly/cpu-renderer](https://github.com/tinypoly/cp
 - What a photograph adds, on by default: subsurface scattering, volumes of fog and smoke, aerial perspective, a lens's bloom, aperture rays, chromatic aberration and distortion, a camera's white balance and exposure triangle.
 - Adaptive sampling: pixels whose noise is gone stop taking paths, and the work they leave goes to the dark, glossy and out of focus areas that still need it.
 - Intel's Open Image Denoise on the device, by default, and a variance-guided denoiser (the spatial filter of SVGF, with diffuse and specular light filtered apart as NVIDIA's RELAX does): each signal is separated from its albedo, filtered by an edge-avoiding wavelet that stops at normals, depths and roughness and trusts each pixel as far as its own variance says, and multiplied back, so textures stay sharp, a sharp reflection stays sharp and flat areas keep their exact mean.
+- Large scenes held lightly: a mesh repeated across the scene is kept once and traced as instances, shading attributes are shared per vertex, and a texture read through one channel only (roughness, bump) takes one byte a texel. Packing hands the page its thread back as it goes, and a lost device is acquired again on the next frame.
 - Progressive output: the canvas refines sample by sample, and the render can be paused, resumed and cancelled.
 - No worker pool and no `SharedArrayBuffer`: the scene lives on the device, so the page needs no cross-origin isolation. A single worker builds the BVH of a large scene, so the page keeps responding while it is prepared.
 
@@ -296,6 +297,7 @@ haze.material.userData.cpuRenderer = { volume: { density: 0.05, color: "#ffffff"
 | `createDefaultBvhWorker()` | The BVH worker this package ships, started from `new URL("./bvhWorker.js", import.meta.url)`. |
 | `respondToBvhRequest(request)` | The worker's side of the exchange, for a worker of your own: returns the response and the buffers to transfer. |
 | `packGeometry`, `buildBvh`, `packLights`, `packTextures`, `sceneByteLength` | The scene packing, published because the sizes it produces are what a host checks against a device's limits before uploading. |
+| `setMemoryLogging(on)`, `deviceMemory()` | Off by default. When on, each step of a frame logs what the device holds by buffer label, the page's JavaScript heap where the browser tells, and the sizes the step produced: the snapshot, repeated geometry kept as instances, the textures and which channels of each are read, and the slowest meshes to pack. `deviceMemory()` answers the same at any time. |
 
 ## Bundlers
 

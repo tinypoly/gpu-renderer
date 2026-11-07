@@ -192,7 +192,7 @@ export class OidnPass {
     const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
 
     // Colour, albedo and normal for the network, then the result.
-    this.buffers = Array.from({ length: 4 }, () => this.device.createBuffer({ size, usage }));
+    this.buffers = Array.from({ length: 4 }, () => this.device.createBuffer({ label: "oidn", size, usage }));
     this.output = this.buffers[3];
     this.width = width;
     this.height = height;
@@ -273,6 +273,26 @@ export class OidnPass {
     this.device.queue.submit([finishing.finish()]);
 
     return true;
+  }
+
+  /**
+   * Lets go of everything sized by an image: the four buffers here and the network's own, its activations and its
+   * input and output passes, which together hold a few hundred megabytes for a large image. The network is loaded
+   * again by the next run. Call it only once no run is in flight.
+   */
+  async release() {
+    for (const buffer of this.buffers) buffer.destroy();
+
+    this.buffers = [];
+    this.output = null;
+    this.width = 0;
+    this.height = 0;
+
+    const byUrl = networks.get(this.device);
+
+    networks.delete(this.device);
+
+    for (const unet of byUrl?.values() ?? []) await unet.then(loaded => loaded.dispose(), () => undefined);
   }
 
   destroy() {

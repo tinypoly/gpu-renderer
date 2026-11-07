@@ -56,6 +56,7 @@ export class Accumulator {
 
   private create(): GPUBuffer {
     return this.device.createBuffer({
+      label: "accumulation",
       size: this.byteLength,
       // clearBuffer is a copy into the buffer: without COPY_DST it fails validation and clears nothing.
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,

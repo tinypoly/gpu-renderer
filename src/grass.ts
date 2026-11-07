@@ -470,7 +470,8 @@ export function packGrass(geometry: PackedGeometry, base: number): PackedGrass |
     if (length < 1e-12) continue;
 
     // The side the surface faces: its vertex normals where it has them, which survive a winding turned around.
-    const authored = [0, 1, 2].map(axis => n[at + axis] + n[at + 3 + axis] + n[at + 6 + axis]);
+    const [v0, v1, v2] = [0, 1, 2].map(corner => geometry.corners[triangle * 3 + corner] * 3);
+    const authored = [0, 1, 2].map(axis => n[v0 + axis] + n[v1 + axis] + n[v2 + axis]);
     const facing = Math.hypot(authored[0], authored[1], authored[2]) > 1e-6 ? authored[1] : geometric[1];
     const up = Math.abs(geometric[1]) / length;
 

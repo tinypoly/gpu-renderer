@@ -3,12 +3,15 @@ import { Accumulator } from "./accumulator.js";
 import { BvhBuilder, createDefaultBvhWorker, type BvhWorkerFactory } from "./bvhBuilder.js";
 import { cameraMatrices, type CameraMatrices } from "./camera.js";
 import { requestRenderDevice, type RenderDevice } from "./device.js";
+import { logMemory, memoryLogging, retainedBytes, sceneBreakdown, textureUsage, toMB } from "./memoryProbe.js";
 import { loadEnvironment, type PackedEnvironment } from "./environment.js";
 import { DispatchScheduler } from "./dispatchScheduler.js";
-import { packGeometry } from "./geometry.js";
+import { packGeometrySliced, type MeshPacked, type PackedGeometry } from "./geometry.js";
+import { instanceWords, mergeHierarchies, transformBox, trianglesBox } from "./instancing.js";
+import type { PackedBvh } from "./bvh.js";
 import { packLights } from "./lights.js";
 import { NO_PROGRAM } from "./materialLayout.js";
-import { NO_TEXTURE, planTextures, textureEntry, writeTextures } from "./texturePack.js";
+import { NO_TEXTURE, planTextures, singleChannelTextures, textureChannels, textureUpload } from "./texturePack.js";
 import { PathTracePass, type FrameUniforms } from "./pathTracePass.js";
 import { ImageResolvePass } from "./imageResolve.js";
 import { PresentPass } from "./presentPass.js";
@@ -45,7 +48,7 @@ import { DEFAULT_OIDN_WEIGHTS, OidnPass } from "./oidnPass.js";
 import { CaptureResolvePass, planarCaptures, type PlanarCaptures } from "./planarCapture.js";
 import { prepareSceneAssets, type SceneAssets } from "./sceneAssets.js";
 import { packVolumetricLights, VOLUMETRIC_WORDS } from "./volumetric.js";
-import { environmentPower, uploadScene, type SceneBuffers } from "./sceneUpload.js";
+import { environmentPower, uploadScene, type SceneBuffers, type UploadHierarchy } from "./sceneUpload.js";
 import { atmosphereExtinction, averageRadiance, brightestSun, gradientAverage } from "./atmosphere.js";
 import {
   DEFAULT_RENDER_ENVIRONMENT,
@@ -154,6 +157,21 @@ function linearColor(color: string | undefined, fallback: readonly number[]): nu
 const yieldToPage = () => new Promise<void>(resolve => setTimeout(resolve, 0));
 
 /**
+ * The same, through a message rather than a timer: a page in the background has its timers spaced out, up to a second
+ * each, which would stretch packing a large scene by minutes, while messages still arrive at once.
+ */
+const yieldForWork = typeof MessageChannel === "undefined" ? yieldToPage : () => new Promise<void>(resolve => {
+  const channel = new MessageChannel();
+
+  channel.port1.onmessage = () => {
+    channel.port1.close();
+    resolve();
+  };
+
+  channel.port2.postMessage(null);
+});
+
+/**
  * How often the canvas is drawn and the page gets the thread back while a frame traces: about once a display frame.
  * Waiting for an animation frame after every band would leave the device idle for most of each one.
  */
@@ -256,6 +274,46 @@ interface PackedTarget {
   /** Where the lawns' hierarchy and entries start in the texture buffer: see grass.ts. */
   grassShells: number;
   grassEntries: number;
+  /** Whether the scene keeps repeated geometry as instances, and where their transforms start in the texture buffer. */
+  instanced: boolean;
+  instanceData: number;
+}
+
+/** Words appended after the texels, kept as typed runs: a plain array of numbers costs twice as much while it grows. */
+class ExtraWords {
+  private readonly parts: Uint32Array[] = [];
+  private length = 0;
+
+  constructor(private readonly base: number) {}
+
+  /** Where the next words will land, absolutely. */
+  get next(): number {
+    return this.base + this.length;
+  }
+
+  /** Appends words and says where they landed. */
+  append(words: ArrayLike<number>): number {
+    const at = this.next;
+
+    if (words.length) {
+      this.parts.push(words instanceof Uint32Array ? words : Uint32Array.from(words));
+      this.length += words.length;
+    }
+
+    return at;
+  }
+
+  words(): Uint32Array {
+    const out = new Uint32Array(this.length);
+    let at = 0;
+
+    for (const part of this.parts) {
+      out.set(part, at);
+      at += part.length;
+    }
+
+    return out;
+  }
 }
 
 /**
@@ -583,6 +641,24 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.abort("The frame was cancelled.");
   }
 
+  /**
+   * Lets go of what the network denoiser holds from the last frame before a new one starts, so its buffers and the
+   * network's activations are not held on the device while the next scene is uploaded beside them. It waits for a run
+   * still in flight, which a replaced frame may have left.
+   */
+  private async releaseDenoiser() {
+    if (!this.oidnPass) return;
+
+    await this.oidnRun;
+
+    if (this.denoiseOutput === this.oidnPass.output) {
+      this.denoiseOutput = null;
+      this.denoised = false;
+    }
+
+    await this.oidnPass.release();
+  }
+
   /** Releases the device. A frame in flight rejects with an `AbortError`. */
   dispose() {
     if (this.disposed) return;
@@ -605,6 +681,41 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.accumulator = null;
     this.gpu = null;
     this.ready = null;
+    logMemory("disposed");
+  }
+
+  /**
+   * The device was lost: everything that lived on it is gone with it. The next frame asks for a new device and uploads
+   * the scene again; the scene's own assets (serialized meshes, translated shaders, the baked sky) are kept.
+   */
+  private dropDevice() {
+    // Whatever the old frame still awaits belongs to the dead device; a newer revision makes it give up quietly.
+    this.revision++;
+    this.resume();
+    this.context?.unconfigure();
+    this.context = null;
+    this.ready = null;
+    this.gpu = null;
+    this.accumulator = null;
+    this.pathTrace = null;
+    this.present = null;
+    this.buffers = null;
+    this.packed = null;
+    this.target = null;
+    this.packedView = "";
+    this.imageResolve = null;
+    this.resolve = null;
+    this.denoisePass = null;
+    this.oidnPass = null;
+    this.denoiseOutput = null;
+    this.oidnRun = Promise.resolve();
+    this.oidnBusy = false;
+    this.lensPass = null;
+    this.lensKey = "";
+    this.finished = null;
+    this.denoised = false;
+    this.sceneDirty = true;
+    this.scheduler.reset();
   }
 
   /** Takes the frame in flight, if any, so it can be settled after the events go out. */
@@ -634,11 +745,23 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   }
 
   private async device(): Promise<RenderDevice> {
-    this.ready ??= requestRenderDevice({
-      onLost: reason => {
-        if (!this.disposed) this.fail(new Error(`GPU renderer: the device was lost (${reason}).`));
-      },
-    });
+    if (!this.ready) {
+      const ready: Promise<RenderDevice> = requestRenderDevice({
+        onLost: reason => {
+          // A device lost after it was replaced, or by dispose(), has nothing left to stop.
+          if (this.disposed || this.ready !== ready) return;
+
+          logMemory("device lost", { reason });
+          this.dropDevice();
+          this.fail(new Error(`GPU renderer: the device was lost (${reason}).`));
+        },
+      });
+
+      this.ready = ready;
+      // A device that could not be acquired is asked for again by the next frame.
+      ready.catch(() => { if (this.ready === ready) this.ready = null; });
+    }
+
     this.gpu = await this.ready;
 
     return this.gpu;
@@ -647,22 +770,54 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private async accumulate(revision: number, camera: CameraState): Promise<RenderImage> {
     this.emit("progress", { completed: 0, total: 1, phase: "prepare" });
 
+    const startedAt = performance.now();
+
+    await this.releaseDenoiser();
+
     const gpu = await this.device();
     const scene = await this.scene;
     const environment = await this.environmentImage;
     const width = this.renderWidth, height = this.renderHeight;
 
     this.check(revision);
+
+    const fresh = !this.assets;
+
     this.assets ??= prepareSceneAssets(scene, { device: gpu.device, sky: this.skyBake });
 
     const assets = await this.assets;
 
     this.skyBake = assets.skyBake;
 
+    // Measuring the snapshot walks all of it, which only the memory log is worth.
+    if (fresh && memoryLogging()) {
+      const usage = textureUsage(scene.textures, scene.meshes.flatMap(mesh => mesh.materials));
+
+      const stored = textureChannels(assets.scene, assets.programs);
+
+      logMemory("texture usage", {
+        totalMB: usage.totalMB,
+        ifOnlyReadChannelsMB: usage.packedMB,
+        ...Object.fromEntries(usage.textures.map((row, k) => [`${k + 1}. ${row.id}`,
+          `${row.size} ${row.MB} MB, ${row.slots} [${row.channels}] -> ${row.packedMB} MB; `
+            + (stored.single.has(row.fullId) ? "stored one byte a texel" : `whole: ${stored.whole.get(row.fullId)}`)])),
+      });
+      logMemory("scene assets", {
+        snapshotMB: toMB(retainedBytes(scene)),
+        meshes: scene.meshes.length,
+        textures: scene.textures.length,
+        texturesMB: toMB(retainedBytes(scene.textures)),
+        environmentMB: environment ? toMB(retainedBytes(environment)) : 0,
+        ...sceneBreakdown(scene.meshes),
+        ms: Math.round(performance.now() - startedAt),
+      });
+    }
+
     this.check(revision);
     await this.prepare(gpu, revision, assets, camera, width, height, environment);
     this.output = { width, height, data: new Uint8ClampedArray(width * height * 4) };
     this.emit("start", { width, height });
+    logMemory("frame start", { width, height, prepareMs: Math.round(performance.now() - startedAt) });
 
     const target = Math.max(1, Math.round(this.current.samples));
     // Adaptive sampling: the frame has the work of `target` paths over the whole image to spend. Pixels that have
@@ -834,6 +989,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.check(revision);
     this.output = image;
     this.finished = { width, height };
+    logMemory("frame done", { width, height, samples: taken, ms: Math.round(performance.now() - startedAt) });
     this.emitIdle();
     this.emit("pixels", { x: 0, y: 0, ...image });
 
@@ -879,20 +1035,26 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     height: number,
     image: PackedEnvironment | null) {
     this.pathTrace ??= new PathTracePass(gpu.device);
+    const pathTrace = this.pathTrace;
     const materials = assets.scene.meshes.flatMap(mesh => mesh.materials);
 
-    this.pathTrace.setPrograms(assets.programs,
-      this.current.subsurface.enabled && materials.some(material =>
-        (material.type === "MeshStandardMaterial" || material.type === "MeshPhysicalMaterial")
-        && subsurfaceOf(material) !== null),
-      // Even turned off, a volume's boundary has to stay invisible, which takes the same code.
-      materials.some(material => volumeOf(material) !== null),
-      this.current.bevel.enabled && materials.some(material => bevelOf(material) > 0),
-      // Portals need windows: thin glass, which is what a physical material with transmission and no thickness is.
-      this.current.globalIllumination.portals !== false && materials.some(material =>
-        material.type === "MeshPhysicalMaterial" && Number(material.values.transmission) > 0
-        && !(Number(material.values.thickness) > 0)),
-      materials.some(material => grassOf(material) !== null));
+    // The kernel is compiled once the scene is packed: whether it enters instances depends on what repeats.
+    const compile = async(instances: boolean) => {
+      await pathTrace.setPrograms(assets.programs,
+        this.current.subsurface.enabled && materials.some(material =>
+          (material.type === "MeshStandardMaterial" || material.type === "MeshPhysicalMaterial")
+          && subsurfaceOf(material) !== null),
+        // Even turned off, a volume's boundary has to stay invisible, which takes the same code.
+        materials.some(material => volumeOf(material) !== null),
+        this.current.bevel.enabled && materials.some(material => bevelOf(material) > 0),
+        // Portals need windows: thin glass, which is what a physical material with transmission and no thickness is.
+        this.current.globalIllumination.portals !== false && materials.some(material =>
+          material.type === "MeshPhysicalMaterial" && Number(material.values.transmission) > 0
+          && !(Number(material.values.thickness) > 0)),
+        materials.some(material => grassOf(material) !== null),
+        instances);
+      this.check(revision);
+    };
 
     // A procedural sky stands in for the renderer's own environment, as it does in the CPU renderer.
     const environment = assets.sky?.environment ?? image;
@@ -912,8 +1074,11 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       this.target = null;
       this.packed = null;
 
+      // The kernel starts compiling as soon as packing knows whether the scene repeats geometry, and compiles while
+      // the hierarchy is built and uploaded: for a large kernel that takes seconds.
       const packed = await this.packScene(
-        gpu, revision, planar?.scene ?? assets.scene, assets, matrices, width, height, environment);
+        gpu, revision, planar?.scene ?? assets.scene, assets, matrices, width, height, environment, true,
+        instanced => { compile(instanced).catch(() => undefined); });
 
       this.packed = packed.packed;
       this.buffers = packed.buffers;
@@ -921,11 +1086,17 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       this.sceneDirty = false;
       this.planar = !!planar;
 
+      // The captures trace with the same kernel, so they are taken once it is compiled for this scene.
+      await compile(packed.instanced);
+
       if (planar) await this.renderCaptures(gpu, revision, planar, assets, environment);
 
       // Only once the captures are in: a frame replaced while they were taken has to take them again.
       this.packedView = view;
     }
+
+    // The settings may have changed what the kernel compiles in since the scene was packed.
+    await compile(this.target?.instanced ?? false);
 
     const resized = !this.accumulator || this.accumulator.resize(width, height);
 
@@ -947,6 +1118,36 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     gpu.device.queue.submit([encoder.finish()]);
   }
 
+  /** The memory log's account of a packed scene: what repeats, what it takes, and which meshes took longest. */
+  private logPacking(geometry: PackedGeometry, meshTimes: readonly MeshPacked[], sizes: Record<string, number>) {
+    const repeated = geometry.instancing;
+
+    const slowest = [...meshTimes].sort((a, b) => b.ms - a.ms).slice(0, 5)
+      .map(info => ({ ...info, ms: Math.round(info.ms) }));
+
+    const byPath: Record<string, { meshes: number; triangles: number; ms: number }> = {};
+
+    for (const info of meshTimes) {
+      byPath[info.path] ??= { meshes: 0, triangles: 0, ms: 0 };
+      byPath[info.path].meshes++;
+      byPath[info.path].triangles += info.triangles;
+      byPath[info.path].ms += Math.round(info.ms);
+    }
+
+    logMemory("scene packed", {
+      sceneTriangles: geometry.triangleCount,
+      instances: repeated?.instances.length ?? 0,
+      prototypes: repeated?.prototypes.length ?? 0,
+      prototypeTriangles: repeated?.triangleCount ?? 0,
+      instancedTriangles: repeated?.materials.length ?? 0,
+      vertices: geometry.vertexCount,
+      geometryMB: toMB(retainedBytes(geometry)),
+      ...sizes,
+      byPath,
+      slowest,
+    });
+  }
+
   /** Packs and uploads one scene: its textures, geometry, hierarchy, lights and every extra word they point at. */
   private async packScene(
     gpu: RenderDevice,
@@ -956,69 +1157,121 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     matrices: CameraMatrices,
     width: number,
     height: number,
-    environment: PackedEnvironment | null): Promise<PackedTarget> {
+    environment: PackedEnvironment | null,
+    instancing = true,
+    onPacked?: (instanced: boolean) => void): Promise<PackedTarget> {
     // The textures are planned first: a material refers to one by the index it lands on in that table, and to its
     // extra words by where they land after the texels. The environment rides along in the same buffer.
-    const plan = planTextures(scene, environment ? [environment.texture] : []);
-    const extra: number[] = [];
+    const packBegan = performance.now();
 
-    const append = (words: ArrayLike<number>) => {
-      const at = plan.extraOffset + extra.length;
+    const plan = planTextures(scene, environment ? [environment.texture] : [],
+      singleChannelTextures(scene, assets.programs));
 
-      for (let i = 0; i < words.length; i++) extra.push(words[i]);
-
-      return at;
-    };
+    const extra = new ExtraWords(plan.extraOffset);
 
     const cdf = environment
-      ? append(new Uint32Array(environment.distribution.buffer, environment.distribution.byteOffset,
+      ? extra.append(new Uint32Array(environment.distribution.buffer, environment.distribution.byteOffset,
         environment.distribution.length))
       : plan.extraOffset;
 
     const textureData = new Map(scene.textures.map(texture => [texture.id, texture]));
+    const meshTimes: MeshPacked[] = [];
 
-    const geometry = packGeometry(scene, {
+    // Sliced, so a large scene does not hold the page while it packs.
+    const geometry = await packGeometrySliced(scene, {
       textures: plan.indexOf,
       textureData,
       camera: matrices,
       width,
       height,
       programs: assets.programs,
-      extraBase: plan.extraOffset + extra.length,
+      extraBase: extra.next,
       fog: scene.fog,
-    });
+      instancing,
+      onMesh: memoryLogging() ? info => meshTimes.push(info) : undefined,
+    }, yieldForWork);
 
-    append(geometry.extraWords);
+    this.check(revision);
+    onPacked?.(geometry.instancing !== null);
+
+    const geometryMs = Math.round(performance.now() - packBegan);
+
+    extra.append(geometry.extraWords);
 
     const lights = packLights(geometry, scene.lights, { power: environmentPower(environment) },
-      { textures: plan.indexOf, extraBase: plan.extraOffset + extra.length });
+      { textures: plan.indexOf, extraBase: extra.next });
 
-    append(lights.extraWords);
+    extra.append(lights.extraWords);
 
     const foreground = assets.programs.foreground;
 
     const skyData = foreground && assets.sky
-      ? append(foreground.packUniforms({ ...assets.sky.uniforms, uCpuSky: { texture: "procedural-sky" } }, plan.indexOf))
+      ? extra.append(foreground.packUniforms({ ...assets.sky.uniforms, uCpuSky: { texture: "procedural-sky" } },
+        plan.indexOf))
       : 0;
 
     const volumetric = packVolumetricLights(scene.lights);
-    const volumetricData = append(new Uint32Array(volumetric.buffer));
-    const grass = packGrass(geometry, plan.extraOffset + extra.length);
+    const volumetricData = extra.append(new Uint32Array(volumetric.buffer));
+    const grass = packGrass(geometry, extra.next);
 
-    if (grass) append(grass.words);
+    if (grass) extra.append(grass.words);
 
-    const textures = writeTextures(plan, new Uint32Array(extra));
-    const bvh = await this.bvh.build(geometry.positions, geometry.triangleCount);
+    const bvhStarted = performance.now();
+    const sceneBvh = await this.bvh.build(geometry.positions, geometry.triangleCount);
+    let hierarchy: UploadHierarchy = sceneBvh;
+    let instanceData = 0;
+    const repeated = geometry.instancing;
+
+    if (repeated) {
+      // One hierarchy per prototype, in its own space, joined under the tree over the instances.
+      const prototypeBvhs: PackedBvh[] = [];
+
+      for (const prototype of repeated.prototypes) {
+        prototypeBvhs.push(await this.bvh.build(
+          repeated.positions.subarray(prototype.first * 9, (prototype.first + prototype.count) * 9), prototype.count));
+        this.check(revision);
+      }
+
+      const boxes = repeated.prototypes.map(prototype =>
+        trianglesBox(repeated.positions, prototype.first, prototype.count));
+
+      const merged = mergeHierarchies(sceneBvh, geometry.triangleCount, prototypeBvhs,
+        repeated.prototypes.map(prototype => prototype.count),
+        repeated.instances.map(instance =>
+          transformBox(instance.matrix, boxes[instance.prototype].low, boxes[instance.prototype].high)));
+
+      instanceData = extra.append(instanceWords(repeated.instances, merged.roots, merged.storageFirst));
+      hierarchy = merged;
+    }
+
+    const bvhMs = Math.round(performance.now() - bvhStarted);
+    const extraWords = extra.words();
+    const textures = textureUpload(plan, extraWords);
+
+    if (memoryLogging()) this.logPacking(geometry, meshTimes, {
+      extraWords: extraWords.length,
+      texturesMB: toMB(textures.byteLength),
+      grassMB: grass ? toMB(grass.words.byteLength) : 0,
+      bvhNodesMB: toMB(hierarchy.nodes.byteLength),
+      geometryMs,
+      bvhMs,
+    });
+
+    const uploadStarted = performance.now();
 
     // Nothing is on the device yet, so a frame replaced while the hierarchy was built has nothing to give back.
     this.check(revision);
 
-    const buffers = uploadScene(gpu.device, geometry, bvh, textures, lights, environment, cdf);
+    const buffers = uploadScene(gpu.device, geometry, hierarchy, textures, lights, environment, cdf);
 
-    const textureOffsets = new Map([...textures.indexOf]
-      .map(([id, index]) => [id, textures.data[textureEntry(index) + 2]]));
+    const textureOffsets = new Map([...textures.indexOf].map(([id, index]) => [id, textures.offsets[index]]));
 
     const packed: PackedSummary = { cameraDependent: geometry.cameraDependent, textureOffsets };
+
+    logMemory("scene uploaded", {
+      ms: Math.round(performance.now() - uploadStarted),
+      upload: Object.fromEntries(Object.entries(buffers.bytes).map(([kind, bytes]) => [kind, toMB(bytes)])),
+    });
 
     if (buffers.bytes.largest > gpu.maxStorageBufferBindingSize) {
       buffers.destroy();
@@ -1034,6 +1287,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       volumes: volumeTriangles(geometry),
       grassShells: grass?.shells ?? GRASS_NONE,
       grassEntries: grass?.entries ?? 0,
+      instanced: repeated !== null,
+      instanceData,
     };
   }
 
@@ -1058,8 +1313,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
         let target = scenes.get(capture.scene);
 
         if (!target) {
+          // Instances only where the kernel was compiled to enter them, which the main scene decided.
           target = await this.packScene(gpu, revision, capture.scene === "scene" ? planar.captureScene : empty, assets,
-            cameraMatrices(capture.camera, width, height), width, height, environment);
+            cameraMatrices(capture.camera, width, height), width, height, environment, main.instanced);
           scenes.set(capture.scene, target);
         }
 
@@ -1339,6 +1595,11 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       colorOffset: buffers?.colorOffset ?? 0,
       hasColors: buffers?.hasColors ?? false,
       varyingOffset: buffers?.varyingOffset ?? 0,
+      sceneTriangles: buffers?.sceneTriangles ?? 0,
+      instanceOffset: buffers?.instanceOffset ?? 0,
+      cornerOffset: buffers?.cornerOffset ?? 0,
+      normalOffset: buffers?.normalOffset ?? 0,
+      instanceData: target?.instanceData ?? 0,
       environmentTexture: surrounding?.texture ?? NO_TEXTURE,
       environmentCdf: surrounding?.cdf ?? 0,
       environmentCdfSize: [surrounding?.width ?? 0, surrounding?.height ?? 0],

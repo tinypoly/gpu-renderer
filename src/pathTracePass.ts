@@ -26,13 +26,22 @@ export type FrameUniforms = Record<keyof typeof FRAME_LAYOUT.offsets & string, n
  */
 export function pathTraceSource(
   programs: ShaderPrograms | null = null, subsurface = true, volumes = true, bevel = true,
-  portals = true, grass = true): string {
+  portals = true, grass = true, instances = true): string {
   // The random walk inside materials and the media inside volumes are compiled in only for a scene that has them: the
   // kernel is bound by its size, and either would cost every other scene a few percent for code that never runs.
   return `const SUBSURFACE_WALK: bool = ${subsurface};\nconst VOLUMES: bool = ${volumes};\nconst BEVEL: bool = ${bevel};\n`
-    + `const PORTALS: bool = ${portals};\nconst GRASS: bool = ${grass};\n` + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL
+    + `const PORTALS: bool = ${portals};\nconst GRASS: bool = ${grass};\n` + traversalConstants(instances) + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL
     + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL + programsWgsl(programs) + ENVIRONMENT_WGSL + SURFACE_WGSL
     + (grass ? GRASS_WGSL : GRASS_STUB_WGSL) + BSDF_WGSL + LIGHTS_WGSL + PATH_TRACE_WGSL;
+}
+
+/**
+ * Whether the traversal can enter instances, and the stack that takes: an instance stacks its own hierarchy on top of
+ * the scene's and the tree over the instances, so the stack doubles. A scene with no repeated geometry keeps the
+ * smaller one, which is what the kernel's registers are measured against.
+ */
+export function traversalConstants(instances: boolean): string {
+  return `const INSTANCES: bool = ${instances};\nconst BVH_STACK: u32 = ${instances ? 64 : 32}u;\n`;
 }
 
 const FRAME_BYTES = FRAME_WORDS * 4;
@@ -40,14 +49,15 @@ const FRAME_BYTES = FRAME_WORDS * 4;
 const WORKGROUP = 8;
 
 export class PathTracePass {
-  private pipeline: GPUComputePipeline;
+  private pipeline: GPUComputePipeline | null = null;
+  /** The kernel being compiled for `programKey`, which every caller asking for the same set waits on. */
+  private building: Promise<GPUComputePipeline> | null = null;
   private readonly uniforms: GPUBuffer;
   private readonly values = new ArrayBuffer(FRAME_BYTES);
   private bindGroup: GPUBindGroup | null = null;
-  private programKey = "|false|false|false|false|false";
+  private programKey: string | null = null;
 
   constructor(private readonly device: GPUDevice) {
-    this.pipeline = this.build(null, false, false, false, false, false);
     this.uniforms = device.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
 
@@ -55,27 +65,41 @@ export class PathTracePass {
    * Recompiles the kernel when the scene's shaders changed, or whether it has a material that scatters light inside;
    * the same set keeps the pipeline it has.
    */
-  setPrograms(programs: ShaderPrograms | null, subsurface = false, volumes = false, bevel = false,
-    portals = false, grass = false) {
-    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}|${portals}|${grass}`;
+  async setPrograms(programs: ShaderPrograms | null, subsurface = false, volumes = false, bevel = false,
+    portals = false, grass = false, instances = false): Promise<void> {
+    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}|${portals}|${grass}|${instances}`;
 
-    if (key === this.programKey) return;
+    if (key !== this.programKey) {
+      this.programKey = key;
+      this.pipeline = null;
+      this.bindGroup = null;
+      this.building = this.build(programs, subsurface, volumes, bevel, portals, grass, instances);
+    }
 
-    this.programKey = key;
-    this.pipeline = this.build(programs, subsurface, volumes, bevel, portals, grass);
-    this.bindGroup = null;
+    const building = this.building as Promise<GPUComputePipeline>;
+    const pipeline = await building;
+
+    // A newer set may have started compiling meanwhile; this one is then already stale.
+    if (this.building === building) this.pipeline = pipeline;
   }
 
+  /**
+   * The kernel is large, and on Windows the browser compiles it through the D3D shader compiler, which can take many
+   * seconds. Compiled synchronously that blocks the GPU process long enough for its watchdog to kill it, and the device
+   * is lost before the first sample; the async path compiles off that thread.
+   */
   private build(programs: ShaderPrograms | null, subsurface: boolean, volumes: boolean,
-    bevel: boolean, portals: boolean, grass: boolean): GPUComputePipeline {
+    bevel: boolean, portals: boolean, grass: boolean, instances: boolean): Promise<GPUComputePipeline> {
     const module = createShaderModule(this.device, "path trace",
-      pathTraceSource(programs, subsurface, volumes, bevel, portals, grass));
+      pathTraceSource(programs, subsurface, volumes, bevel, portals, grass, instances));
 
-    return this.device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    return this.device.createComputePipelineAsync({ label: "path trace", layout: "auto", compute: { module, entryPoint: "main" } });
   }
 
   /** Rebinds after the scene or the accumulation buffer was replaced. */
   setBindings(scene: SceneBuffers, accumulation: GPUBuffer) {
+    if (!this.pipeline) throw new Error("GPU renderer: the path tracing kernel is not compiled yet.");
+
     this.bindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
@@ -93,7 +117,7 @@ export class PathTracePass {
   }
 
   encode(encoder: GPUCommandEncoder, frame: FrameUniforms) {
-    if (!this.bindGroup) throw new Error("GPU renderer: the path tracing pass has no scene bound.");
+    if (!this.bindGroup || !this.pipeline) throw new Error("GPU renderer: the path tracing pass has no scene bound.");
 
     new Uint32Array(this.values).fill(0);
     writeStruct(FRAME_LAYOUT, this.values, 0, frame);

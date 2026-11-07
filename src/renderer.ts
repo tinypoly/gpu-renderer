@@ -35,6 +35,7 @@ import {
   type VolumeMaterial,
 } from "./subsurface.js";
 import { GRASS_NONE, grassField, grassOf, packGrass, type GrassMaterial } from "./grass.js";
+import { waterField, waterOf, type WaterMaterial } from "./water.js";
 import { containingVolume, NO_MATERIAL, volumeTriangles, type VolumeTriangles } from "./volumeContainment.js";
 import {
   CONVERGED_ERROR,
@@ -1052,7 +1053,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
           material.type === "MeshPhysicalMaterial" && Number(material.values.transmission) > 0
           && !(Number(material.values.thickness) > 0)),
         materials.some(material => grassOf(material) !== null),
-        instances);
+        instances,
+        materials.some(material => waterOf(material) !== null));
       this.check(revision);
     };
 
@@ -1662,7 +1664,7 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
   const renamed = new Map<Material, string>();
   // The snapshot keeps a material's name but not its media, so the name carries a mark to them.
   const named = new Map<Material, string>();
-  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown }[] = [];
+  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown }[] = [];
 
   scene.traverse(object => {
     const value = (object as Object3D & { material?: Material | Material[] }).material;
@@ -1676,14 +1678,17 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       }
 
       const data = material.userData?.cpuRenderer as
-        { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown } | undefined;
+        { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown } | undefined;
 
       if (!named.has(material)
         && (subsurfaceMedium(data?.subsurface) || volumeMedium(data?.volume) || bevelRadius(data?.bevel) > 0
-          || grassField(data?.grass))) {
+          || grassField(data?.grass) || waterField(data?.water))) {
         named.set(material, material.name);
         material.name = `${material.name}${MEDIA_MARK}${media.length}`;
-        media.push({ subsurface: data?.subsurface, volume: data?.volume, bevel: data?.bevel, grass: data?.grass });
+        media.push({
+          subsurface: data?.subsurface, volume: data?.volume, bevel: data?.bevel,
+          grass: data?.grass, water: data?.water,
+        });
       }
     }
   });
@@ -1700,7 +1705,9 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
 
   // Materials are shared between the meshes that use them, so each one is unmarked once and seen marked no more.
   for (const mesh of snapshot.meshes) {
-    for (const material of mesh.materials as (SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial)[]) {
+    type Carrier = SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial & WaterMaterial;
+
+    for (const material of mesh.materials as Carrier[]) {
       const at = material.name.lastIndexOf(MEDIA_MARK);
 
       if (at < 0) continue;
@@ -1712,6 +1719,7 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       if (medium.volume !== undefined) material.volume = medium.volume as VolumeMaterial["volume"];
       if (medium.bevel !== undefined) material.bevel = medium.bevel as BevelMaterial["bevel"];
       if (medium.grass !== undefined) material.grass = medium.grass as GrassMaterial["grass"];
+      if (medium.water !== undefined) material.water = medium.water as WaterMaterial["water"];
     }
   }
 

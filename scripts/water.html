@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>@tinypoly/gpu-renderer: water</title>
+    <style>
+      body { font: 13px/1.6 ui-monospace, monospace; margin: 2rem; background: #16181c; color: #d8dbe0; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <pre id="out">Tracing…</pre>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/": "/node_modules/three/",
+          "@tinypoly/cpu-renderer": "/node_modules/@tinypoly/cpu-renderer/dist/index.js",
+          "@tinypoly/cpu-renderer/engine": "/node_modules/@tinypoly/cpu-renderer/dist/engine.js",
+          "naga-wasm": "/node_modules/naga-wasm/dist/index.js",
+          "oidn-webgpu/dist/oidn.js": "/node_modules/oidn-webgpu/dist/oidn.js"
+        }
+      }
+    </script>
+    <script>
+      const post = (url, body) => fetch(url, { method: "POST", body });
+      addEventListener("error", event => post("/report", `ERROR ${event.message} @${event.lineno}`));
+      addEventListener("unhandledrejection", event =>
+        post("/report", `REJECT ${(event.reason && event.reason.stack) || event.reason}`));
+    </script>
+    <script type="module">
+      import * as THREE from "three";
+      import { GpuRenderer } from "/dist/index.js";
+
+      /**
+       * Water under the sun, against paper: a unit albedo floor a metre under still water receives the sun less what
+       * the surface reflects, and the camera above sees it through the same surface again. Rippled water only moves
+       * that light around, so the floor's average stays what still water gives it.
+       */
+      const SIZE = 64;
+      const lines = [];
+      const toLinear = c => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+      const IOR = 1.333;
+      const E = Math.PI / 4;
+
+      /** The share of light crossing from air into water at this cosine, both polarisations, as the kernel's. */
+      const enters = cosine => {
+        const eta = 1 / IOR;
+        const sin2 = eta * eta * (1 - cosine * cosine);
+        const t = Math.sqrt(1 - sin2);
+        const s = (eta * cosine - t) / (eta * cosine + t);
+        const p = (cosine - eta * t) / (cosine + eta * t);
+        return 1 - 0.5 * (s * s + p * p);
+      };
+
+      function scene(sun, waves, glowing = false) {
+        const scene = new THREE.Scene();
+        // A floor that only shows its own colour measures what the camera's way through the surface keeps.
+        const surface = glowing ? new THREE.MeshBasicMaterial() : new THREE.MeshLambertMaterial();
+        const floor = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), surface);
+        floor.material.color.setRGB(1, 1, 1, THREE.LinearSRGBColorSpace);
+        floor.rotation.x = -Math.PI / 2;
+        scene.add(floor);
+        const water = new THREE.MeshPhysicalMaterial({ transmission: 1, ior: IOR, thickness: 1, roughness: 0, metalness: 0 });
+        water.color.setRGB(1, 1, 1, THREE.LinearSRGBColorSpace);
+        water.userData.cpuRenderer = { water: waves };
+        // The water reaches past the floor, as a pool's does past its tiles.
+        const volume = new THREE.Mesh(new THREE.BoxGeometry(60, 1.05, 60), water);
+        volume.position.y = 0.475;
+        scene.add(volume);
+        const light = new THREE.DirectionalLight(0xffffff, E);
+        // Without its shadow the sun would cross the water as if it were not there.
+        light.castShadow = true;
+        light.position.copy(sun).multiplyScalar(20);
+        scene.add(light, light.target);
+        scene.updateMatrixWorld(true);
+        return scene;
+      }
+
+      const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+      camera.up.set(0, 0, -1);
+      camera.position.set(0, 3, 0);
+      camera.lookAt(0, 0, 0);
+      camera.updateMatrixWorld(true);
+
+      /** The mean of the middle of the image, or of all of it. */
+      async function measure(scene, whole = false, samples = 512) {
+        const renderer = new GpuRenderer({
+          width: SIZE, height: SIZE, scene, camera,
+          settings: { samples, toneMapping: "linear", exposure: 1, bloom: { enabled: false }, glare: { enabled: false },
+            lens: { chromaticAberration: 0 }, atmosphere: { enabled: false },
+            globalIllumination: { bounces: 0, denoise: false, clamp: 0 } },
+          environment: { kind: "gradient", topColor: "#000000", bottomColor: "#000000" },
+        });
+        const { data } = await renderer.render();
+        renderer.dispose();
+        const [low, high] = whole ? [0, SIZE] : [SIZE / 2 - 4, SIZE / 2 + 4];
+        let sum = 0, n = 0;
+        for (let y = low; y < high; y++) for (let x = low; x < high; x++) {
+          sum += toLinear(data[(y * SIZE + x) * 4] / 255);
+          n++;
+        }
+        return sum / n;
+      }
+
+      const check = (name, got, want, tolerance = 2) => {
+        const error = Math.abs(got - want) / want * 100;
+        lines.push(`${name.padEnd(52)} got ${got.toFixed(4)}  want ${want.toFixed(4)}  ${error.toFixed(1)}%`
+          + (error > tolerance ? "   <-- OFF" : ""));
+        document.getElementById("out").textContent = lines.join("\n");
+      };
+
+      try {
+        const overhead = new THREE.Vector3(0, 1, 0);
+        const still = { waveHeight: 0 };
+        const seen = await measure(scene(overhead, still, true));
+        lines.push(`the camera's way through the surface keeps ${seen.toFixed(4)}`);
+        const top = await measure(scene(overhead, still));
+        check("still water, sun overhead: the share the surface lets in", top, 0.25 * enters(1) * seen);
+
+        const slant = new THREE.Vector3(1, 1, 0).normalize();
+        check("still water, sun at 45 degrees against overhead",
+          (await measure(scene(slant, still))) / top, slant.y * enters(slant.y) / enters(1), 1);
+
+        const flat = await measure(scene(overhead, still), true, 256);
+        const rippled = await measure(scene(overhead, { waveHeight: 0.004, waveLength: 1.2 }), true, 1024);
+        check("rippled water keeps the floor's average", rippled, flat, 8);
+        await post("/report", lines.join("\n"));
+      } catch (error) {
+        await post("/report", `EXC ${error.stack}`);
+      }
+    </script>
+  </body>
+</html>

@@ -41,6 +41,12 @@ it("validates the kernel with grass and nothing else", () => {
   expect(() => check(pathTraceSource(null, false, false, false, false, true))).not.toThrow();
 });
 
+it("validates the kernel with water, alone and with everything else", () => {
+  expect(() => check(pathTraceSource(null, false, false, false, false, false, false, true))).not.toThrow();
+  expect(() => check(pathTraceSource(null, true, true, true, true, true, true, true))).not.toThrow();
+  expect(() => check(pathTraceSource(null, true, true, true, true, true, true, false))).not.toThrow();
+});
+
 it("validates the presentation pass", () => {
   expect(() => check(PRESENT_WGSL)).not.toThrow();
 });

@@ -7,6 +7,7 @@ import { BSDF_WGSL } from "./wgsl/bsdf.wgsl.js";
 import { BVH_WGSL } from "./wgsl/bvh.wgsl.js";
 import { COMMON_WGSL } from "./wgsl/common.wgsl.js";
 import { GRASS_STUB_WGSL, GRASS_WGSL } from "./wgsl/grass.wgsl.js";
+import { WATER_CAUSTICS_STUB_WGSL, WATER_CAUSTICS_WGSL, WATER_SURFACE_WGSL } from "./wgsl/water.wgsl.js";
 import { ENVIRONMENT_WGSL } from "./wgsl/environment.wgsl.js";
 import { LIGHTS_WGSL } from "./wgsl/lights.wgsl.js";
 import { PATH_TRACE_WGSL } from "./wgsl/pathTrace.wgsl.js";
@@ -26,13 +27,16 @@ export type FrameUniforms = Record<keyof typeof FRAME_LAYOUT.offsets & string, n
  */
 export function pathTraceSource(
   programs: ShaderPrograms | null = null, subsurface = true, volumes = true, bevel = true,
-  portals = true, grass = true, instances = true): string {
+  portals = true, grass = true, instances = true, water = true): string {
   // The random walk inside materials and the media inside volumes are compiled in only for a scene that has them: the
   // kernel is bound by its size, and either would cost every other scene a few percent for code that never runs.
   return `const SUBSURFACE_WALK: bool = ${subsurface};\nconst VOLUMES: bool = ${volumes};\nconst BEVEL: bool = ${bevel};\n`
-    + `const PORTALS: bool = ${portals};\nconst GRASS: bool = ${grass};\n` + traversalConstants(instances) + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL
-    + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL + programsWgsl(programs) + ENVIRONMENT_WGSL + SURFACE_WGSL
-    + (grass ? GRASS_WGSL : GRASS_STUB_WGSL) + BSDF_WGSL + LIGHTS_WGSL + PATH_TRACE_WGSL;
+    + `const PORTALS: bool = ${portals};\nconst GRASS: bool = ${grass};\nconst WATER: bool = ${water};\n` + traversalConstants(instances)
+    + COMMON_WGSL + RANDOM_WGSL + BVH_WGSL
+    + SAMPLING_WGSL + TEXTURE_WGSL + SHADER_SUPPORT_WGSL + programsWgsl(programs) + ENVIRONMENT_WGSL
+    + WATER_SURFACE_WGSL + SURFACE_WGSL + (grass ? GRASS_WGSL : GRASS_STUB_WGSL) + BSDF_WGSL + LIGHTS_WGSL
+    + (water ? WATER_CAUSTICS_WGSL : WATER_CAUSTICS_STUB_WGSL)
+    + PATH_TRACE_WGSL;
 }
 
 /**
@@ -66,14 +70,14 @@ export class PathTracePass {
    * the same set keeps the pipeline it has.
    */
   async setPrograms(programs: ShaderPrograms | null, subsurface = false, volumes = false, bevel = false,
-    portals = false, grass = false, instances = false): Promise<void> {
-    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}|${portals}|${grass}|${instances}`;
+    portals = false, grass = false, instances = false, water = false): Promise<void> {
+    const key = `${programs?.key ?? ""}|${subsurface}|${volumes}|${bevel}|${portals}|${grass}|${instances}|${water}`;
 
     if (key !== this.programKey) {
       this.programKey = key;
       this.pipeline = null;
       this.bindGroup = null;
-      this.building = this.build(programs, subsurface, volumes, bevel, portals, grass, instances);
+      this.building = this.build(programs, subsurface, volumes, bevel, portals, grass, instances, water);
     }
 
     const building = this.building as Promise<GPUComputePipeline>;
@@ -89,9 +93,9 @@ export class PathTracePass {
    * is lost before the first sample; the async path compiles off that thread.
    */
   private build(programs: ShaderPrograms | null, subsurface: boolean, volumes: boolean,
-    bevel: boolean, portals: boolean, grass: boolean, instances: boolean): Promise<GPUComputePipeline> {
+    bevel: boolean, portals: boolean, grass: boolean, instances: boolean, water: boolean): Promise<GPUComputePipeline> {
     const module = createShaderModule(this.device, "path trace",
-      pathTraceSource(programs, subsurface, volumes, bevel, portals, grass, instances));
+      pathTraceSource(programs, subsurface, volumes, bevel, portals, grass, instances, water));
 
     return this.device.createComputePipelineAsync({ label: "path trace", layout: "auto", compute: { module, entryPoint: "main" } });
   }

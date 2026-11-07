@@ -1,6 +1,6 @@
 {
   "name": "@tinypoly/gpu-renderer",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "WebGPU path tracer for Three.js scenes: BVH traversal, progressive accumulation and tone mapping in WGSL compute shaders.",
   "keywords": [
     "three",

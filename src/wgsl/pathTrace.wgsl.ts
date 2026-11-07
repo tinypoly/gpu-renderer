@@ -140,6 +140,32 @@ fn treeNormal(surface: Surface) -> vec3<f32> {
   return surface.normal;
 }
 
+/**
+ * The sun's light at a point under water, which no straight shadow ray reaches: through the rippled surface, by
+ * manifold next event estimation (see water.wgsl.ts). Only the lobes at the point weigh it; no bounce could find it.
+ */
+fn causticLight(
+  surface: Surface,
+  position: vec3<f32>,
+  view: vec3<f32>,
+  chosen: LightSample,
+  rng: ptr<function, PathSampler>,
+  diffusePart: ptr<function, vec3<f32>>,
+  water: u32) -> vec3<f32> {
+  let caustic = waterCaustic(water, position, surface.facing, chosen, rng);
+
+  if (!caustic.found) {
+    return vec3<f32>(0.0);
+  }
+
+  let reflected = evaluateBsdf(surface, view, caustic.direction);
+  let light = chosen.value * caustic.share;
+
+  *diffusePart = min(diffuseValue(surface, view, caustic.direction), reflected.value) * light;
+
+  return reflected.value * light;
+}
+
 /** One shadow ray from the surface towards a light, weighted against the chance the bounce would have found it too. */
 fn directLight(
   surface: Surface,
@@ -149,7 +175,8 @@ fn directLight(
   u: vec2<f32>,
   rng: ptr<function, PathSampler>,
   diffusePart: ptr<function, vec3<f32>>,
-  medium: f32) -> vec3<f32> {
+  medium: f32,
+  water: u32) -> vec3<f32> {
   *diffusePart = vec3<f32>(0.0);
 
   let chosen = sampleLight(position, treeNormal(surface), pick, u);
@@ -180,6 +207,11 @@ fn directLight(
   }
 
   let through = lightTransmittance(shadowFrom, chosen, rng, skip, medium);
+
+  // Under water the sun comes through the waves, along a way no straight shadow ray takes.
+  if (WATER && water != NO_MATERIAL && chosen.kind == LIGHT_DIRECTIONAL && chosen.occlude && all(through <= vec3<f32>(0.0))) {
+    return causticLight(surface, position, view, chosen, rng, diffusePart, water);
+  }
 
   if (all(through <= vec3<f32>(0.0))) {
     return vec3<f32>(0.0);
@@ -389,6 +421,8 @@ fn traceRadiance(
   var bsdfPdf = 0.0;
   // What the volume the ray is travelling through absorbs per unit of distance; zero outside any.
   var absorption = vec3<f32>(0.0);
+  // The water the ray is in, whose surface the sun's caustics come through, or none.
+  var insideWater = NO_MATERIAL;
   // Still on the camera's own line of sight, which transmission keeps a path on.
   var primary = true;
   // Still the camera ray itself, in a straight line: only this one is culled and clipped by the far plane.
@@ -684,7 +718,7 @@ fn traceRadiance(
         if ((surface.flags & MATERIAL_LIT) != 0u) {
           var unused: vec3<f32>;
           added = added + directLight(surface, point + surface.normal * RAY_EPSILON, -direction, pick.x, lightSample, rng,
-            &unused, select(0.0, volumeDensity, inVolume));
+            &unused, select(0.0, volumeDensity, inVolume), insideWater);
         }
 
         radiance = radiance + throughput * added * strength;
@@ -884,7 +918,7 @@ fn traceRadiance(
       var directDiffuse: vec3<f32>;
       let lit = select(throughput, throughput * (1.0 - surface.transmission), windowLight);
       let direct = lit * directLight(surface, position, view, pick.x, lightSample, rng, &directDiffuse,
-        select(0.0, volumeDensity, inVolume));
+        select(0.0, volumeDensity, inVolume), insideWater);
       let added = select(direct, clampIndirect(direct), bounce > 0u);
       let before = radiance;
 
@@ -976,6 +1010,7 @@ fn traceRadiance(
 
         if (crossing.crossed) {
           absorption = select(vec3<f32>(0.0), surface.absorption, surface.front);
+          insideWater = select(NO_MATERIAL, surface.material, surface.front && (surface.flags & MATERIAL_WATER) != 0u);
         } else {
           primary = false;
         }

@@ -621,6 +621,11 @@ fn resolveSurfaceFrom(triangle: u32, bary: vec2<f32>, direction: vec3<f32>, base
   surface.front = dot(authoredNormal(triangle, bary), direction) < 0.0;
   surface.normal = mappedNormal(m, triangle, bary, facing);
 
+  // Water ripples with its own waves, which take the place of any map.
+  if (WATER && (flags & MATERIAL_WATER) != 0u) {
+    surface.normal = waterNormal(m, trianglePointAt(triangle, bary), facing);
+  }
+
   // A normal map may tilt past the horizon, where the surface would be lit from behind itself.
   if (dot(surface.normal, view) <= 0.0) {
     surface.normal = facing;

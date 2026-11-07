@@ -103,6 +103,7 @@ const MATERIAL_SPECULAR: u32 = 4096u;
 const MATERIAL_VOLUME: u32 = 8192u;
 // An unlit material of a fixed colour, which direct sampling aims at: it emits what it shows.
 const MATERIAL_UNLIT_LIGHT: u32 = 16384u;
+const MATERIAL_WATER: u32 = 32768u;
 
 const KIND_STANDARD: u32 = ${MATERIAL_KIND.standard}u;
 const KIND_PHYSICAL: u32 = ${MATERIAL_KIND.physical}u;

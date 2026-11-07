@@ -1,5 +1,7 @@
 /** Acquiring a device, and the questions a host asks before choosing this renderer at all. */
 
+import { logMemory, toMB, trackDevice } from "./memoryProbe.js";
+
 /** What the renderer needs from the platform, and what is missing when it cannot run. */
 export interface WebGpuSupport {
   /** True when an adapter answered. */
@@ -79,7 +81,17 @@ export async function requestRenderDevice(options: RenderDeviceOptions = {}): Pr
     },
   });
 
+  trackDevice(device);
   void device.lost.then(info => options.onLost?.(info.message || String(info.reason)));
+
+  const info = (adapter as GPUAdapter & { info?: GPUAdapterInfo }).info;
+
+  logMemory("device acquired", {
+    adapter: info ? `${info.vendor} ${info.architecture} ${info.device} ${info.description}`.trim() : "unknown",
+    maxBufferMB: toMB(device.limits.maxBufferSize),
+    maxStorageBindingMB: toMB(device.limits.maxStorageBufferBindingSize),
+    shaderF16: requiredFeatures.length > 0,
+  });
 
   return {
     adapter,

@@ -137,13 +137,16 @@ const TEXTURE_TABLE: u32 = ${TEXTURE_TABLE}u;
 // A WebGPU device only has to offer eight storage buffers per stage, so arrays of the same kind share one binding and
 // the uniform says where the second one starts. See sceneUpload.ts, which joins them.
 @group(0) @binding(0) var<uniform> frame: Frame;
-// Nine coordinates per triangle, in the hierarchy's leaf order: see leafOf in bvh.wgsl.ts.
+// Nine coordinates per stored triangle, in the hierarchy's leaf order: see leafOf in bvh.wgsl.ts. A prototype's are
+// in object space.
 @group(0) @binding(1) var<storage, read> positions: array<f32>;
-// Normals, then the UV sets from frame.uvOffset, vertex colours from frame.colorOffset and shader varyings from
-// frame.varyingOffset.
+// Per vertex: the UV sets from frame.uvOffset and vertex colours from frame.colorOffset; then shader varyings, per
+// corner, from frame.varyingOffset.
 @group(0) @binding(2) var<storage, read> attributes: array<f32>;
-// One material index per triangle, then the hierarchy's triangle order from frame.orderOffset on (the triangle at each
-// position of the leaf order), then from frame.leafOffset on the other way (the position of each triangle).
+// One material index per triangle a hit can name, then the hierarchy's triangle order from frame.orderOffset on (the
+// stored triangle at each position of the leaf order), then from frame.leafOffset on the other way (the position of
+// each stored triangle), the instance of every instanced triangle from frame.instanceOffset, the three vertices of each
+// stored triangle from frame.cornerOffset and every vertex's folded normal from frame.normalOffset.
 @group(0) @binding(3) var<storage, read> indices: array<u32>;
 @group(0) @binding(4) var<storage, read> materials: array<Material>;
 @group(0) @binding(5) var<storage, read> nodes: array<BvhNode>;
@@ -163,22 +166,100 @@ fn orderedTriangle(at: u32) -> u32 {
   return indices[frame.orderOffset + at];
 }
 
-/** One word of a UV set: three vertices of four components, two per set. */
-fn attributeUv(triangle: u32, corner: u32, channel: u32) -> vec2<f32> {
-  let at = frame.uvOffset + triangle * 12u + corner * 4u + channel * 2u;
+/** What a triangle of the scene's own belongs to: no instance. */
+const NO_INSTANCE: u32 = 0xffffffffu;
+
+/** The instance a triangle a hit named belongs to, or NO_INSTANCE for one of the scene's own. */
+fn instanceOf(triangle: u32) -> u32 {
+  if (!INSTANCES || triangle < frame.sceneTriangles) {
+    return NO_INSTANCE;
+  }
+
+  return indices[frame.instanceOffset + triangle - frame.sceneTriangles];
+}
+
+/** One word of an instance's record: see INSTANCE_WORDS in instancing.ts. */
+fn instanceWord(instance: u32, word: u32) -> u32 {
+  return textures[frame.instanceData + instance * 28u + word];
+}
+
+/** A row of an instance's transforms: 0 to 2 take object space to world, 3 to 5 back. */
+fn instanceRow(instance: u32, row: u32) -> vec4<f32> {
+  let at = frame.instanceData + instance * 28u + row * 4u;
+
+  return vec4<f32>(bitcast<f32>(textures[at]), bitcast<f32>(textures[at + 1u]), bitcast<f32>(textures[at + 2u]),
+    bitcast<f32>(textures[at + 3u]));
+}
+
+/** Where a named triangle is stored: itself, or for an instance's, the prototype's triangle it repeats. */
+fn storedTriangle(triangle: u32, instance: u32) -> u32 {
+  if (instance == NO_INSTANCE) {
+    return triangle;
+  }
+
+  return instanceWord(instance, 25u) + triangle - instanceWord(instance, 26u);
+}
+
+/** A point of an instance's prototype, in world space. */
+fn instancePoint(instance: u32, p: vec3<f32>) -> vec3<f32> {
+  let q = vec4<f32>(p, 1.0);
+
+  return vec3<f32>(dot(instanceRow(instance, 0u), q), dot(instanceRow(instance, 1u), q), dot(instanceRow(instance, 2u), q));
+}
+
+/** A world space point (w 1) or direction (w 0), in an instance's object space. */
+fn instanceToObject(instance: u32, v: vec3<f32>, w: f32) -> vec3<f32> {
+  let q = vec4<f32>(v, w);
+
+  return vec3<f32>(dot(instanceRow(instance, 3u), q), dot(instanceRow(instance, 4u), q), dot(instanceRow(instance, 5u), q));
+}
+
+/** An object space normal in world space, by the inverse transpose; not normalized. */
+fn instanceNormal(instance: u32, n: vec3<f32>) -> vec3<f32> {
+  return n.x * instanceRow(instance, 3u).xyz + n.y * instanceRow(instance, 4u).xyz + n.z * instanceRow(instance, 5u).xyz;
+}
+
+/** The three vertices of a triangle a hit named. */
+fn triangleCorners(triangle: u32) -> vec3<u32> {
+  let at = frame.cornerOffset + storedTriangle(triangle, instanceOf(triangle)) * 3u;
+
+  return vec3<u32>(indices[at], indices[at + 1u], indices[at + 2u]);
+}
+
+/** One UV set of a vertex: four components, two per set. */
+fn vertexUv(vertex: u32, channel: u32) -> vec2<f32> {
+  let at = frame.uvOffset + vertex * 4u + channel * 2u;
 
   return vec2<f32>(attributes[at], attributes[at + 1u]);
 }
 
-/** A corner's vertex colour, or white when the scene has none. */
-fn attributeColor(triangle: u32, corner: u32) -> vec4<f32> {
+/** A vertex's colour, or white when the scene has none. */
+fn vertexColor(vertex: u32) -> vec4<f32> {
   if (frame.hasColors == 0u) {
     return vec4<f32>(1.0);
   }
 
-  let at = frame.colorOffset + triangle * 12u + corner * 4u;
+  let at = frame.colorOffset + vertex * 4u;
 
   return vec4<f32>(attributes[at], attributes[at + 1u], attributes[at + 2u], attributes[at + 3u]);
+}
+
+/** A normal folded onto an octahedron in two signed 16 bit halves, as sceneUpload.ts folds it; zero for NO_NORMAL. */
+fn vertexNormal(vertex: u32) -> vec3<f32> {
+  let code = indices[frame.normalOffset + vertex];
+
+  if (code == 0x80008000u) {
+    return vec3<f32>(0.0);
+  }
+
+  let e = unpack2x16snorm(code);
+  var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+  let t = max(-n.z, 0.0);
+
+  n.x = n.x + select(t, -t, n.x >= 0.0);
+  n.y = n.y + select(t, -t, n.y >= 0.0);
+
+  return normalize(n);
 }
 
 fn extraFloat(at: u32) -> f32 {

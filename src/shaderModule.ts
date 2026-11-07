@@ -13,7 +13,8 @@ export function createShaderModule(device: GPUDevice, label: string, code: strin
       if (message.type === "error") console.error(text);
       else if (message.type === "warning") console.warn(text);
     }
-  });
+  // A device lost while compiling rejects here too; the loss itself reaches the renderer through `device.lost`.
+  }, () => undefined);
 
   return module;
 }

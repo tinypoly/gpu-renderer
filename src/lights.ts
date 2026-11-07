@@ -148,11 +148,15 @@ interface Bounds {
   radius: number;
 }
 
-function sceneBounds(positions: Float32Array): Bounds {
-  if (!positions.length) return { centre: [0, 0, 0], radius: 1 };
+function sceneBounds(geometry: PackedGeometry): Bounds {
+  const positions = geometry.positions;
+  const instances = geometry.instancing?.bounds;
 
-  const low = [Infinity, Infinity, Infinity];
-  const high = [-Infinity, -Infinity, -Infinity];
+  if (!positions.length && !instances) return { centre: [0, 0, 0], radius: 1 };
+
+  // Repeated geometry is kept in object space; the box around its instances stands in for it.
+  const low = instances ? [...instances.low] : [Infinity, Infinity, Infinity];
+  const high = instances ? [...instances.high] : [-Infinity, -Infinity, -Infinity];
 
   for (let at = 0; at < positions.length; at += 3) {
     for (let axis = 0; axis < 3; axis++) {
@@ -418,7 +422,7 @@ export function packLights(
   lights: readonly SerializedLight[] = [],
   environment?: { power: number } | null,
   options: LightPackOptions = {}): PackedLights {
-  const bounds = sceneBounds(geometry.positions);
+  const bounds = sceneBounds(geometry);
   const areas = emissiveTriangles(geometry, bounds);
   const extra: number[] = [];
 

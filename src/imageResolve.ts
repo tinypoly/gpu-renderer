@@ -97,8 +97,8 @@ export class ImageResolvePass {
     this.device.queue.writeBuffer(this.uniforms, 0, this.values);
 
     const bytes = width * height * 4;
-    const output = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const staging = this.device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const output = this.device.createBuffer({ label: "image readback", size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const staging = this.device.createBuffer({ label: "image readback", size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
     try {
       const encoder = this.device.createCommandEncoder({ label: "image resolve" });

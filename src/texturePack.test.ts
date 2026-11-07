@@ -1,6 +1,17 @@
-import { expect, it } from "vitest";
-import { NO_TEXTURE, packTextures, SOBOL_TABLE, SRGB_TABLE, TEXTURE_TABLE, TEXTURE_WORDS } from "./texturePack.js";
-import type { SerializedScene, SerializedTexture } from "./upstream.js";
+import { describe, expect, it } from "vitest";
+import {
+  NO_TEXTURE,
+  packTextures,
+  planTextures,
+  SOBOL_TABLE,
+  SRGB_TABLE,
+  TEXTURE_TABLE,
+  TEXTURE_WORDS,
+  textureChannels,
+  textureUpload,
+  writeTextures,
+} from "./texturePack.js";
+import type { SerializedMaterial, SerializedMesh, SerializedScene, SerializedTexture } from "./upstream.js";
 
 const texture = (overrides: Partial<SerializedTexture>): SerializedTexture => ({
   id: "t",
@@ -19,7 +30,43 @@ const texture = (overrides: Partial<SerializedTexture>): SerializedTexture => ({
 
 const scene = (textures: SerializedTexture[]): SerializedScene => ({ meshes: [], lights: [], textures });
 
-const FLOAT = 1, SRGB = 2, NEAREST = 4, FLIP_Y = 8;
+const FLOAT = 1, SRGB = 2, NEAREST = 4, FLIP_Y = 8, SINGLE = 32;
+
+/** A mesh whose one material uses these maps, and whatever else the material says. */
+function meshWith(maps: Record<string, string>, rest: Partial<SerializedMaterial> = {}): SerializedMesh {
+  return {
+    attributes: { position: { data: new Float32Array(9), itemSize: 3 } },
+    index: null,
+    groups: [],
+    materials: [{ type: "MeshStandardMaterial", name: "m", values: {}, maps, ...rest }],
+    matrixWorld: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+    castShadow: true,
+    receiveShadow: true,
+    renderOrder: 0,
+  };
+}
+
+/** readTexel in texture.wgsl.ts, for a byte texture: the four channels of one texel. */
+function readTexel(words: Uint32Array, index: number, texel: number): number[] {
+  const at = TEXTURE_TABLE + index * TEXTURE_WORDS;
+  const offset = words[at + 2], flags = words[at + 3];
+  const linear = (code: number) => new Float32Array(words.buffer)[SRGB_TABLE + code];
+
+  if (flags & SINGLE) {
+    const code = (words[offset + (texel >> 2)] >>> ((texel & 3) * 8)) & 0xff;
+    const colour = flags & SRGB ? linear(code) : code / 255;
+
+    return [colour, colour, colour, code / 255];
+  }
+
+  const word = words[offset + texel];
+  const code = (shift: number) => (word >>> shift) & 0xff;
+
+  return flags & SRGB
+    ? [linear(code(0)), linear(code(8)), linear(code(16)), code(24) / 255]
+    : [code(0) / 255, code(8) / 255, code(16) / 255, code(24) / 255];
+}
+
 const T = TEXTURE_TABLE;
 
 it("writes the size, the flags and the wrap modes of each texture", () => {
@@ -154,4 +201,115 @@ it("leads with the linear value of every sRGB code", () => {
   expect(floats[SRGB_TABLE]).toBe(0);
   expect(floats[SRGB_TABLE + 255]).toBe(1);
   expect(floats[SRGB_TABLE + 128]).toBeCloseTo(0.21586, 5);
+});
+
+it("writes the same bytes to the device as the buffer it would have built, without building it", () => {
+  const bytes = (width: number, height: number, seed: number) => texture({
+    id: `b${seed}`,
+    width,
+    height,
+    data: Uint8Array.from({ length: width * height * 4 }, (_, k) => (k * 31 + seed) & 255),
+  });
+
+  const floats = texture({
+    id: "f",
+    width: 3,
+    height: 2,
+    data: Float32Array.from({ length: 3 * 2 * 4 }, (_, k) => k / 7),
+  });
+
+  // The last one is read through its red channel alone, so it is kept one byte a texel.
+  const scene: SerializedScene = {
+    meshes: [meshWith({ map: "b1", bumpMap: "b9" })],
+    lights: [],
+    textures: [bytes(5, 3, 1), floats, bytes(5, 3, 9)],
+  };
+
+  const extra = Uint32Array.from([7, 8, 9, 10]);
+  const plan = planTextures(scene);
+  const whole = writeTextures(plan, extra);
+  const upload = textureUpload(plan, extra);
+  const written = new Uint8Array(upload.byteLength);
+
+  const device = {
+    queue: {
+      writeBuffer(_buffer: unknown, offset: number, data: ArrayBufferView) {
+        written.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength), offset);
+      },
+    },
+  } as unknown as GPUDevice;
+
+  upload.write(device, {} as GPUBuffer);
+
+  expect(upload.byteLength).toBe(whole.data.byteLength);
+  expect([...new Uint32Array(written.buffer)]).toEqual([...whole.data]);
+  expect(upload.offsets)
+    .toEqual(plan.textures.map((_, index) => whole.data[TEXTURE_TABLE + index * TEXTURE_WORDS + 2]));
+});
+
+describe("textures read through one channel", () => {
+  const bytes = (id: string, colorSpace = "") => texture({
+    id,
+    width: 7,
+    height: 3,
+    colorSpace,
+    data: Uint8Array.from({ length: 7 * 3 * 4 }, (_, k) => (k * 37 + id.length * 11) & 255),
+  });
+
+  it("keeps the only channel read, one byte a texel, and reads back what the full texel said in it", () => {
+    for (const [slot, channel, colorSpace] of [["roughnessMap", 1, ""], ["bumpMap", 0, ""], ["alphaMap", 1, "srgb"]] as const) {
+      const source = bytes("t", colorSpace);
+      const single = packTextures({ meshes: [meshWith({ [slot]: "t" })], lights: [], textures: [source] });
+
+      const whole = writeTextures(planTextures({ meshes: [], lights: [], textures: [source] }, [], new Map()),
+        new Uint32Array(0));
+
+      expect(single.data[TEXTURE_TABLE + 3] & SINGLE).toBe(SINGLE);
+      expect(single.data.length).toBe(whole.data.length - 21 + Math.ceil(21 / 4));
+
+      for (let texel = 0; texel < 21; texel++)
+        expect(readTexel(single.data, 0, texel)[channel]).toBeCloseTo(readTexel(whole.data, 0, texel)[channel], 6);
+    }
+  });
+
+  it("keeps all four where a slot reads another channel, or something besides a map names the texture", () => {
+    const textures = [bytes("orm"), bytes("lit"), bytes("uniform"), bytes("rough")];
+
+    const plan = textureChannels({
+      meshes: [
+        meshWith({ roughnessMap: "orm", metalnessMap: "orm", bumpMap: "lit" }),
+        meshWith({ roughnessMap: "uniform" }, { shader: { uniforms: { tMap: { texture: "uniform" } } } as never }),
+        meshWith({ roughnessMap: "rough" }),
+      ],
+      lights: [{ map: "lit" } as never],
+      textures,
+    });
+
+    expect([...plan.single]).toEqual([["rough", 1]]);
+    expect(plan.whole.get("orm")).toBe("reads gb");
+    expect(plan.whole.get("lit")).toBe("named by lights.0.map");
+    expect(plan.whole.get("uniform")).toBe('named by material "m".shader.uniforms.tMap.texture');
+  });
+
+  it("counts a shader's uniforms only for the textures its translated program reads", () => {
+    const hooked = meshWith({ bumpMap: "bump", roughnessMap: "rough" }, {
+      shader: { uniforms: { bumpMap: { texture: "bump" }, roughnessMap: { texture: "rough" } } } as never,
+    });
+
+    // A program that declares only the roughness map among the uniforms it is handed.
+    const program = {
+      packUniforms: (values: Record<string, { texture?: string }>, textures: ReadonlyMap<string, number>) =>
+        Uint32Array.from([textures.get(values.roughnessMap?.texture ?? "") ?? NO_TEXTURE, 7]),
+    };
+
+    const programs = {
+      fragment: (material: SerializedMaterial) => material === hooked.materials[0] ? program as never : null,
+      after: () => null,
+    };
+
+    const plan = textureChannels({ meshes: [hooked], lights: [], textures: [bytes("bump"), bytes("rough")] }, programs);
+
+    expect([...plan.single]).toEqual([["bump", 0]]);
+    expect(plan.whole.get("rough")).toBe('named by the shader of material "m"');
+  });
 });

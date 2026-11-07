@@ -31,6 +31,12 @@ it("validates the kernel without the subsurface walk or volumes, as a plain scen
   expect(() => check(pathTraceSource(null, false, true, false, false, false))).not.toThrow();
 });
 
+it("validates the kernel with and without the traversal into instances", () => {
+  expect(() => check(pathTraceSource(null, false, false, false, false, false, false))).not.toThrow();
+  expect(() => check(pathTraceSource(null, false, false, false, false, false, true))).not.toThrow();
+  expect(() => check(pathTraceSource(null, true, true, true, true, true, true))).not.toThrow();
+});
+
 it("validates the kernel with grass and nothing else", () => {
   expect(() => check(pathTraceSource(null, false, false, false, false, true))).not.toThrow();
 });

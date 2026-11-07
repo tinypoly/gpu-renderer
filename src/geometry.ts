@@ -3,32 +3,56 @@ import {
   isMaterialVisible,
   MATERIAL_KIND,
   MATERIAL_UNLIT_LIGHT,
+  MATERIAL_VOLUME,
   materialProperties,
   NO_PLACEMENT,
   NO_PROGRAM,
   type MaterialPlacement,
   type MaterialProperties,
 } from "./materialLayout.js";
+import {
+  geometryKey,
+  INSTANCE_MIN_TRIANGLES,
+  instanceable,
+  transformBox,
+  trianglesBox,
+  type Instance,
+  type PackedInstancing,
+  type Prototype,
+} from "./instancing.js";
 import { normalMatrix, transformNormal, transformPoint } from "./math.js";
 import type { ShaderPrograms } from "./shaderProgram.js";
 import { type CpuShader, matrixValue, sampleTexture } from "./upstream.js";
 import type { SerializedMaterial, SerializedMesh, SerializedScene, SerializedTexture, UniformValue } from "./upstream.js";
 
-/** The flat, GPU ready form of a scene's triangles. Positions and normals are world space, three vertices per entry. */
+/**
+ * The GPU ready form of a scene's triangles. Positions are nine coordinates per triangle, world space, which is what the
+ * traversal reads; everything shading reads is kept per vertex, and each triangle names its three vertices. Geometry the
+ * scene repeats is kept once, in `instancing`.
+ */
 export interface PackedGeometry {
-  /** Nine coordinates per triangle. */
+  /** Nine coordinates per triangle of the scene's own, world space. */
   positions: Float32Array;
-  /** Nine normal components per triangle, one per vertex. */
+  /**
+   * Three vertex numbers per stored triangle: the scene's own first, then every prototype's (see `instancing`), in the
+   * order the stored triangles are numbered.
+   */
+  corners: Uint32Array;
+  /** Three normal components per vertex; zero where the mesh authored a zero normal. */
   normals: Float32Array;
-  /** Twelve per triangle: two UV sets for each of the three vertices, which is what Three's map channels need. */
+  /** Four per vertex: two UV sets, which is what Three's map channels need. */
   uvs: Float32Array;
-  /** Twelve per triangle, RGBA per vertex, when any material reads vertex colours; empty otherwise. */
+  /** Four per vertex, RGBA, when any material reads vertex colours; empty otherwise. */
   colors: Float32Array;
+  vertexCount: number;
   /** Shader varyings, three corners per triangle of a shader material, laid out as each program asks. */
   varyings: Float32Array;
-  /** One material index per triangle. */
+  /** One material index per triangle of the scene's own. */
   materials: Uint32Array;
+  /** Triangles of the scene's own: what lights, windows, volumes and grass are found among. */
   triangleCount: number;
+  /** Repeated geometry, kept once with a transform per copy; null when nothing repeats. */
+  instancing: PackedInstancing | null;
   /** Four floats per material: linear rgb and opacity. */
   materialColors: Float32Array;
   /** Four floats per material: linear emissive rgb and its intensity. */
@@ -47,6 +71,15 @@ export interface PackedGeometry {
   cameraDependent: boolean;
 }
 
+/** How one mesh was packed, for a host measuring where the time goes. */
+export interface MeshPacked {
+  /** Its index among the scene's meshes. */
+  mesh: number;
+  path: "plain" | "general" | "instance" | "prototype";
+  triangles: number;
+  ms: number;
+}
+
 export interface PackOptions {
   /** The index in the texture table of each texture, by id. */
   textures?: ReadonlyMap<string, number>;
@@ -62,6 +95,10 @@ export interface PackOptions {
   extraBase?: number;
   /** Scene fog, which a shader's fog uniforms read. */
   fog?: SerializedScene["fog"];
+  /** Whether repeated geometry may become instances. On by default. */
+  instancing?: boolean;
+  /** Told about every mesh once it is packed. */
+  onMesh?: (info: MeshPacked) => void;
 }
 
 /** Three's wireframe and line width: WebGL draws every line one pixel wide whatever the material asks. */
@@ -88,6 +125,33 @@ interface Entry {
 }
 
 /** Grows a float array as triangles are added, since how many a primitive makes is only known as it is built. */
+class UintStream {
+  data: Uint32Array;
+  length = 0;
+
+  constructor(capacity: number) {
+    this.data = new Uint32Array(Math.max(16, capacity));
+  }
+
+  reserve(count: number) {
+    if (this.length + count <= this.data.length) return;
+
+    const next = new Uint32Array(Math.max(this.data.length * 2, this.length + count));
+
+    next.set(this.data.subarray(0, this.length));
+    this.data = next;
+  }
+
+  push(value: number) {
+    this.reserve(1);
+    this.data[this.length++] = value;
+  }
+
+  view(): Uint32Array {
+    return this.data.subarray(0, this.length);
+  }
+}
+
 class FloatStream {
   data: Float32Array;
   length = 0;
@@ -202,16 +266,65 @@ function flatten(value: unknown): number[] | null {
   return null;
 }
 
+/** Triangles one slice of packing covers before it may hand the thread back. */
+const SLICE_TRIANGLES = 32768;
+
+const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+
+/** A mesh's groups, or the one group covering it when it declares none. */
+function groupsOf(mesh: SerializedMesh) {
+  return mesh.groups.length
+    ? mesh.groups
+    : [{
+      start: 0,
+      count: mesh.index ? mesh.index.length : mesh.attributes.position.data.length / 3,
+      materialIndex: 0,
+    }];
+}
+
 /**
  * Flattens the scene into triangles, materials resolved and transforms applied. Every triangle carries its own three
- * vertices: the path tracer reads a hit through its triangle index, and sharing vertices would cost an indirection on
- * the hottest path of the kernel for memory that low poly scenes do not miss.
+ * positions: the traversal reads them straight off the buffer, and sharing them would cost an indirection on the
+ * hottest path of the kernel. What shading reads (normals, UVs, colours) is kept per vertex instead, since it is read
+ * once a hit, and a mesh that repeats becomes instances of one prototype (see `instancing.ts`).
  *
  * Points, lines and sprites become triangles that face the camera, sized the way Three draws them, so a path has a
  * surface to find; vertex shaders run here, on the CPU renderer's interpreter, and their varyings ride along per corner.
  */
 export function packGeometry(
   scene: SerializedScene, options: PackOptions | ReadonlyMap<string, number> = {}): PackedGeometry {
+  const steps = packingSteps(scene, options);
+  let step = steps.next();
+
+  while (!step.done) step = steps.next();
+
+  return step.value;
+}
+
+/**
+ * The same packing, handing the thread back between slices: `pause` is awaited whenever the work has held the thread
+ * for `sliceMs`, so a large scene does not freeze the page while it packs.
+ */
+export async function packGeometrySliced(
+  scene: SerializedScene, options: PackOptions, pause: () => Promise<void>, sliceMs = 12): Promise<PackedGeometry> {
+  const steps = packingSteps(scene, options);
+  let started = performance.now();
+  let step = steps.next();
+
+  while (!step.done) {
+    if (performance.now() - started >= sliceMs) {
+      await pause();
+      started = performance.now();
+    }
+
+    step = steps.next();
+  }
+
+  return step.value;
+}
+
+function* packingSteps(
+  scene: SerializedScene, options: PackOptions | ReadonlyMap<string, number>): Generator<void, PackedGeometry> {
   const settings: PackOptions = options instanceof Map ? { textures: options } : options as PackOptions;
   const textures = settings.textures ?? new Map<string, number>();
   const textureData = settings.textureData ?? new Map<string, SerializedTexture>();
@@ -221,21 +334,49 @@ export function packGeometry(
   const programs = settings.programs;
   const extraBase = settings.extraBase ?? 0;
   const meshes = scene.meshes.filter(mesh => mesh.attributes.position);
-  const estimate = meshes.reduce((count, mesh) => count + (mesh.primitive ? 0 : triangleCountOf(mesh)), 0);
+
+  const repeated = settings.instancing === false ? new Map<SerializedMesh, string>()
+    : repeatedGeometry(meshes, material => plainMaterial(material, textures, programs));
+
+  const estimate = meshes.reduce((count, mesh) =>
+    count + (mesh.primitive || repeated.has(mesh) ? 0 : triangleCountOf(mesh)), 0);
+
+  const vertexEstimate = meshes.reduce((count, mesh) =>
+    count + (mesh.primitive || repeated.has(mesh) ? 0 : mesh.attributes.position.data.length / 3), 0);
 
   const anyVertexColors = meshes.some(mesh =>
     mesh.attributes.color && mesh.materials.some(m => m?.values?.vertexColors === true));
 
   const positions = new FloatStream(estimate * 9);
-  const normals = new FloatStream(estimate * 9);
-  const uvs = new FloatStream(estimate * 12);
-  const colors = new FloatStream(anyVertexColors ? estimate * 12 : 0);
+  const corners = new UintStream(estimate * 3);
+  const normals = new FloatStream(vertexEstimate * 3);
+  const uvs = new FloatStream(vertexEstimate * 4);
+  const colors = new FloatStream(anyVertexColors ? vertexEstimate * 4 : 0);
+  let vertexCount = 0;
   const varyings = new FloatStream(0);
-  const triangleMaterials: number[] = [];
+  const triangleMaterials = new UintStream(estimate);
   const entries: Entry[] = [];
   const shared = new Map<SerializedMaterial | undefined, Entry>();
   const extra: number[] = [];
   let cameraDependent = false;
+
+  // Repeated geometry: each prototype's triangles once, in object space, with the group each one came from.
+  const prototypePositions = new FloatStream(0);
+  const prototypeCorners = new UintStream(0);
+  const prototypeGroups = new UintStream(0);
+  const prototypes: Prototype[] = [];
+  const prototypeOf = new Map<string, number>();
+  const instances: Instance[] = [];
+  const instanceMaterials = new UintStream(0);
+  let instanced = 0;
+
+  const flatSink: TriangleSink = { positions, corners, tags: triangleMaterials };
+
+  const prototypeSink: TriangleSink = {
+    positions: prototypePositions,
+    corners: prototypeCorners,
+    tags: prototypeGroups,
+  };
 
   /** A material's clipping planes, written once to the extra words. */
   const clipPlanes = new Map<SerializedMaterial, { start: number; count: number }>();
@@ -327,24 +468,49 @@ export function packGeometry(
     return entry;
   };
 
-  const writeTriangle = (corners: readonly Corner[], entry: Entry) => {
+  /** A vertex of its own, for everything a hit reads per vertex; its number. */
+  const emitVertex = (normal: ArrayLike<number>, n: number, uv: ArrayLike<number>, u: number,
+    color: ArrayLike<number>, c: number): number => {
+    normals.reserve(3);
+    normals.data[normals.length++] = normal[n];
+    normals.data[normals.length++] = normal[n + 1];
+    normals.data[normals.length++] = normal[n + 2];
+    uvs.reserve(4);
+    uvs.data[uvs.length++] = uv[u];
+    uvs.data[uvs.length++] = uv[u + 1];
+    uvs.data[uvs.length++] = uv[u + 2];
+    uvs.data[uvs.length++] = uv[u + 3];
+
+    if (anyVertexColors) {
+      colors.reserve(4);
+      colors.data[colors.length++] = color[c];
+      colors.data[colors.length++] = color[c + 1];
+      colors.data[colors.length++] = color[c + 2];
+      colors.data[colors.length++] = color[c + 3];
+    }
+
+    return vertexCount++;
+  };
+
+  const writeTriangle = (triangle: readonly Corner[], entry: Entry) => {
     // Geometry without normals is shaded flat: the three corners share the face normal.
-    const flat = corners.some(corner => corner.normal.length < 3)
-      ? faceNormal(corners[0].position, corners[1].position, corners[2].position)
+    const flat = triangle.some(corner => corner.normal.length < 3)
+      ? faceNormal(triangle[0].position, triangle[1].position, triangle[2].position)
       : null;
 
-    for (const corner of corners) {
+    for (const corner of triangle) {
       positions.push(corner.position, 3);
-      normals.push(flat ?? corner.normal, 3);
-      uvs.push([corner.uv0[0], corner.uv0[1], corner.uv1[0], corner.uv1[1]], 4);
+      const color = corner.color;
 
-      if (anyVertexColors) colors.push(corner.color, 4);
+      // A missing component reads as zero, as the stream it replaces padded it.
+      corners.push(emitVertex(flat ?? corner.normal, 0, [corner.uv0[0], corner.uv0[1], corner.uv1[0], corner.uv1[1]], 0,
+        [color[0] ?? 0, color[1] ?? 0, color[2] ?? 0, color[3] ?? 0], 0));
     }
 
     const stride = entry.placement.varyingStride;
 
     if (stride > 0)
-      for (const corner of corners) {
+      for (const corner of triangle) {
         if (corner.varyings) varyings.push(corner.varyings, stride);
         else varyings.pad(stride);
       }
@@ -352,179 +518,260 @@ export function packGeometry(
     triangleMaterials.push(entry.index);
   };
 
-  /** Every vertex of a plain mesh, transformed once and shared by its groups. */
-  let plain: PlainVertices | null = null;
-
-  const writePlainTriangles = (mesh: SerializedMesh, start: number, end: number, mirrored: boolean, entry: Entry) => {
-    if (plain?.mesh !== mesh) plain = plainVertices(mesh);
-
-    const { world, normal, hasNormal, uv, color, valid } = plain;
-    const index = mesh.index;
-    const stride = entry.placement.varyingStride;
-    const corners = [0, 0, 0];
+  const writePlainTriangles = (vertices: PlainVertices, start: number, end: number, mirrored: boolean,
+    stride: number, sink: TriangleSink, tag: number) => {
+    const { world, normal, hasNormal, uv, color, valid, ids } = vertices;
+    const index = vertices.mesh.index;
+    const triangle = [0, 0, 0];
 
     for (let v = start; v + 2 < end; v += 3) {
       const a = index ? index[v] : v, b = index ? index[v + 1] : v + 1, c = index ? index[v + 2] : v + 2;
 
       if (!valid(a) || !valid(b) || !valid(c)) continue;
 
-      corners[0] = a;
-      corners[1] = mirrored ? c : b;
-      corners[2] = mirrored ? b : c;
+      triangle[0] = a;
+      triangle[1] = mirrored ? c : b;
+      triangle[2] = mirrored ? b : c;
 
-      // Geometry without normals is shaded flat: the three corners share the face normal.
+      // Geometry without normals is shaded flat: the three corners share the face normal, so a vertex of their own.
       const flat = !hasNormal[a] || !hasNormal[b] || !hasNormal[c]
         ? faceNormal(
-          Array.from(world.subarray(corners[0] * 3, corners[0] * 3 + 3)),
-          Array.from(world.subarray(corners[1] * 3, corners[1] * 3 + 3)),
-          Array.from(world.subarray(corners[2] * 3, corners[2] * 3 + 3)))
+          Array.from(world.subarray(triangle[0] * 3, triangle[0] * 3 + 3)),
+          Array.from(world.subarray(triangle[1] * 3, triangle[1] * 3 + 3)),
+          Array.from(world.subarray(triangle[2] * 3, triangle[2] * 3 + 3)))
         : null;
 
-      positions.reserve(9);
-      normals.reserve(9);
-      uvs.reserve(12);
+      sink.positions.reserve(9);
+      sink.corners.reserve(3);
 
-      if (anyVertexColors) colors.reserve(12);
+      for (const corner of triangle) {
+        const p = corner * 3;
 
-      for (const corner of corners) {
-        const p = corner * 3, q = corner * 4;
+        sink.positions.data[sink.positions.length++] = world[p];
+        sink.positions.data[sink.positions.length++] = world[p + 1];
+        sink.positions.data[sink.positions.length++] = world[p + 2];
 
-        positions.data[positions.length++] = world[p];
-        positions.data[positions.length++] = world[p + 1];
-        positions.data[positions.length++] = world[p + 2];
+        let id: number;
 
         if (flat) {
-          normals.data[normals.length++] = flat[0];
-          normals.data[normals.length++] = flat[1];
-          normals.data[normals.length++] = flat[2];
+          id = emitVertex(flat, 0, uv, corner * 4, color, corner * 4);
         } else {
-          normals.data[normals.length++] = normal[p];
-          normals.data[normals.length++] = normal[p + 1];
-          normals.data[normals.length++] = normal[p + 2];
+          id = ids[corner];
+
+          if (id < 0) id = ids[corner] = emitVertex(normal, p, uv, corner * 4, color, corner * 4);
         }
 
-        uvs.data[uvs.length++] = uv[q];
-        uvs.data[uvs.length++] = uv[q + 1];
-        uvs.data[uvs.length++] = uv[q + 2];
-        uvs.data[uvs.length++] = uv[q + 3];
-
-        if (anyVertexColors) {
-          colors.data[colors.length++] = color[q];
-          colors.data[colors.length++] = color[q + 1];
-          colors.data[colors.length++] = color[q + 2];
-          colors.data[colors.length++] = color[q + 3];
-        }
+        sink.corners.data[sink.corners.length++] = id;
       }
 
       if (stride > 0) varyings.pad(3 * stride);
 
-      triangleMaterials.push(entry.index);
+      sink.tags.push(tag);
     }
   };
 
-  for (const mesh of meshes) {
-    const groups = mesh.groups.length
-      ? mesh.groups
-      : [{
-        start: 0,
-        count: mesh.index ? mesh.index.length : mesh.attributes.position.data.length / 3,
-        materialIndex: 0,
-      }];
+  // Time spent on the mesh at hand, without the pauses between slices.
+  let meshMs = 0;
+  let segment = performance.now();
 
-    if (mesh.primitive) cameraDependent = true;
+  const pause = function* () {
+    meshMs += performance.now() - segment;
+    yield;
+    segment = performance.now();
+  };
 
-    for (const group of groups) {
-      const material = mesh.materials[group.materialIndex] ?? mesh.materials[0];
+  /** A plain run of triangles, sliced so the page is not held for the whole of a large mesh. */
+  const plainRun = function* (vertices: PlainVertices, start: number, end: number, mirrored: boolean, stride: number,
+    sink: TriangleSink, tag: number) {
+    for (let from = start; from < end; from += SLICE_TRIANGLES * 3) {
+      writePlainTriangles(vertices, from, Math.min(end, from + SLICE_TRIANGLES * 3), mirrored, stride, sink, tag);
 
-      if (!isMaterialVisible(material)) continue;
+      if (from + SLICE_TRIANGLES * 3 < end) yield* pause();
+    }
+  };
 
-      const entry = entryFor(material, mesh);
-      const vertexShader = material ? programs?.vertex(material) ?? null : null;
+  for (let meshIndex = 0; meshIndex < meshes.length; meshIndex++) {
+    const mesh = meshes[meshIndex];
+    const groups = groupsOf(mesh);
+    const key = repeated.get(mesh);
+    const before = triangleMaterials.length + instanced;
+    let path: MeshPacked["path"] = "plain";
 
-      if (vertexShader) cameraDependent = true;
+    meshMs = 0;
+    segment = performance.now();
 
-      // Primitives that face the camera need one to face; without it there is nothing sensible to build.
-      if (mesh.primitive && !camera) continue;
+    if (key !== undefined) {
+      let prototype = prototypeOf.get(key);
 
-      const context = { camera, width, height, textureData, vertexShader, programs, fog: settings.fog };
-      const vertices = new VertexReader(mesh, material, context);
-      const count = mesh.index ? mesh.index.length : mesh.attributes.position.data.length / 3;
-      const start = Math.max(0, group.start);
-      const end = Math.min(group.start + group.count, count);
-      const at = (offset: number) => (mesh.index ? mesh.index[offset] : offset);
+      // The first copy lays the prototype down, in object space; the next ones only point at it.
+      if (prototype === undefined) {
+        const first = prototypeGroups.length;
+        const vertices = plainVertices(mesh, IDENTITY);
 
-      if (!mesh.primitive) {
-        // A mirroring transform turns the winding around; Three flips its front face to match, and so does this.
-        const mirrored = determinant3(mesh.matrixWorld) < 0;
-        // Instanced geometry drawn by a shader (Line2, particles built in a vertex shader): the template runs once per
-        // instance, reading the per-instance attributes at that instance.
-        const instancing = vertexShader ? instancedAttributes(mesh) : null;
+        for (let g = 0; g < groups.length; g++) {
+          const group = groups[g];
+          const material = mesh.materials[group.materialIndex] ?? mesh.materials[0];
 
-        // The common case, a plain mesh, skips the general reader: each vertex is transformed once, straight into
-        // typed arrays, and each triangle is copied from them. What it writes is exactly what the reader would.
-        if (!vertexShader && !material?.maps?.displacementMap) {
-          writePlainTriangles(mesh, start, end, mirrored, entry);
+          if (!isMaterialVisible(material)) continue;
+
+          const count = mesh.index ? mesh.index.length : mesh.attributes.position.data.length / 3;
+
+          yield* plainRun(vertices, Math.max(0, group.start), Math.min(group.start + group.count, count), false, 0,
+            prototypeSink, g);
+        }
+
+        prototype = prototypes.length;
+        prototypes.push({ first, count: prototypeGroups.length - first });
+        prototypeOf.set(key, prototype);
+        path = "prototype";
+      } else {
+        path = "instance";
+      }
+
+      const { first, count } = prototypes[prototype];
+
+      if (count > 0) {
+        const entryOfGroup = groups.map(group => {
+          const material = mesh.materials[group.materialIndex] ?? mesh.materials[0];
+
+          return isMaterialVisible(material) ? entryFor(material, mesh).index : 0;
+        });
+
+        instances.push({ prototype, matrix: mesh.matrixWorld, firstTriangle: instanced });
+        instanceMaterials.reserve(count);
+
+        for (let i = 0; i < count; i++)
+          instanceMaterials.data[instanceMaterials.length++] = entryOfGroup[prototypeGroups.data[first + i]];
+
+        instanced += count;
+      }
+    } else {
+      if (mesh.primitive) cameraDependent = true;
+
+      // Every vertex of a plain mesh, transformed once and shared by its groups.
+      let plain: PlainVertices | null = null;
+
+      for (const group of groups) {
+        const material = mesh.materials[group.materialIndex] ?? mesh.materials[0];
+
+        if (!isMaterialVisible(material)) continue;
+
+        const entry = entryFor(material, mesh);
+        const vertexShader = material ? programs?.vertex(material) ?? null : null;
+
+        if (vertexShader) cameraDependent = true;
+
+        // Primitives that face the camera need one to face; without it there is nothing sensible to build.
+        if (mesh.primitive && !camera) continue;
+
+        const context = { camera, width, height, textureData, vertexShader, programs, fog: settings.fog };
+        const count = mesh.index ? mesh.index.length : mesh.attributes.position.data.length / 3;
+        const start = Math.max(0, group.start);
+        const end = Math.min(group.start + group.count, count);
+        const at = (offset: number) => (mesh.index ? mesh.index[offset] : offset);
+
+        if (!mesh.primitive) {
+          // A mirroring transform turns the winding around; Three flips its front face to match, and so does this.
+          const mirrored = determinant3(mesh.matrixWorld) < 0;
+
+          // The common case, a plain mesh, skips the general reader: each vertex is transformed once, straight into
+          // typed arrays, and each triangle is copied from them. What it writes is exactly what the reader would.
+          if (!vertexShader && !material?.maps?.displacementMap) {
+            plain ??= plainVertices(mesh);
+            yield* plainRun(plain, start, end, mirrored, entry.placement.varyingStride, flatSink, entry.index);
+            continue;
+          }
+
+          path = "general";
+
+          // Instanced geometry drawn by a shader (Line2, particles built in a vertex shader): the template runs once
+          // per instance, reading the per-instance attributes at that instance.
+          const instancing = vertexShader ? instancedAttributes(mesh) : null;
+
+          for (let instance = 0; instance < (instancing?.count ?? 1); instance++) {
+            const reader = new VertexReader(mesh, material, context, instancing?.names, instance);
+
+            for (let v = start; v + 2 < end; v += 3) {
+              const a = reader.corner(at(v)), b = reader.corner(at(v + 1)), c = reader.corner(at(v + 2));
+
+              if (a && b && c) writeTriangle(mirrored ? [a, c, b] : [a, b, c], entry);
+
+              if ((v - start) % (SLICE_TRIANGLES * 3) === 0 && v > start) yield* pause();
+            }
+          }
+
           continue;
         }
 
-        for (let instance = 0; instance < (instancing?.count ?? 1); instance++) {
-          const reader = instancing ? new VertexReader(mesh, material, context, instancing.names, instance) : vertices;
+        path = "general";
 
+        const vertices = new VertexReader(mesh, material, context);
+
+        if (mesh.primitive === "points") {
+          for (let v = start; v < end; v++)
+            for (const triangle of vertices.point(at(v))) writeTriangle(triangle, entry);
+
+          continue;
+        }
+
+        if (mesh.primitive === "sprite") {
           for (let v = start; v + 2 < end; v += 3) {
-            const a = reader.corner(at(v)), b = reader.corner(at(v + 1)), c = reader.corner(at(v + 2));
+            const a = vertices.corner(at(v)), b = vertices.corner(at(v + 1)), c = vertices.corner(at(v + 2));
 
-            if (!a || !b || !c) continue;
-
-            writeTriangle(mirrored ? [a, c, b] : [a, b, c], entry);
+            if (a && b && c) writeTriangle([a, b, c], entry);
           }
+
+          continue;
         }
 
-        continue;
-      }
+        // Lines: segments, a strip, or a strip that closes on itself.
+        const segments: [number, number][] = [];
 
-      if (mesh.primitive === "points") {
-        for (let v = start; v < end; v++)
-          for (const triangle of vertices.point(at(v))) writeTriangle(triangle, entry);
+        if (mesh.primitive === "lineSegments") {
+          for (let v = start; v + 1 < end; v += 2) segments.push([at(v), at(v + 1)]);
+        } else {
+          for (let v = start; v + 1 < end; v++) segments.push([at(v), at(v + 1)]);
 
-        continue;
-      }
-
-      if (mesh.primitive === "sprite") {
-        for (let v = start; v + 2 < end; v += 3) {
-          const a = vertices.corner(at(v)), b = vertices.corner(at(v + 1)), c = vertices.corner(at(v + 2));
-
-          if (a && b && c) writeTriangle([a, b, c], entry);
+          if (mesh.primitive === "lineLoop" && end - start > 2) segments.push([at(end - 1), at(start)]);
         }
 
-        continue;
+        for (const [a, b] of segments)
+          for (const triangle of vertices.segment(a, b)) writeTriangle(triangle, entry);
       }
-
-      // Lines: segments, a strip, or a strip that closes on itself.
-      const segments: [number, number][] = [];
-
-      if (mesh.primitive === "lineSegments") {
-        for (let v = start; v + 1 < end; v += 2) segments.push([at(v), at(v + 1)]);
-      } else {
-        for (let v = start; v + 1 < end; v++) segments.push([at(v), at(v + 1)]);
-
-        if (mesh.primitive === "lineLoop" && end - start > 2) segments.push([at(end - 1), at(start)]);
-      }
-
-      for (const [a, b] of segments)
-        for (const triangle of vertices.segment(a, b)) writeTriangle(triangle, entry);
     }
+
+    meshMs += performance.now() - segment;
+    settings.onMesh?.({
+      mesh: meshIndex,
+      path,
+      triangles: triangleMaterials.length + instanced - before,
+      ms: meshMs,
+    });
+
+    yield* pause();
   }
 
   const properties = entries.map(entry => entry.properties);
+  const sceneTriangles = triangleMaterials.length;
+  const prototypeTriangles = prototypeGroups.length;
+  const allCorners = new Uint32Array((sceneTriangles + prototypeTriangles) * 3);
+
+  allCorners.set(corners.view(), 0);
+  allCorners.set(prototypeCorners.view(), sceneTriangles * 3);
 
   return {
     positions: positions.view(),
+    corners: allCorners,
     normals: normals.view(),
     uvs: uvs.view(),
     colors: colors.view(),
+    vertexCount,
     varyings: varyings.view(),
-    materials: new Uint32Array(triangleMaterials),
-    triangleCount: triangleMaterials.length,
+    materials: triangleMaterials.view(),
+    triangleCount: sceneTriangles,
+    instancing: instances.length
+      ? packedInstancing(prototypePositions.view(), prototypes, instances, sceneTriangles, instanceMaterials.view())
+      : null,
     materialColors: new Float32Array(properties.flatMap(m => [...m.color, m.opacity])),
     // Only a lit or plainly emissive surface is a light: a shader's colour is not known until it runs. An unlit
     // material of a fixed colour emits that colour, so it is one too.
@@ -540,6 +787,150 @@ export function packGeometry(
   };
 }
 
+/** Where a run of plain triangles goes: their positions, their vertices, and a number each. */
+interface TriangleSink {
+  positions: FloatStream;
+  corners: UintStream;
+  tags: UintStream;
+}
+
+/** The instances, numbered after the scene's own triangles, with their prototypes and the box around them all. */
+function packedInstancing(positions: Float32Array, prototypes: Prototype[], instances: Instance[],
+  sceneTriangles: number, materials: Uint32Array): PackedInstancing {
+  const boxes = prototypes.map(prototype => trianglesBox(positions, prototype.first, prototype.count));
+  const low = [Infinity, Infinity, Infinity], high = [-Infinity, -Infinity, -Infinity];
+
+  for (const instance of instances) {
+    const box = transformBox(instance.matrix, boxes[instance.prototype].low, boxes[instance.prototype].high);
+
+    for (let axis = 0; axis < 3; axis++) {
+      low[axis] = Math.min(low[axis], box.low[axis]);
+      high[axis] = Math.max(high[axis], box.high[axis]);
+    }
+  }
+
+  return {
+    positions,
+    triangleCount: positions.length / 9,
+    prototypes,
+    instances: instances.map(instance => ({ ...instance, firstTriangle: sceneTriangles + instance.firstTriangle })),
+    materials,
+    bounds: { low, high },
+  };
+}
+
+/**
+ * Whether a material can be shared by instances: nothing about it is read triangle by triangle on the CPU (lights,
+ * windows, volumes, grass) or tied to one mesh (shaders, object space normal maps, displacement).
+ */
+function plainMaterial(material: SerializedMaterial | undefined, textures: ReadonlyMap<string, number>,
+  programs: ShaderPrograms | undefined): boolean {
+  if (!material) return true;
+  if (programs?.fragment(material) || programs?.vertex(material)) return false;
+  if (material.values?.normalMapType === 1 || material.maps?.displacementMap) return false;
+
+  const p = materialProperties(material, textures);
+
+  if (p.kind === MATERIAL_KIND.shader || (p.flags & (MATERIAL_UNLIT_LIGHT | MATERIAL_VOLUME)) !== 0) return false;
+  if ((p.emissive[0] + p.emissive[1] + p.emissive[2]) * p.emissiveIntensity > 0) return false;
+  if (p.transmission > 0 && p.thickness <= 0) return false;
+
+  return !p.grass;
+}
+
+/**
+ * The meshes whose geometry another mesh repeats, each with the key its copies share. Meshes are first set apart by
+ * their sizes, which is free, and only those that still have a match are hashed.
+ */
+function repeatedGeometry(meshes: readonly SerializedMesh[],
+  plain: (material: SerializedMaterial | undefined) => boolean): Map<SerializedMesh, string> {
+  const plainOf = new Map<SerializedMaterial | undefined, boolean>();
+
+  const isPlain = (material: SerializedMaterial | undefined) => {
+    let known = plainOf.get(material);
+
+    if (known === undefined) plainOf.set(material, known = plain(material));
+
+    return known;
+  };
+
+  const bySize = new Map<string, { mesh: SerializedMesh; visible: string }[]>();
+
+  for (const mesh of meshes) {
+    if (mesh.primitive || !instanceable(mesh.matrixWorld) || triangleCountOf(mesh) < INSTANCE_MIN_TRIANGLES) continue;
+
+    let visible = "";
+    let usable = true;
+
+    for (const group of groupsOf(mesh)) {
+      const material = mesh.materials[group.materialIndex] ?? mesh.materials[0];
+      const shown = isMaterialVisible(material);
+
+      visible += shown ? "1" : "0";
+
+      if (shown && !isPlain(material)) usable = false;
+    }
+
+    if (!usable) continue;
+
+    const size = `${mesh.attributes.position.data.length}|${mesh.index?.length ?? -1}|${mesh.groups.length}|${visible}`;
+    const bucket = bySize.get(size);
+
+    if (bucket) bucket.push({ mesh, visible });
+    else bySize.set(size, [{ mesh, visible }]);
+  }
+
+  const byKey = new Map<string, SerializedMesh[]>();
+
+  for (const bucket of bySize.values()) {
+    if (bucket.length < 2) continue;
+
+    for (const { mesh, visible } of bucket) {
+      const key = geometryKey(mesh, visible);
+      const same = byKey.get(key);
+
+      if (same) same.push(mesh);
+      else byKey.set(key, [mesh]);
+    }
+  }
+
+  const repeated = new Map<SerializedMesh, string>();
+
+  for (const [key, same] of byKey) if (same.length > 1) for (const mesh of same) repeated.set(mesh, key);
+
+  return repeated;
+}
+
+/** The three vertex numbers of a stored triangle. */
+export function triangleVertices(geometry: PackedGeometry, triangle: number): [number, number, number] {
+  const at = triangle * 3;
+
+  return [geometry.corners[at], geometry.corners[at + 1], geometry.corners[at + 2]];
+}
+
+/** The normal at one corner of a stored triangle. */
+export function cornerNormal(geometry: PackedGeometry, triangle: number, corner: number): number[] {
+  const vertex = geometry.corners[triangle * 3 + corner];
+
+  return Array.from(geometry.normals.subarray(vertex * 3, vertex * 3 + 3));
+}
+
+/** The two UV sets at one corner of a stored triangle, four numbers. */
+export function cornerUvs(geometry: PackedGeometry, triangle: number, corner: number): number[] {
+  const vertex = geometry.corners[triangle * 3 + corner];
+
+  return Array.from(geometry.uvs.subarray(vertex * 4, vertex * 4 + 4));
+}
+
+/** The colour at one corner of a stored triangle, RGBA, or empty when the scene has no vertex colours. */
+export function cornerColor(geometry: PackedGeometry, triangle: number, corner: number): number[] {
+  if (!geometry.colors.length) return [];
+
+  const vertex = geometry.corners[triangle * 3 + corner];
+
+  return Array.from(geometry.colors.subarray(vertex * 4, vertex * 4 + 4));
+}
+
 /** A plain mesh's vertices in world space, read lazily: only the ones some triangle uses are transformed. */
 interface PlainVertices {
   mesh: SerializedMesh;
@@ -552,9 +943,11 @@ interface PlainVertices {
   color: Float32Array;
   /** Whether the vertex exists and has a finite position, transforming it on first use. */
   valid(index: number): boolean;
+  /** The packed vertex each one became, or -1 before a triangle uses it. */
+  ids: Int32Array;
 }
 
-function plainVertices(mesh: SerializedMesh): PlainVertices {
+function plainVertices(mesh: SerializedMesh, matrixWorld: readonly number[] = mesh.matrixWorld): PlainVertices {
   const position = mesh.attributes.position;
   const count = Math.floor(position.data.length / Math.max(1, position.itemSize));
   const world = new Float32Array(count * 3);
@@ -564,8 +957,8 @@ function plainVertices(mesh: SerializedMesh): PlainVertices {
   const color = new Float32Array(count * 4);
   // 0 not read yet, 1 usable, 2 refused.
   const state = new Uint8Array(count);
-  const rotation = normalMatrix(mesh.matrixWorld);
-  const matrix = mesh.matrixWorld as number[];
+  const rotation = normalMatrix(matrixWorld);
+  const matrix = matrixWorld as number[];
   const { normal: normals, uv: uv0, uv1, color: colors } = mesh.attributes;
 
   /** Component `c` of a vertex, as the reader's `Array.from(subarray(...))[c]` would see it. */
@@ -621,6 +1014,7 @@ function plainVertices(mesh: SerializedMesh): PlainVertices {
     hasNormal,
     uv,
     color,
+    ids: new Int32Array(count).fill(-1),
     valid(vertex: number) {
       if (!(vertex >= 0 && vertex < count)) return false;
 

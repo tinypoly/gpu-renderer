@@ -1,17 +1,19 @@
-import type { PackedBvh } from "./bvh.js";
 import type { PackedGeometry } from "./geometry.js";
 import { packLights, type PackedLights } from "./lights.js";
 import { MATERIAL_WORDS, materialProperties, writeMaterial } from "./materialLayout.js";
-import { NO_TEXTURE, packTextures, type PackedTextures } from "./texturePack.js";
+import { NO_TEXTURE, packTextures, type PackedTextures, type TextureUpload } from "./texturePack.js";
 import type { PackedEnvironment } from "./environment.js";
 
 /** Bytes each buffer of a scene takes on the device. Computed without a device, so a host can check it up front. */
 export interface SceneByteLength {
   positions: number;
   materials: number;
-  /** Vertex normals, the UV sets, vertex colours and shader varyings, in one buffer. */
+  /** The UV sets, vertex colours and shader varyings, in one buffer. */
   attributes: number;
-  /** One material index per triangle, then the hierarchy's triangle order and its inverse, in one buffer. */
+  /**
+   * One material index per triangle, the hierarchy's triangle order and its inverse, the instance of every instanced
+   * triangle, the three vertices of every stored one and the vertices' normals, in one buffer.
+   */
   indices: number;
   nodes: number;
   lights: number;
@@ -39,7 +41,14 @@ export interface SceneBuffers {
   orderOffset: number;
   /** Where each triangle's position in the leaf order starts inside `indices`. */
   leafOffset: number;
+  /** Where the instance of every instanced triangle, the corners and the normals start inside `indices`. */
+  instanceOffset: number;
+  cornerOffset: number;
+  normalOffset: number;
+  /** Every triangle a hit can name: the scene's own, then each instance's. */
   triangleCount: number;
+  /** The scene's own triangles, which lead the numbering. */
+  sceneTriangles: number;
   /** Everything the integrator can aim a shadow ray at. */
   lightCount: number;
   /** How many of those are emissive triangles, which lead the buffer. */
@@ -79,23 +88,39 @@ const MINIMUM = Math.max(64, MATERIAL_WORDS * 4);
 
 const sized = (bytes: number) => Math.max(MINIMUM, bytes);
 
+/** What a scene's hierarchy hands the upload: its nodes, and the stored triangle at each position of its leaf order. */
+export interface UploadHierarchy {
+  nodes: ArrayBuffer;
+  order: Uint32Array;
+}
+
 const attributeBytes = (geometry: PackedGeometry) =>
-  geometry.normals.byteLength + geometry.uvs.byteLength + (geometry.colors?.byteLength ?? 0)
-  + (geometry.varyings?.byteLength ?? 0);
+  geometry.uvs.byteLength + (geometry.colors?.byteLength ?? 0) + (geometry.varyings?.byteLength ?? 0);
+
+/** Triangles a hit can name, and the ones stored: the scene's own and every prototype's. */
+function triangleCounts(geometry: PackedGeometry) {
+  const instanced = geometry.instancing?.materials.length ?? 0;
+  const stored = geometry.triangleCount + (geometry.instancing?.triangleCount ?? 0);
+
+  return { instanced, stored, named: geometry.triangleCount + instanced };
+}
 
 export function sceneByteLength(
   geometry: PackedGeometry,
-  bvh: PackedBvh,
+  bvh: UploadHierarchy,
   lights: PackedLights = packLights(geometry),
-  textures: Pick<PackedTextures, "data"> = { data: new Uint32Array(4) }): SceneByteLength {
+  textures: Pick<PackedTextures, "data"> | Pick<TextureUpload, "byteLength"> = { data: new Uint32Array(4) }): SceneByteLength {
+  const { instanced, stored, named } = triangleCounts(geometry);
+
   const lengths = {
-    positions: sized(geometry.positions.byteLength),
+    positions: sized(stored * 36),
     attributes: sized(attributeBytes(geometry)),
-    indices: sized(geometry.materials.byteLength + 2 * bvh.order.byteLength),
+    // Materials of every named triangle, the order both ways, each instanced one's instance, corners and normals.
+    indices: sized((named + 2 * stored + instanced + 3 * stored + geometry.vertexCount) * 4),
     materials: sized(Math.max(1, geometry.materialCount) * MATERIAL_WORDS * 4),
     nodes: sized(bvh.nodes.byteLength),
     lights: sized(lights.entries.byteLength),
-    textures: sized(textures.data.byteLength),
+    textures: sized("data" in textures ? textures.data.byteLength : textures.byteLength),
   };
 
   const values = Object.values(lengths);
@@ -105,6 +130,54 @@ export function sceneByteLength(
     total: values.reduce((sum, value) => sum + value, 0),
     largest: Math.max(...values),
   };
+}
+
+/** A unit normal in two signed 16 bit halves of one word, folded onto an octahedron; zero is kept apart as NO_NORMAL. */
+export const NO_NORMAL = 0x80008000;
+
+export function octahedralNormal(x: number, y: number, z: number): number {
+  const length = Math.abs(x) + Math.abs(y) + Math.abs(z);
+
+  if (!(length > 0) || !Number.isFinite(length)) return NO_NORMAL;
+
+  let u = x / length, v = y / length;
+
+  if (z < 0) {
+    const fu = (1 - Math.abs(v)) * (u >= 0 ? 1 : -1);
+
+    v = (1 - Math.abs(u)) * (v >= 0 ? 1 : -1);
+    u = fu;
+  }
+
+  const qu = Math.round(Math.min(1, Math.max(-1, u)) * 32767);
+  const qv = Math.round(Math.min(1, Math.max(-1, v)) * 32767);
+
+  return ((qu & 0xffff) | ((qv & 0xffff) << 16)) >>> 0;
+}
+
+/** Every vertex normal, folded into one word each. */
+function encodedNormals(geometry: PackedGeometry): Uint32Array {
+  const words = new Uint32Array(geometry.vertexCount);
+  const n = geometry.normals;
+
+  for (let vertex = 0; vertex < geometry.vertexCount; vertex++)
+    words[vertex] = octahedralNormal(n[vertex * 3], n[vertex * 3 + 1], n[vertex * 3 + 2]);
+
+  return words;
+}
+
+/** The instance every instanced triangle belongs to, in the order they are numbered. */
+function instanceOfTriangles(geometry: PackedGeometry): Uint32Array {
+  const instancing = geometry.instancing;
+  const words = new Uint32Array(instancing?.materials.length ?? 0);
+
+  instancing?.instances.forEach((instance, k) => {
+    const from = instance.firstTriangle - geometry.triangleCount;
+
+    words.fill(k, from, from + instancing.prototypes[instance.prototype].count);
+  });
+
+  return words;
 }
 
 /** Materials as the shader reads them: one `Material` struct each, laid out by `materialLayout.ts`. */
@@ -127,17 +200,23 @@ export function environmentPower(environment: PackedEnvironment | null): number 
 
 /**
  * The positions in the hierarchy's leaf order, which is the order its traversal reads them in, so a leaf is one run of
- * the buffer; and where each triangle went, for everything that reads a triangle by its own number.
+ * the buffer; and where each stored triangle went, for everything that reads a triangle by its own number. A stored
+ * triangle past the scene's own is a prototype's, in object space.
  */
 export function leafOrder(
-  positions: Float32Array, order: Uint32Array): { positions: Float32Array; inverse: Uint32Array } {
+  geometry: Pick<PackedGeometry, "positions" | "triangleCount" | "instancing">,
+  order: Uint32Array): { positions: Float32Array; inverse: Uint32Array } {
   const ordered = new Float32Array(order.length * 9);
   const inverse = new Uint32Array(order.length);
+  const scene = geometry.triangleCount;
+  const prototypes = geometry.instancing?.positions ?? new Float32Array(0);
 
   for (let at = 0; at < order.length; at++) {
     const triangle = order[at];
+    const source = triangle < scene ? geometry.positions : prototypes;
+    const from = (triangle < scene ? triangle : triangle - scene) * 9;
 
-    ordered.set(positions.subarray(triangle * 9, triangle * 9 + 9), at * 9);
+    ordered.set(source.subarray(from, from + 9), at * 9);
     inverse[triangle] = at;
   }
 
@@ -147,18 +226,18 @@ export function leafOrder(
 export function uploadScene(
   device: GPUDevice,
   geometry: PackedGeometry,
-  bvh: PackedBvh,
-  textures: PackedTextures = packTextures({ meshes: [], lights: [], textures: [] }),
+  bvh: UploadHierarchy,
+  textures: PackedTextures | TextureUpload = packTextures({ meshes: [], lights: [], textures: [] }),
   lights: PackedLights = packLights(geometry),
   environment: PackedEnvironment | null = null,
   environmentCdf = textures.extraOffset): SceneBuffers {
   const lengths = sceneByteLength(geometry, bvh, lights, textures);
 
-  const create = (size: number): GPUBuffer =>
-    device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const create = (size: number, label: string): GPUBuffer =>
+    device.createBuffer({ label: `scene ${label}`, size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
 
-  const write = (data: ArrayBufferView, size: number): GPUBuffer => {
-    const buffer = create(size);
+  const write = (data: ArrayBufferView, size: number, label: string): GPUBuffer => {
+    const buffer = create(size, label);
 
     device.queue.writeBuffer(buffer, 0, data);
 
@@ -166,8 +245,8 @@ export function uploadScene(
   };
 
   /** Arrays of the same kind, one after the other, so they cost one binding between them. */
-  const join = (parts: ArrayBufferView[], size: number): GPUBuffer => {
-    const buffer = create(size);
+  const join = (parts: ArrayBufferView[], size: number, label: string): GPUBuffer => {
+    const buffer = create(size, label);
     let offset = 0;
 
     for (const part of parts) {
@@ -181,28 +260,52 @@ export function uploadScene(
 
   const colors = geometry.colors ?? new Float32Array(0);
   const varyings = geometry.varyings ?? new Float32Array(0);
-  const leaves = leafOrder(geometry.positions, bvh.order);
+  const leaves = leafOrder(geometry, bvh.order);
+  const { instanced, stored, named } = triangleCounts(geometry);
+  const instanceOf = instanceOfTriangles(geometry);
+  const orderOffset = named;
+  const leafOffset = orderOffset + stored;
+  const instanceOffset = leafOffset + stored;
+  const cornerOffset = instanceOffset + instanced;
+  const normalOffset = cornerOffset + 3 * stored;
+
+  const texturesBuffer = create(lengths.textures, "textures");
+
+  if ("write" in textures) textures.write(device, texturesBuffer);
+  else device.queue.writeBuffer(texturesBuffer, 0, textures.data);
 
   const buffers = {
-    positions: write(leaves.positions, lengths.positions),
-    attributes: join([geometry.normals, geometry.uvs, colors, varyings], lengths.attributes),
-    indices: join([geometry.materials, bvh.order, leaves.inverse], lengths.indices),
-    materials: write(new Uint8Array(packMaterials(geometry)), lengths.materials),
-    nodes: write(new Uint8Array(bvh.nodes), lengths.nodes),
-    lights: write(new Uint8Array(lights.entries), lengths.lights),
-    textures: write(textures.data, lengths.textures),
+    positions: write(leaves.positions, lengths.positions, "positions"),
+    attributes: join([geometry.uvs, colors, varyings], lengths.attributes, "attributes"),
+    indices: join([
+      geometry.materials,
+      geometry.instancing?.materials ?? new Uint32Array(0),
+      bvh.order,
+      leaves.inverse,
+      instanceOf,
+      geometry.corners,
+      encodedNormals(geometry),
+    ], lengths.indices, "indices"),
+    materials: write(new Uint8Array(packMaterials(geometry)), lengths.materials, "materials"),
+    nodes: write(new Uint8Array(bvh.nodes), lengths.nodes, "bvh nodes"),
+    lights: write(new Uint8Array(lights.entries), lengths.lights, "lights"),
+    textures: texturesBuffer,
   };
 
   return {
     bytes: lengths,
     ...buffers,
-    uvOffset: geometry.normals.length,
-    colorOffset: geometry.normals.length + geometry.uvs.length,
-    varyingOffset: geometry.normals.length + geometry.uvs.length + colors.length,
+    uvOffset: 0,
+    colorOffset: geometry.uvs.length,
+    varyingOffset: geometry.uvs.length + colors.length,
     hasColors: colors.length > 0,
-    orderOffset: geometry.materials.length,
-    leafOffset: geometry.materials.length + bvh.order.length,
-    triangleCount: geometry.triangleCount,
+    orderOffset,
+    leafOffset,
+    instanceOffset,
+    cornerOffset,
+    normalOffset,
+    triangleCount: named,
+    sceneTriangles: geometry.triangleCount,
     lightCount: lights.count,
     areaLightCount: lights.areaCount,
     lightCdf: lights.cdfAt,

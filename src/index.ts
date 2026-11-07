@@ -5,6 +5,7 @@ export { isWebGpuAvailable, requestRenderDevice, requestWebGpuSupport } from "./
 export type { RenderDevice, RenderDeviceOptions, WebGpuSupport } from "./device.js";
 
 export { GpuRenderer, isAbortError } from "./renderer.js";
+export { deviceMemory, setMemoryLogging } from "./memoryProbe.js";
 
 export type {
   GpuRendererEvents,

@@ -27,11 +27,14 @@ stay the algorithmic reference, line by line.
 
 - `device.ts`: adapter and device acquisition, requested limits, loss handling.
 - `camera.ts`: the camera's matrices. Every ray goes through the inverse of the camera's own projection.
-- `geometry.ts`, `bvh.ts`: flat triangle and attribute buffers, and the BVH: built as a binary tree, then laid out in
+- `geometry.ts`, `bvh.ts`: the triangle and vertex buffers, and the BVH: built as a binary tree, then laid out in
   64 byte nodes that each hold their two children's boxes, so one read tests both and a leaf is never read. Packing
   also builds what Three draws in screen space (points, lines, sprites, dashes) as triangles facing the camera, applies
   displacement maps, and runs vertex shaders. A plain mesh, with no vertex shader and no displacement, takes a faster
-  path that transforms each vertex once into typed arrays and writes exactly what the general one would.
+  path that transforms each vertex once into typed arrays and writes exactly what the general one would. Packing is a
+  generator: `packGeometry` runs it at once, `packGeometrySliced` hands the page its thread back every few
+  milliseconds, which is what the renderer uses.
+- `instancing.ts`: repeated geometry kept once, and the tree over the instances (see below).
 - `bvhBuilder.ts`, `bvhWorker.ts`: the BVH built in a Web Worker from a copy of the positions, for scenes of at least
   `BVH_WORKER_MIN_TRIANGLES`; on the main thread below that, when `bvhWorker` is false, or for good once the worker
   fails to start or load.
@@ -58,18 +61,51 @@ later rewrites the scheduler, not the BRDFs. The signal to revisit: a kernel pas
 falling off a cliff when a lobe is added.
 
 **Arrays of the same kind share a binding.** A WebGPU device only has to offer eight storage buffers per shader stage,
-and the kernel wants eleven arrays. Normals and the UV sets go in one buffer, the per-triangle material indices and the
-hierarchy's triangle order (both ways) in another, and the lookup tables and the texture table sit in front of the
-texels they point at, with the uniform saying where each second half begins. The positions are uploaded in the
+and the kernel wants more arrays than that. The UV sets and the vertex colours go in one buffer; every word that is an
+index in another: the per-triangle material indices, the hierarchy's triangle order (both ways), the instance of each
+instanced triangle, the three vertices of each triangle and the vertices' folded normals, which are bit patterns that a
+float buffer could flush or canonicalize on some drivers. The lookup tables and the texture table sit in front of the
+texels they point at, with the uniform saying where each part begins. The positions are uploaded in the
 hierarchy's leaf order, so a leaf is one run of the buffer; anything that reads a triangle by its own number goes through
 the inverse order. Positions, materials, nodes, lights and the accumulation buffer keep their own.
 Merging costs a scene some headroom against `maxStorageBufferBindingSize`, which is why positions stay separate: they are
 the largest array and the hottest one.
 
+**The traversal reads triangles, shading reads vertices.** Positions stay nine floats a triangle in leaf order, so a
+leaf is one run of the buffer and the hottest loop of the kernel has no indirection. Everything else a hit reads
+(normals, UVs, colours) is read once per hit, so it is kept per vertex, and each triangle names its three vertices: a
+smooth mesh shares almost every vertex between six triangles, and the attributes shrink to about a sixth. A normal is
+folded onto an octahedron in two signed 16 bit halves, within a hundredth of a degree. UVs stay 32 bit floats: a tiled
+texture's coordinates run into the tens, where half floats would be off by whole texels.
+
+**Repeated geometry is kept once.** A mesh whose triangles another mesh repeats exactly (positions, normals, UVs,
+colours, index and groups, compared by a hash of their contents) becomes an instance of one prototype, stored in object
+space with a hierarchy of its own; each copy keeps its transform and the material of each of its triangles, so copies
+may differ in material. A tree over the instances' boxes sits beside the scene's own under node zero, and a leaf of it
+(count -1) links to an instance: the traversal takes the ray into the instance's space and goes on in its prototype's
+hierarchy, with a marker on the stack that brings it back. The distance along the ray is the same in both spaces, since
+the direction is transformed and not normalized. A hit names a triangle as before, numbered after the scene's own, so
+every reader keeps its `triangle` argument and resolves it once: `instanceOf`, then the stored triangle it repeats.
+
+- **What stays flat.** Lights, windows, volumes and grass are found on the CPU among the scene's own triangles, and a
+  shader, an object space normal map or a displacement map is tied to one mesh; points, lines, sprites and vertex
+  shaders depend on the camera. A mirrored transform, a projective one, or a mesh of fewer than 256 triangles is copied
+  as well, the last because entering an instance costs more than its triangles.
+- **Compiled in only where a scene has them**, as `INSTANCES`, which also doubles the traversal stack: the instances'
+  tree is split at the median, so its depth is the logarithm of their count, and a prototype's is capped as the scene's
+  is. Planar captures trace with the kernel the main scene was compiled with, so they pack instances only when it does.
+- `InstancedMesh`, which the snapshot expands to one mesh per instance sharing the same arrays, becomes instances again
+  here.
+
 **Textures in a storage buffer, sampled by hand.** Core WebGPU has no binding arrays, and `texture_2d_array` demands one
 size and one format for every layer, which the scene snapshot does not provide (arbitrary sizes, per texture wrap and UV
-matrix, authored mipmaps). Compute shaders have no implicit derivatives either, so the level of detail is computed by
-hand regardless and half of a hardware sampler's advantage disappears. A fast path can add `texture_2d_array` later, for
+matrix, authored mipmaps). The buffer is written to the device a piece at a time, each texture straight from the
+snapshot, so the page never assembles a copy of every texel only to hand it over. A byte texture read through one channel
+alone, which is what every reference to it being a map slot that reads that channel means (a roughness or a bump map),
+keeps that channel, four texels to a word, and the shader hands it back in every channel; one named anywhere else, by a
+light, a shader's uniforms or a planar capture, keeps all four. Compute shaders have no implicit
+derivatives either, so the level of detail is computed by hand regardless and half of a hardware sampler's advantage
+disappears. A fast path can add `texture_2d_array` later, for
 scenes where every texture happens to be uniform.
 
 **WGSL lives in `src/wgsl/*.wgsl.ts`, as template literals.** The build is plain `tsc`, and `tsc` does not copy `.wgsl`
@@ -244,8 +280,9 @@ this table is the only way to know.
 
 | Works | Notes |
 | --- | --- |
-| Triangle meshes, transformed to world space | Every triangle carries its own three vertices |
-| `InstancedMesh`, with `instanceColor` | The scene snapshot expands it to one mesh per instance |
+| Triangle meshes, transformed to world space | Every triangle carries its own three positions; shading attributes are per vertex |
+| Repeated meshes | Kept once, as instances of a prototype, when nothing about them is read triangle by triangle |
+| `InstancedMesh`, with `instanceColor` | The scene snapshot expands it to one mesh per instance; those become instances again |
 | `SkinnedMesh`, morph targets | The snapshot bakes the deformed positions |
 | Per-group materials, indexed or not, `drawRange` | |
 | Vertex normals, or a face normal when absent; `flatShading` | |
@@ -418,7 +455,8 @@ packing, buffer layouts and alignment, the scheduler's feedback loop, and the up
 renderer. `kernel.test.ts` validates the whole kernel with naga, with translated shaders of every kind in it, so a WGSL
 mistake fails in CI rather than on a device. The hierarchy is checked against
 brute force over every triangle, with a traversal in the test file that mirrors the WGSL one step for step, so a packing
-mistake fails here instead of on a device where nothing can be printed.
+mistake fails here instead of on a device where nothing can be printed. Instances are checked the same way, over the
+very buffers `uploadScene` writes, against the same scene packed flat.
 
 GPU suites are named `*.gpu.test.ts` and skip themselves when no adapter is available. They exist to catch WGSL that does
 not compile, which is the most common and most tedious error to find in a browser.

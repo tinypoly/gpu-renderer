@@ -274,16 +274,18 @@ The renderer reads the CPU renderer's optional settings from `userData.cpuRender
 light.userData.cpuRenderer = { volumetric: { density: 0.05 } };
 ```
 
-Two more on materials, which only this renderer reads:
+More on materials, which only this renderer reads:
 
 - **`subsurface`** (standard and physical materials): light enters the material and leaves it somewhere else, by a random walk inside it, as skin, wax, marble and milk do. `true` takes Blender's defaults. The material's colour, maps included, is what the medium reflects in all; `radius` is how far red, green and blue travel inside, as multiples of `scale` in scene units; `weight` is the share of the diffuse layer that scatters inside; `anisotropy` the phase function's.
 - **`bevel`** (lit materials): a radius in scene units, over which the shading normal turns from one face to the next, as Cycles' bevel node rounds edges without changing the geometry. Sharp CG corners catch light like real, slightly rounded ones. The normal map still applies.
+- **`water`** (physical materials with `transmission` and `thickness`, whose mesh bounds the water): the surface that faces up or down ripples with waves of its own, read only as a normal, so the geometry stays flat; and what lies under the water gets the sun's caustics through those waves, by manifold next event estimation: a few Newton steps find where the refraction sends the light of a directional light to each point, and the spread of the refracted beam there sets how much arrives. `true` takes the defaults; `waveHeight` and `waveLength` are those of the longest wave, in scene units (`0.006` and `0.9`, a pool in a breeze), `wind` the direction the waves travel to, in radians, and `seed` changes their arrangement. Give the water its colour with `attenuationColor` and `attenuationDistance`, and let the sun cast shadows: the caustics replace the straight shadow ray the water blocks.
 - **`volume`** (any material): the mesh only bounds a medium, which scatters and absorbs light in the space it encloses: fog, smoke, a beam of sunlight through dust, murky water. Its surface is invisible. `density` is per scene unit, `color` what each scattering keeps (white for fog, dark for soot), `anisotropy` how forward it scatters (about `0.7` for haze). The mesh has to be closed, with its normals out; the camera may stand inside one, and objects inside are lit through it.
 
 ```ts
 skin.userData.cpuRenderer = { subsurface: { radius: [1, 0.4, 0.25], scale: 0.01 } };
 table.userData.cpuRenderer = { bevel: 0.003 };
 haze.material.userData.cpuRenderer = { volume: { density: 0.05, color: "#ffffff", anisotropy: 0.6 } };
+pool.material.userData.cpuRenderer = { water: { waveHeight: 0.006, waveLength: 0.9 } };
 ```
 
 ### Helpers
@@ -338,7 +340,7 @@ This is a path tracer, not Three.js or WebGL conformance, and not a match for th
 
 ## Development
 
-`pnpm dev` opens the example gallery, the same scenes as the CPU renderer's, traced here. `pnpm test` runs the CI gate, which needs no GPU; `pnpm verify` renders scenes with answers known on paper on a real GPU in headless Chrome; `pnpm capture:scenes` renders the gallery pictures with the example running. `pnpm verify --page divergence.html` measures what the megakernel loses to divergence: the same grid of spheres with one material at a time and with all of them mixed.
+`pnpm dev` opens the example gallery, the same scenes as the CPU renderer's, traced here. `pnpm test` runs the CI gate, which needs no GPU; `pnpm verify` renders scenes with answers known on paper on a real GPU in headless Chrome; `pnpm capture:scenes` renders the gallery pictures with the example running. `pnpm verify --page divergence.html` measures what the megakernel loses to divergence: the same grid of spheres with one material at a time and with all of them mixed. `pnpm verify --page water.html` checks the caustics: still water lets in the surface's share of the sun at any angle, and rippled water only moves that light around.
 
 ## License
 

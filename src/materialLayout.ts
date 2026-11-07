@@ -1,6 +1,7 @@
 import { layoutStruct, writeStruct, type StructField } from "./structLayout.js";
 import { grassOf, type GrassField } from "./grass.js";
 import { bevelOf, subsurfaceOf, volumeOf } from "./subsurface.js";
+import { waterOf, type WaterField } from "./water.js";
 import { NO_TEXTURE } from "./texturePack.js";
 import type { SerializedMaterial, UniformValue } from "./upstream.js";
 
@@ -80,6 +81,8 @@ export interface MaterialProperties {
    * rather than in the struct: see grass.ts.
    */
   grass?: GrassField | null;
+  /** The waves of a water surface, from `userData.cpuRenderer.water`: see water.ts. */
+  water?: WaterField | null;
   /** An index into the texture table per slot, or `NO_TEXTURE`. */
   maps: Record<MaterialMap, number>;
 }
@@ -170,6 +173,9 @@ export const MATERIAL_VOLUME = 8192;
  */
 export const MATERIAL_UNLIT_LIGHT = 16384;
 
+/** Water: the surface ripples with the waves of `water`, and the sun lights what is under it through them. */
+export const MATERIAL_WATER = 32768;
+
 /** What a material's `program` reads as when it has no shader. */
 export const NO_PROGRAM = 0xffffffff;
 
@@ -224,6 +230,7 @@ const FIELDS: StructField[] = [
   { name: "volume", type: "vec4f", doc: "rgb is the medium's single scattering albedo, w its density per scene unit." },
   { name: "volumeAnisotropy", type: "f32" },
   { name: "bevel", type: "f32", doc: "The radius edges are rounded over at shading time; zero leaves them sharp." },
+  { name: "water", type: "vec4f", doc: "Waves of a water surface: the longest one's height and length, the wind's angle and the seed." },
   { name: "normalRow0", type: "vec4f", doc: "The mesh's world normal matrix, for an object space normal map." },
   { name: "normalRow1", type: "vec4f" },
   { name: "normalRow2", type: "vec4f" },
@@ -303,6 +310,7 @@ export function materialProperties(
   const thickness = vector(values.iridescenceThicknessRange, [100, 400], 2);
   const medium = pbr ? subsurfaceOf(material) : null;
   const volume = volumeOf(material);
+  const water = waterOf(material);
 
   const maps = Object.fromEntries(MATERIAL_MAPS.map(slot => {
     const id = material?.maps?.[slot];
@@ -327,6 +335,7 @@ export function materialProperties(
     | (flag(values.alphaHash, false) ? MATERIAL_ALPHA_HASH : 0)
     | (physical ? MATERIAL_SPECULAR : 0)
     | (volume ? MATERIAL_VOLUME : 0)
+    | (water ? MATERIAL_WATER : 0)
     | (type === "MeshBasicMaterial" && !shader && !transparent && !flag(values.alphaHash, false)
       && !flag(values.wireframe, false) && number(values.blending, 1) === 1 && number(values.opacity, 1) >= 1
       && number(values.alphaTest, 0) <= 0 && maps.alphaMap === NO_TEXTURE && maps.envMap === NO_TEXTURE
@@ -383,6 +392,7 @@ export function materialProperties(
     volumeAnisotropy: volume?.anisotropy ?? 0,
     bevel: LIT.has(type) ? bevelOf(material) : 0,
     grass: LIT.has(type) ? grassOf(material) : null,
+    water,
     maps,
   };
 }
@@ -458,6 +468,7 @@ export function writeMaterial(
     volume: [...p.volumeAlbedo, p.volumeDensity],
     volumeAnisotropy: p.volumeAnisotropy,
     bevel: p.bevel,
+    water: p.water ? [p.water.waveHeight, p.water.waveLength, p.water.wind, p.water.seed] : [0, 1, 0, 0],
     normalRow0: [n[0], n[3], n[6], 0],
     normalRow1: [n[1], n[4], n[7], 0],
     normalRow2: [n[2], n[5], n[8], 0],

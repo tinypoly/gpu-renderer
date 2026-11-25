@@ -165,8 +165,8 @@ export const DEFAULT_GPU_RENDER_SETTINGS: Readonly<GpuRenderSettings> = Object.f
     glare: { enabled: true, intensity: 0.06, blades: 6, length: 0.25, rotation: 15 },
     lens: { chromaticAberration: 0.05, distortion: 0 },
     camera: {
-      contrast: 1, physicalExposure: false, autoExposure: false, exposureCompensation: 0, skyExposure: 0, darkAdaptation: 0,
-      iso: 100,
+      contrast: 1, physicalExposure: false, autoExposure: false, exposureCompensation: 0, skyExposure: 0,
+      darkAdaptation: 0, iso: 100,
       shutterSpeed: 1 / 125, whiteBalance: 6500,
     },
     subsurface: { enabled: true, depth: 2 },

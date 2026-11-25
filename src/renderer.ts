@@ -590,6 +590,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     if (this.displayLutBuffer) return this.displayLutBuffer;
 
     const data = this.displayLut?.data ?? new Float32Array(3);
+
     const buffer = device.createBuffer({
       label: "display table", size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
@@ -1701,7 +1702,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       grassEntries: target?.grassEntries ?? 0,
       cloudShape: clouds ? [clouds.coverage, clouds.density, clouds.scale, clouds.seed] : [0, 0, 1, 0],
       cloudLayer: clouds ? [clouds.altitude, clouds.thickness, clouds.detail, clouds.haze] : [0, 1, 0, 0],
-      cloudSun: [clouds ? clouds.sunUp : 1, clouds ? clouds.shadow : 0, clouds ? clouds.drift[0] : 0, clouds ? clouds.drift[1] : 0],
+      cloudSun: [clouds ? clouds.sunUp : 1, clouds ? clouds.shadow : 0, clouds ? clouds.drift[0] : 0,
+        clouds ? clouds.drift[1] : 0],
       cloudClock: [clouds ? clouds.time : 0, 0, 0, 0],
     };
   }
@@ -1750,7 +1752,10 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
   const renamed = new Map<Material, string>();
   // The snapshot keeps a material's name but not its media, so the name carries a mark to them.
   const named = new Map<Material, string>();
-  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown; translucency?: unknown }[] = [];
+
+  const media: {
+    subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown; translucency?: unknown;
+  }[] = [];
 
   scene.traverse(object => {
     const value = (object as Object3D & { material?: Material | Material[] }).material;
@@ -1764,7 +1769,10 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       }
 
       const data = material.userData?.cpuRenderer as
-        { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown; translucency?: unknown } | undefined;
+        {
+          subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown;
+          translucency?: unknown;
+        } | undefined;
 
       if (!named.has(material)
         && (subsurfaceMedium(data?.subsurface) || volumeMedium(data?.volume) || bevelRadius(data?.bevel) > 0
@@ -1791,7 +1799,8 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
 
   // Materials are shared between the meshes that use them, so each one is unmarked once and seen marked no more.
   for (const mesh of snapshot.meshes) {
-    type Carrier = SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial & WaterMaterial & TranslucencyMaterial;
+    type Carrier = SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial & WaterMaterial
+      & TranslucencyMaterial;
 
     for (const material of mesh.materials as Carrier[]) {
       const at = material.name.lastIndexOf(MEDIA_MARK);

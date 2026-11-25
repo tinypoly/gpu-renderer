@@ -174,7 +174,8 @@ function bladeReach(field: GrassField): number {
  * One blade: a spine curving away from its root as a quadratic, tapering to a point, with a slight twist. It leans away
  * from the middle of its clump, as grass grows.
  */
-function makeBlade(field: GrassField, next: () => number, x: number, z: number, lean: [number, number], clump: number): Blade {
+function makeBlade(field: GrassField, next: () => number, x: number, z: number, lean: [number, number],
+  clump: number): Blade {
   // Heights spread wide, with a few blades standing above the rest: a lawn evened out to one height reads as a carpet.
   const straggler = next() < 0.06;
   const height = field.height * (straggler ? 0.9 + 0.1 * next() : clump * (0.4 + 0.6 * next()));

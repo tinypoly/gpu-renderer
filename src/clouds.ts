@@ -41,6 +41,7 @@ const number = (value: UniformValue | undefined, fallback: number): number =>
 function driftOf(value: UniformValue | undefined): [number, number] {
   if (!Array.isArray(value) || value.length < 2) return [0, 0];
   const [x, z] = value as number[];
+
   return [Number.isFinite(x) ? x : 0, Number.isFinite(z) ? z : 0];
 }
 

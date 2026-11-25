@@ -17,11 +17,14 @@ struct Present {
   denoised: u32,
   // How much of AgX's Punchy look goes over its base curve.
   contrast: f32,
+  // The edge of the display table AgX reads, or 0 to use its analytic curve.
+  lutSize: u32,
 };
 
 @group(0) @binding(0) var<uniform> present: Present;
 @group(0) @binding(1) var<storage, read> accumulation: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> denoised: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> displayLut: array<f32>;
 
 @vertex
 fn vertexMain(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
@@ -46,7 +49,67 @@ fn toneMapAces(color: vec3<f32>) -> vec3<f32> {
   return fromAces * ((v * (v + 0.0245786) - 0.000090537) / (v * (0.983729 * v + 0.432951) + 0.238081));
 }
 
+fn lutTexel(r: u32, g: u32, b: u32) -> vec3<f32> {
+  let size = present.lutSize;
+  let at = (r + size * (g + size * b)) * 3u;
+
+  return vec3<f32>(displayLut[at], displayLut[at + 1u], displayLut[at + 2u]);
+}
+
+/** A display table, read as OpenColorIO reads it: E-Gamut log in, tetrahedral between its points, power 2.4 out. */
+fn toneMapLut(color: vec3<f32>) -> vec3<f32> {
+  let toEGamut = mat3x3<f32>(
+    vec3<f32>(0.55937111, 0.07622071, 0.06552671),
+    vec3<f32>(0.30478334, 0.78797179, 0.16454676),
+    vec3<f32>(0.13584556, 0.13580747, 0.76992649));
+  let wide = max(toEGamut * color, vec3<f32>(1e-12));
+  let x = clamp((log2(wide) + 12.47393) / 24.9999988117, vec3<f32>(0.0), vec3<f32>(1.0)) * f32(present.lutSize - 1u);
+  let i = min(vec3<u32>(x), vec3<u32>(present.lutSize - 2u));
+  let f = x - vec3<f32>(i);
+  let origin = lutTexel(i.x, i.y, i.z);
+  let far = lutTexel(i.x + 1u, i.y + 1u, i.z + 1u);
+  var first = vec3<u32>(1u, 0u, 0u);
+  var second = vec3<u32>(1u, 1u, 0u);
+  var weights = f;
+
+  if (f.x >= f.y) {
+    if (f.y < f.z) {
+      if (f.x >= f.z) {
+        second = vec3<u32>(1u, 0u, 1u);
+        weights = vec3<f32>(f.x, f.z, f.y);
+      } else {
+        first = vec3<u32>(0u, 0u, 1u);
+        second = vec3<u32>(1u, 0u, 1u);
+        weights = vec3<f32>(f.z, f.x, f.y);
+      }
+    }
+  } else if (f.x >= f.z) {
+    first = vec3<u32>(0u, 1u, 0u);
+    weights = vec3<f32>(f.y, f.x, f.z);
+  } else {
+    second = vec3<u32>(0u, 1u, 1u);
+
+    if (f.y >= f.z) {
+      first = vec3<u32>(0u, 1u, 0u);
+      weights = vec3<f32>(f.y, f.z, f.x);
+    } else {
+      first = vec3<u32>(0u, 0u, 1u);
+      weights = vec3<f32>(f.z, f.y, f.x);
+    }
+  }
+
+  let a = lutTexel(i.x + first.x, i.y + first.y, i.z + first.z);
+  let b = lutTexel(i.x + second.x, i.y + second.y, i.z + second.z);
+  let encoded = origin * (1.0 - weights.x) + a * (weights.x - weights.y) + b * (weights.y - weights.z) + far * weights.z;
+
+  return pow(clamp(encoded, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(2.4));
+}
+
 fn toneMapAgx(color: vec3<f32>) -> vec3<f32> {
+  if (present.lutSize > 0u) {
+    return toneMapLut(color);
+  }
+
   let toAgx = mat3x3<f32>(
     vec3<f32>(0.6274, 0.0691, 0.0164),
     vec3<f32>(0.3293, 0.9195, 0.088),

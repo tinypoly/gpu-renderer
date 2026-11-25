@@ -17,7 +17,7 @@ const WORKGROUP = 8;
  * It follows the image `render()` has always resolved: no grain, and the vignette measured from each pixel's corner.
  */
 export const IMAGE_RESOLVE_WGSL = /* wgsl */ `${PRESENT_WGSL}
-@group(0) @binding(3) var<storage, read_write> pixels: array<u32>;
+@group(0) @binding(4) var<storage, read_write> pixels: array<u32>;
 
 fn encodeByte(value: f32) -> u32 {
   return u32(round(clamp(value, 0.0, 1.0) * 255.0));
@@ -64,6 +64,9 @@ export interface ResolveSettings {
   vignette: number;
   contrast: number;
   transparent: boolean;
+  /** The display table AgX reads, and the length of its edge: 0 keeps the analytic curve. */
+  lut: GPUBuffer;
+  lutSize: number;
 }
 
 export class ImageResolvePass {
@@ -94,6 +97,7 @@ export class ImageResolvePass {
     integers[7] = settings.transparent ? 1 : 0;
     integers[8] = denoised ? 1 : 0;
     floats[9] = settings.contrast;
+    integers[10] = settings.lutSize;
     this.device.queue.writeBuffer(this.uniforms, 0, this.values);
 
     const bytes = width * height * 4;
@@ -111,7 +115,8 @@ export class ImageResolvePass {
           { binding: 0, resource: { buffer: this.uniforms } },
           { binding: 1, resource: { buffer: accumulation } },
           { binding: 2, resource: { buffer: denoised ?? accumulation } },
-          { binding: 3, resource: { buffer: output } },
+          { binding: 3, resource: { buffer: settings.lut } },
+          { binding: 4, resource: { buffer: output } },
         ],
       }));
       pass.dispatchWorkgroups(Math.ceil(width / WORKGROUP), Math.ceil(height / WORKGROUP));

@@ -149,6 +149,22 @@ export function bevelOf(material: SerializedMaterial | undefined): number {
   return bevelRadius((material as BevelMaterial | undefined)?.bevel);
 }
 
+/**
+ * How much of its diffuse light a thin surface lets through to its far side, from `userData.cpuRenderer.translucency`,
+ * `0` to `1`: a leaf, a petal, a paper lampshade. Light from behind then shows through it, a little yellower, and it
+ * reflects that much less. Unlike `subsurface` it needs no thickness, so it suits a single sided card.
+ */
+export type TranslucencyMaterial = SerializedMaterial & { translucency?: number };
+
+/** The share a translucency input asks for, or zero. */
+export function translucencyShare(input: unknown): number {
+  return typeof input === "number" && Number.isFinite(input) ? Math.min(1, Math.max(0, input)) : 0;
+}
+
+export function translucencyOf(material: SerializedMaterial | undefined): number {
+  return translucencyShare((material as TranslucencyMaterial | undefined)?.translucency);
+}
+
 export function volumeOf(material: SerializedMaterial | undefined): VolumeMedium | null {
   return volumeMedium((material as VolumeMaterial | undefined)?.volume);
 }

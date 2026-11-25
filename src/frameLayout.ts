@@ -84,6 +84,10 @@ export const FRAME_LAYOUT = layoutStruct("Frame", [
   { name: "grassShells", type: "u32", doc: "Where the hierarchy of the triangles that grow grass starts in the texture buffer, or GRASS_NONE." },
   { name: "grassEntries", type: "u32", doc: "Where those triangles' entries start in the texture buffer." },
   { name: "clipPlane", type: "vec4f", doc: "A plane the camera ray drops surfaces behind, for planar captures; w = 0 and xyz = 0 is none." },
+  { name: "cloudShape", type: "vec4f", doc: "A path traced cloud layer: coverage (0 is none), density, size and pattern." },
+  { name: "cloudLayer", type: "vec4f", doc: "Its base altitude and thickness in kilometres, edge detail, and haze per kilometre." },
+  { name: "cloudSun", type: "vec4f", doc: "x is how far the sun is up, from 0 at night, when the brightest light is the moon, to 1; y is how much the clouds shade it; zw how far the wind has carried them, in kilometres along X and Z." },
+  { name: "cloudClock", type: "vec4f", doc: "x is the hours the clouds have lived since noon: they boil, are born and dissolve with it." },
 ]);
 
 export const FRAME_WORDS = FRAME_LAYOUT.words;

@@ -52,6 +52,8 @@ struct Lens {
   darkAdaptation: f32,
   // The exposure applied after the lens, the meter's aside, which the rays are limited against.
   exposure: f32,
+  // The fixed exposure of a day, the same indoors and out, or 0 to let the meter decide.
+  skyExposure: f32,
 };
 
 const PI: f32 = 3.14159265358979;
@@ -74,6 +76,9 @@ const GLARE_CEILING: f32 = 4.0;
 @group(0) @binding(6) var<storage, read_write> streaked: array<vec4<f32>>;
 // What the camera's meter read: the exposure that brings the image's average to middle grey, in x.
 @group(0) @binding(7) var<storage, read_write> metered: array<vec4<f32>>;
+
+/** How much a point of open sky counts in the meter: a photographer exposes for the building, not for what is behind it. */
+const METER_SKY_WEIGHT: f32 = 0.25;
 
 /** What a light meter calibrates to: an average scene reflects about eighteen percent. */
 const MIDDLE_GREY: f32 = 0.18;
@@ -126,11 +131,20 @@ fn meter(@builtin(local_invocation_index) thread: u32) {
     let luminance = dot(imageTexel(i32(uv.x * f32(lens.resolution.x)), i32(uv.y * f32(lens.resolution.y))),
       vec3<f32>(0.2126, 0.7152, 0.0722));
     let away = (uv - 0.5) * 2.0;
-    let weight = select(0.0, 1.0 - 0.6 * min(dot(away, away) * 0.5, 1.0), luminance > 0.0);
+    let x = clamp(i32(uv.x * f32(lens.resolution.x)), 0, i32(lens.resolution.x) - 1);
+    let y = clamp(i32(uv.y * f32(lens.resolution.y)), 0, i32(lens.resolution.y) - 1);
+    let index = u32(y) * lens.resolution.x + u32(x);
+    let stored = accumulation[index];
+    // A point with nothing in front of a lit sky: its depth is exactly 1 on every sample. A night sky still counts in
+    // full, or the meter would expose for the moonlit ground and turn the night into day.
+    let isSky = luminance > DIM_AVERAGE && stored.w > 0.0
+      && accumulation[lens.resolution.x * lens.resolution.y + index].y / stored.w >= 0.999999;
+    let centred = 1.0 - 0.6 * min(dot(away, away) * 0.5, 1.0);
+    let weight = select(0.0, centred * select(1.0, METER_SKY_WEIGHT, isSky), luminance > 0.0);
 
     sum = sum + vec2<f32>(log(max(luminance, 1e-6)) * weight, weight);
 
-    if (luminance > 0.0) {
+    if (luminance > 0.0 && !isSky) {
       let bin = u32(clamp((log2(luminance) + 16.0) * 2.0, 0.0, f32(METER_BINS - 1u)));
 
       atomicAdd(&meterHistogram[bin], 1u);
@@ -179,6 +193,11 @@ fn meter(@builtin(local_invocation_index) thread: u32) {
 
     if (bright > 0.0) {
       exposure = min(exposure, HIGHLIGHT_CEILING * MIDDLE_GREY / bright);
+    }
+
+    // By day the exposure is fixed, whatever the camera is pointed at: a room stays as dark as it is against the garden.
+    if (lens.skyExposure > 0.0) {
+      exposure = lens.skyExposure;
     }
 
     metered[0] = vec4<f32>(clamp(exposure, 1e-4, 1e4), average, bright, 0.0);

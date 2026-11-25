@@ -20,6 +20,13 @@ function check(source: string) {
   }
 }
 
+it("validates the kernel with a path traced cloud layer", () => {
+  const alone = pathTraceSource(null, false, false, false, false, false, false, false, false, true);
+
+  expect(() => check(alone)).not.toThrow();
+  expect(() => check(pathTraceSource(null, true, true, true, true, true, true, true, true, true))).not.toThrow();
+});
+
 it("validates the path tracing kernel without any shader", () => {
   expect(() => check(pathTraceSource(null))).not.toThrow();
 });
@@ -34,6 +41,8 @@ it("validates the kernel without the subsurface walk or volumes, as a plain scen
 it("validates the kernel with and without the traversal into instances", () => {
   expect(() => check(pathTraceSource(null, false, false, false, false, false, false))).not.toThrow();
   expect(() => check(pathTraceSource(null, false, false, false, false, false, true))).not.toThrow();
+  // Leaves without grass: the translucent paths compile on their own.
+  expect(() => check(pathTraceSource(null, false, false, false, false, false, false, false, true))).not.toThrow();
   expect(() => check(pathTraceSource(null, true, true, true, true, true, true))).not.toThrow();
 });
 

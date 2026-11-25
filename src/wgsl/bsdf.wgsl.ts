@@ -186,7 +186,7 @@ const KIND_VOLUME: u32 = 100u;
  * grass blade does: by how much of the diffuse light each side accounts for.
  */
 fn translucentShare(surface: Surface) -> f32 {
-  if (!GRASS) {
+  if (!TRANSLUCENT) {
     return 0.0;
   }
 
@@ -219,7 +219,7 @@ fn lobeWeights(surface: Surface, view: vec3<f32>) -> vec3<f32> {
   let base = coatTransmittance(surface, view);
   // The floors keep every lobe reachable: the diffuse one also carries the sheen and the multiple scattering term.
   let diffuse = (luminanceOf(surface.albedo * ((1.0 - surface.metalness) * (1.0 - surface.subsurface)))
-    + max3(surface.sheenColor) + select(0.0, luminanceOf(surface.translucent), GRASS)) * base + 0.02;
+    + max3(surface.sheenColor) + select(0.0, luminanceOf(surface.translucent), TRANSLUCENT)) * base + 0.02;
   let specular = luminanceOf(schlick3(surface.specularColor, surface.specularF90, nv)
     * (1.0 - surface.metalness) + surface.albedo * surface.metalness) * base + 0.05;
   let coat = select(0.0, (1.0 - base) + 0.02, surface.clearcoat > 0.0);
@@ -298,7 +298,7 @@ fn physicalValue(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> vec3<f3
   }
 
   // Light through a translucent surface, from its far side.
-  if (GRASS && nl < 0.0) {
+  if (TRANSLUCENT && nl < 0.0) {
     value = value + surface.translucent / PI * (-nl);
   }
 
@@ -333,7 +333,7 @@ fn bsdfPdf(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> f32 {
   let weights = lobeWeights(surface, view);
   var pdf = weights.x * max(nl, 0.0) / PI;
 
-  if (GRASS) {
+  if (TRANSLUCENT) {
     pdf = weights.x * mix(max(nl, 0.0), max(-nl, 0.0), translucentShare(surface)) / PI;
   }
 
@@ -404,7 +404,7 @@ fn evaluateBsdf(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> BsdfEval
   }
 
   // A clearcoat may face a light its base turns away from, so only a surface without one stops here.
-  if (nl <= 0.0 && surface.clearcoat <= 0.0 && !(GRASS && any(surface.translucent > vec3<f32>(0.0)))) {
+  if (nl <= 0.0 && surface.clearcoat <= 0.0 && !(TRANSLUCENT && any(surface.translucent > vec3<f32>(0.0)))) {
     return result;
   }
 
@@ -584,7 +584,7 @@ fn sampleBsdf(surface: Surface, view: vec3<f32>, lobe: f32, u: vec2<f32>) -> Bsd
 
   if (lobe < weights.x) {
     // A translucent surface sends that share of its diffuse light through, to the far side.
-    let through = GRASS && lobe < weights.x * translucentShare(surface);
+    let through = TRANSLUCENT && lobe < weights.x * translucentShare(surface);
 
     result.direction = cosineDirection(select(normal, -normal, through), u);
   } else if (surface.kind == KIND_PHONG) {
@@ -638,7 +638,7 @@ fn diffuseValue(surface: Surface, view: vec3<f32>, light: vec3<f32>) -> vec3<f32
     return surface.albedo * henyeyGreenstein(dot(-view, light), surface.anisotropy);
   }
 
-  if (GRASS && nl < 0.0) {
+  if (TRANSLUCENT && nl < 0.0) {
     return surface.translucent / PI * (-nl);
   }
 

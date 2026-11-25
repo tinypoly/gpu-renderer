@@ -90,3 +90,13 @@ it("pauses and resumes like the CPU renderer", () => {
   renderer.resume();
   expect(renderer.paused).toBe(false);
 });
+
+it("captures the finished image when no frame was left midway, and nothing once disposed", async() => {
+  const renderer = new GpuRenderer({ width: 10, height: 10 });
+
+  await expect(renderer.capture()).resolves.toBe(renderer.image);
+
+  renderer.dispose();
+
+  await expect(renderer.capture()).resolves.toBeNull();
+});

@@ -33,6 +33,8 @@ export interface LensEffects {
   darkAdaptation: number;
   /** What the image is multiplied by after the lens, the meter's own exposure aside: the rays are limited against it. */
   exposure: number;
+  /** The fixed exposure of a day, the same indoors and out, or `0` to let the meter decide. */
+  skyExposure: number;
 }
 
 /** The lens effects these settings ask for, or `null` when they ask for none and the pass can be skipped. */
@@ -61,6 +63,7 @@ export function lensEffects(settings: GpuRenderSettings): LensEffects | null {
     autoExposure,
     darkAdaptation: Math.min(1, Math.max(0, Number(camera.darkAdaptation) || 0)),
     exposure: Math.max(effectiveExposure(settings), 0),
+    skyExposure: Math.max(0, Number(camera.skyExposure) || 0),
   };
 }
 
@@ -220,6 +223,7 @@ export class LensPass {
       floats[35] = effects.autoExposure ? 1 : 0;
       floats[36] = effects.darkAdaptation;
       floats[37] = effects.exposure;
+      floats[38] = effects.skyExposure;
       for (let row = 0; row < 3; row++) for (let column = 0; column < 3; column++)
         floats[20 + row * 4 + column] = white[row * 3 + column];
       fill();

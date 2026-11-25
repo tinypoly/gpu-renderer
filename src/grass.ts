@@ -11,13 +11,13 @@ import type { SerializedMaterial } from "./upstream.js";
  * plane and follows each triangle's slope by shearing, so the lawn costs the same whatever the size of the surface.
  */
 export type GrassInput = boolean | {
-  /** The tallest blade, in scene units. Defaults to `0.09`. */
+  /** The tallest blade, in scene units. Defaults to `0.06`, a mown lawn. */
   height?: number;
-  /** Blades per square scene unit. Defaults to `6000`, a full lawn. */
+  /** Blades per square scene unit. Defaults to `12000`, a full lawn. */
   density?: number;
-  /** The widest a blade gets, in scene units. Defaults to `0.005`. */
+  /** The widest a blade gets, in scene units. Defaults to `0.0035`. */
   width?: number;
-  /** How far blades lean and curl over, `0` (upright) to `1`. Defaults to `0.35`. */
+  /** How far blades lean and curl over, `0` (upright) to `1`. Defaults to `0.5`. */
   bend?: number;
   /** Colour at the root, `#rrggbb` or linear rgb. */
   color?: string | readonly number[];
@@ -83,16 +83,16 @@ export function grassField(input: unknown): GrassField | null {
   if (!input || typeof input !== "object") return null;
 
   const value = input as Exclude<GrassInput, boolean>;
-  const height = finite(value.height, 0.09);
-  const density = finite(value.density, 6000);
+  const height = finite(value.height, 0.06);
+  const density = finite(value.density, 12000);
 
   if (!(height > 0) || !(density > 0)) return null;
 
   return {
     height,
     density,
-    width: Math.max(1e-4, finite(value.width, 0.005)),
-    bend: unit(value.bend, 0.35),
+    width: Math.max(1e-4, finite(value.width, 0.0035)),
+    bend: unit(value.bend, 0.5),
     color: linearAlbedo(value.color ?? DEFAULT_COLOR),
     tipColor: linearAlbedo(value.tipColor ?? DEFAULT_TIP),
     dryColor: linearAlbedo(value.dryColor ?? DEFAULT_DRY),
@@ -174,8 +174,11 @@ function bladeReach(field: GrassField): number {
  * One blade: a spine curving away from its root as a quadratic, tapering to a point, with a slight twist. It leans away
  * from the middle of its clump, as grass grows.
  */
-function makeBlade(field: GrassField, next: () => number, x: number, z: number, lean: [number, number]): Blade {
-  const height = field.height * (0.45 + 0.55 * Math.pow(next(), 0.6));
+function makeBlade(field: GrassField, next: () => number, x: number, z: number, lean: [number, number],
+  clump: number): Blade {
+  // Heights spread wide, with a few blades standing above the rest: a lawn evened out to one height reads as a carpet.
+  const straggler = next() < 0.06;
+  const height = field.height * (straggler ? 0.9 + 0.1 * next() : clump * (0.4 + 0.6 * next()));
   const width = field.width * (0.7 + 0.6 * next());
   const amount = field.bend * (0.35 + 0.75 * next());
   const twist = (next() - 0.5) * 0.9;
@@ -247,10 +250,13 @@ function arrangement(field: GrassField, tile: number, seed: number, count: numbe
       // A whole number of blades on average, with the fraction drawn.
       const whole = Math.floor(perClump);
       const n = whole + (next() < perClump - whole ? 1 : 0);
+      // Some clumps grow taller than their neighbours, so the top of the lawn is uneven.
+      const clump = 0.65 + 0.35 * next();
 
       for (let b = 0; b < n; b++) {
-        const dx = gaussian(next) * step * 0.4;
-        const dz = gaussian(next) * step * 0.4;
+        // Spread wide enough that clumps run into each other, as in a lawn, rather than standing apart as tufts.
+        const dx = gaussian(next) * step * 0.7;
+        const dz = gaussian(next) * step * 0.7;
         const away = Math.hypot(dx, dz);
         const angle = next() * Math.PI * 2;
         // Away from the middle of the clump, with some of every direction mixed in.
@@ -260,7 +266,7 @@ function arrangement(field: GrassField, tile: number, seed: number, count: numbe
         const x = ((cx + dx) % tile + tile) % tile;
         const z = ((cz + dz) % tile + tile) % tile;
 
-        blades.push(makeBlade(field, next, x, z, [mixX / length, mixZ / length]));
+        blades.push(makeBlade(field, next, x, z, [mixX / length, mixZ / length], clump));
       }
     }
   }

@@ -27,6 +27,9 @@ import {
   bevelOf,
   bevelRadius,
   type BevelMaterial,
+  translucencyOf,
+  translucencyShare,
+  type TranslucencyMaterial,
   subsurfaceMedium,
   subsurfaceOf,
   volumeMedium,
@@ -51,6 +54,7 @@ import { prepareSceneAssets, type SceneAssets } from "./sceneAssets.js";
 import { packVolumetricLights, VOLUMETRIC_WORDS } from "./volumetric.js";
 import { environmentPower, uploadScene, type SceneBuffers, type UploadHierarchy } from "./sceneUpload.js";
 import { atmosphereExtinction, averageRadiance, brightestSun, gradientAverage } from "./atmosphere.js";
+import { cloudLayerOf, VOLUMETRIC_CLOUDS_UNIFORM } from "./clouds.js";
 import {
   DEFAULT_RENDER_ENVIRONMENT,
   EventEmitter,
@@ -93,6 +97,12 @@ export interface GpuRendererEvents {
 }
 
 /** The CPU renderer's options without its worker pool, which has no counterpart on a device. */
+/** A display transform as a table: `size` cubed RGB points, red fastest, from E-Gamut log to power 2.4 display. */
+export interface DisplayLut {
+  size: number;
+  data: Float32Array<ArrayBuffer>;
+}
+
 export interface GpuRendererOptions {
   scene?: RenderScene | SerializedScene;
   /** Defaults to a perspective camera at (5, 5, 5) looking at the origin. */
@@ -190,6 +200,9 @@ const BANDS_IN_FLIGHT = 2;
  * carries light, instead of seven bounces before the roulette ever looks at it. The mean stays exact.
  */
 const ROULETTE_THRESHOLD = 1;
+
+/** The fewest submits a pass over an image with clouds is cut into. */
+const CLOUD_BANDS = 12;
 
 /** How often the lens pass grades the canvas again while a frame traces without the denoiser. */
 const LENS_EVERY_MS = 100;
@@ -374,10 +387,15 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   // What the lens pass last graded, and when: its input only changes when the denoiser runs or the accumulation grows.
   private lensKey = "";
   private lensAt = -Infinity;
+  /** The display table AgX reads, as the host gave it, and its buffer on the device. */
+  private displayLut: DisplayLut | null = null;
+  private displayLutBuffer: GPUBuffer | null = null;
   private denoiseVersion = 0;
   private denoiserSettings: DenoiserSettings = { ...DEFAULT_DENOISER };
   // The size of the last frame that finished, which setDenoiser filters again; null while a frame traces.
   private finished: { width: number; height: number } | null = null;
+  /** The frame the accumulator holds samples of while it is unfinished: traced, paused or cancelled midway. */
+  private partial: { width: number; height: number } | null = null;
   // Whether the denoiser's output holds this frame yet: until it does, the canvas shows the accumulation itself.
   private denoised = false;
   // How large a pixel is for the camera of the frame, which the specular filter sizes its footprint by.
@@ -482,6 +500,20 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     return this.output;
   }
 
+  /**
+   * The image as far as it got: what the accumulator holds of a frame still tracing, paused or cancelled midway,
+   * through the same lens, exposure and tone mapping as the screen, and with the denoiser's last pass when one ran.
+   * Otherwise `image`. The read goes through the device's queue, after whatever the frame submitted before it.
+   */
+  async capture(): Promise<RenderImage | null> {
+    const partial = this.partial, gpu = this.gpu;
+
+    if (this.disposed) return null;
+    if (!partial || !gpu || !this.accumulator) return this.output;
+
+    return this.readImage(gpu, partial.width, partial.height, this.denoised ? this.denoiseOutput : null);
+  }
+
   get renderWidth(): number {
     return Math.max(1, Math.floor(this.width * this.pixelRatio * this.current.renderScale));
   }
@@ -538,6 +570,35 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.current = mergeGpuSettings(this.current, settings);
 
     if (developing(this.current) !== before) this.refilter();
+  }
+
+  /**
+   * The table AgX's display transform reads instead of its analytic curve, or `null` for the curve. A finished image is
+   * developed again with it, without tracing anything.
+   */
+  setDisplayLut(lut: DisplayLut | null) {
+    if (lut === this.displayLut) return;
+
+    this.displayLut = lut;
+    this.displayLutBuffer?.destroy();
+    this.displayLutBuffer = null;
+    this.refilter();
+  }
+
+  /** The table on the device; a single empty entry when there is none, since the shaders always bind one. */
+  private lutBuffer(device: GPUDevice): GPUBuffer {
+    if (this.displayLutBuffer) return this.displayLutBuffer;
+
+    const data = this.displayLut?.data ?? new Float32Array(3);
+
+    const buffer = device.createBuffer({
+      label: "display table", size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    device.queue.writeBuffer(buffer, 0, data);
+    this.displayLutBuffer = buffer;
+
+    return buffer;
   }
 
   setEnvironment(environment: RenderEnvironment) {
@@ -677,6 +738,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.lensPass = null;
     this.imageResolve?.dispose();
     this.imageResolve = null;
+    this.displayLutBuffer?.destroy();
+    this.displayLutBuffer = null;
     this.gpu?.device.destroy();
     this.buffers = null;
     this.accumulator = null;
@@ -705,6 +768,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.target = null;
     this.packedView = "";
     this.imageResolve = null;
+    this.displayLutBuffer = null;
     this.resolve = null;
     this.denoisePass = null;
     this.oidnPass = null;
@@ -773,6 +837,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
     const startedAt = performance.now();
 
+    // The accumulator is about to be prepared for this frame: what it held of the last one is no longer readable.
+    this.partial = null;
+
     await this.releaseDenoiser();
 
     const gpu = await this.device();
@@ -817,6 +884,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.check(revision);
     await this.prepare(gpu, revision, assets, camera, width, height, environment);
     this.output = { width, height, data: new Uint8ClampedArray(width * height * 4) };
+    this.partial = { width, height };
     this.emit("start", { width, height });
     logMemory("frame start", { width, height, prepareMs: Math.round(performance.now() - startedAt) });
 
@@ -829,6 +897,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     // In rows times paths, the unit the scheduler measures work in.
     const budget = target * height;
     const accumulator = this.accumulator as Accumulator;
+    // The clouds make some rows far dearer than the ground below them, and the rate measured on the cheap ones would
+    // send the dear ones in one band too long for the watchdog.
+    const cloudy = cloudLayerOf(assets.sky?.uniforms) !== null;
+    const bandLimit = (paths: number) => cloudy ? Math.max(1, Math.floor(height / (CLOUD_BANDS * paths))) : height;
     let active: number[] = Array.from({ length: height }, (_, row) => row);
     // Paths every pixel still in the running has taken so far, which is also the next sample index.
     let taken = 0;
@@ -888,7 +960,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
           this.check(revision);
 
-          const rows = this.scheduler.next(end - row, samples);
+          const rows = Math.min(this.scheduler.next(end - row, samples), bandLimit(samples));
           const started = performance.now();
           const encoder = gpu.device.createCommandEncoder();
 
@@ -990,6 +1062,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     this.check(revision);
     this.output = image;
     this.finished = { width, height };
+    this.partial = null;
     logMemory("frame done", { width, height, samples: taken, ms: Math.round(performance.now() - startedAt) });
     this.emitIdle();
     this.emit("pixels", { x: 0, y: 0, ...image });
@@ -1054,7 +1127,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
           && !(Number(material.values.thickness) > 0)),
         materials.some(material => grassOf(material) !== null),
         instances,
-        materials.some(material => waterOf(material) !== null));
+        materials.some(material => waterOf(material) !== null),
+        materials.some(material => translucencyOf(material) > 0),
+        cloudLayerOf(assets.sky?.uniforms) !== null);
       this.check(revision);
     };
 
@@ -1208,8 +1283,10 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     const foreground = assets.programs.foreground;
 
     const skyData = foreground && assets.sky
-      ? extra.append(foreground.packUniforms({ ...assets.sky.uniforms, uCpuSky: { texture: "procedural-sky" } },
-        plan.indexOf))
+      // With its cumulus path traced, the sky's own shader is told to leave them out of what it paints.
+      ? extra.append(foreground.packUniforms({ ...assets.sky.uniforms,
+        ...(cloudLayerOf(assets.sky.uniforms) ? { [VOLUMETRIC_CLOUDS_UNIFORM]: 1 } : {}),
+        uCpuSky: { texture: "procedural-sky" } }, plan.indexOf))
       : 0;
 
     const volumetric = packVolumetricLights(scene.lights);
@@ -1389,6 +1466,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
   private encodePresent(encoder: GPUCommandEncoder, width: number, height: number) {
     if (!this.context || !this.present || !this.gpu) return;
 
+    this.present.setDisplayLut(this.lutBuffer(this.gpu.device), this.displayLut?.size ?? 0);
     this.present.encode(encoder, this.context.getCurrentTexture().createView(), {
       width,
       height,
@@ -1450,6 +1528,9 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
    * submitted at once; OIDN runs after any run still in flight, and is dropped when a newer frame starts meanwhile.
    */
   private async denoiseNow(gpu: RenderDevice, width: number, height: number): Promise<void> {
+    // The device may have been lost while this waited its turn, and the accumulation went with it.
+    if (!this.accumulator) return;
+
     if (this.usesOidn()) {
       const revision = this.revision;
       const run = this.oidnRun.then(() => this.runOidn(gpu, width, height, revision));
@@ -1457,7 +1538,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       this.oidnRun = run.catch(() => undefined);
 
       // Denoised, or replaced by a newer frame: either way nothing is left to do here.
-      if (await run || !this.oidnFailed) return;
+      if (await run || !this.oidnFailed || !this.accumulator) return;
     }
 
     const encoder = gpu.device.createCommandEncoder();
@@ -1532,6 +1613,7 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
 
     const extinction = atmosphereExtinction(atmosphere);
     const sun = brightestSun(assets.scene.lights);
+    const clouds = cloudLayerOf(sky?.uniforms);
 
     return {
       cameraToWorld: matrices.cameraWorld,
@@ -1618,6 +1700,11 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
       volumetricData: target?.volumetricData ?? 0,
       grassShells: target?.grassShells ?? GRASS_NONE,
       grassEntries: target?.grassEntries ?? 0,
+      cloudShape: clouds ? [clouds.coverage, clouds.density, clouds.scale, clouds.seed] : [0, 0, 1, 0],
+      cloudLayer: clouds ? [clouds.altitude, clouds.thickness, clouds.detail, clouds.haze] : [0, 1, 0, 0],
+      cloudSun: [clouds ? clouds.sunUp : 1, clouds ? clouds.shadow : 0, clouds ? clouds.drift[0] : 0,
+        clouds ? clouds.drift[1] : 0],
+      cloudClock: [clouds ? clouds.time : 0, 0, 0, 0],
     };
   }
 
@@ -1642,7 +1729,8 @@ export class GpuRenderer extends EventEmitter<GpuRendererEvents> {
     gpu.device.queue.submit([encoder.finish()]);
 
     const data = await this.imageResolve.read(accumulator.buffer, graded, width, height,
-      { exposure, toneMapping, vignette, contrast: lookContrast(this.current), transparent });
+      { exposure, toneMapping, vignette, contrast: lookContrast(this.current), transparent,
+        lut: this.lutBuffer(gpu.device), lutSize: this.displayLut?.size ?? 0 });
 
     return { width, height, data };
   }
@@ -1664,7 +1752,10 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
   const renamed = new Map<Material, string>();
   // The snapshot keeps a material's name but not its media, so the name carries a mark to them.
   const named = new Map<Material, string>();
-  const media: { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown }[] = [];
+
+  const media: {
+    subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown; translucency?: unknown;
+  }[] = [];
 
   scene.traverse(object => {
     const value = (object as Object3D & { material?: Material | Material[] }).material;
@@ -1678,16 +1769,19 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       }
 
       const data = material.userData?.cpuRenderer as
-        { subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown } | undefined;
+        {
+          subsurface?: unknown; volume?: unknown; bevel?: unknown; grass?: unknown; water?: unknown;
+          translucency?: unknown;
+        } | undefined;
 
       if (!named.has(material)
         && (subsurfaceMedium(data?.subsurface) || volumeMedium(data?.volume) || bevelRadius(data?.bevel) > 0
-          || grassField(data?.grass) || waterField(data?.water))) {
+          || grassField(data?.grass) || waterField(data?.water) || translucencyShare(data?.translucency) > 0)) {
         named.set(material, material.name);
         material.name = `${material.name}${MEDIA_MARK}${media.length}`;
         media.push({
           subsurface: data?.subsurface, volume: data?.volume, bevel: data?.bevel,
-          grass: data?.grass, water: data?.water,
+          grass: data?.grass, water: data?.water, translucency: data?.translucency,
         });
       }
     }
@@ -1705,7 +1799,8 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
 
   // Materials are shared between the meshes that use them, so each one is unmarked once and seen marked no more.
   for (const mesh of snapshot.meshes) {
-    type Carrier = SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial & WaterMaterial;
+    type Carrier = SubsurfaceMaterial & VolumeMaterial & BevelMaterial & GrassMaterial & WaterMaterial
+      & TranslucencyMaterial;
 
     for (const material of mesh.materials as Carrier[]) {
       const at = material.name.lastIndexOf(MEDIA_MARK);
@@ -1720,6 +1815,7 @@ async function serializeLive(scene: Scene): Promise<SerializedScene> {
       if (medium.bevel !== undefined) material.bevel = medium.bevel as BevelMaterial["bevel"];
       if (medium.grass !== undefined) material.grass = medium.grass as GrassMaterial["grass"];
       if (medium.water !== undefined) material.water = medium.water as WaterMaterial["water"];
+      if (medium.translucency !== undefined) material.translucency = translucencyShare(medium.translucency);
     }
   }
 

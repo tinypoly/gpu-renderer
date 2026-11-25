@@ -70,6 +70,32 @@ fn grassNoise(p: vec2<f32>) -> f32 {
   return mix(mix(corner.x, corner.y, s.x), mix(corner.z, corner.w, s.x), s.y);
 }
 
+/**
+ * Noise for the patches across the lawn: octaves turned against each other and a warp of the coordinates, so the patches
+ * come out ragged and of every size. One octave of value noise gives round blobs of one size on a grid, which from afar
+ * reads as a pattern laid over the lawn. Stretched back to about the spread of a single octave.
+ */
+fn grassPatches(p: vec2<f32>, octaves: i32) -> f32 {
+  var q = p;
+
+  if (octaves > 2) {
+    q = q + 0.8 * vec2<f32>(grassNoise(p * 0.7 + vec2<f32>(17.3, 3.9)), grassNoise(p * 0.7 + vec2<f32>(5.1, 23.7))) - 0.4;
+  }
+
+  var sum = 0.0;
+  var weight = 0.0;
+  var amplitude = 0.5;
+
+  for (var o = 0; o < octaves; o = o + 1) {
+    sum = sum + amplitude * grassNoise(q);
+    weight = weight + amplitude;
+    q = mat2x2<f32>(1.6, 1.2, -1.2, 1.6) * q + vec2<f32>(7.7, 2.3);
+    amplitude = amplitude * 0.5;
+  }
+
+  return clamp((sum / weight - 0.5) * 1.5 + 0.5, 0.0, 1.0);
+}
+
 /** Whether a blade grows where its root stands: the lawn thins out in patches, and each blade has its own number. */
 fn grassKeeps(record: u32, root: vec2<f32>, rand: f32) -> bool {
   let patchiness = extraFloat(record + 22u);
@@ -78,7 +104,7 @@ fn grassKeeps(record: u32, root: vec2<f32>, rand: f32) -> bool {
     return true;
   }
 
-  let thin = smoothstep(0.3, 0.75, grassNoise(root * extraFloat(record + 23u) + vec2<f32>(31.7, 11.3)));
+  let thin = smoothstep(0.3, 0.75, grassPatches(root * extraFloat(record + 23u) + vec2<f32>(31.7, 11.3), 2));
 
   return rand >= patchiness * thin;
 }
@@ -379,26 +405,38 @@ fn grassSurface(hit: GrassHit, direction: vec3<f32>) -> Surface {
 
   let variation = extraFloat(record + 21u);
   let scale = extraFloat(record + 23u);
-  let wide = grassNoise(root * scale);
-  let fine = grassNoise(root * scale * 4.3 + vec2<f32>(5.2, 1.7));
   var albedo = mix(grassVec3(record + 9u), grassVec3(record + 12u), smoothstep(0.0, 1.0, pow(height, 0.75)));
 
-  // Across the lawn, greener and yellower stretches; from blade to blade, lighter and darker.
-  albedo = albedo * mix(vec3<f32>(1.0), vec3<f32>(1.12, 1.0, 0.7), variation * (wide - 0.4));
-  albedo = albedo * (1.0 + variation * 0.6 * (fract(rand * 13.37) - 0.5));
+  // Across the lawn, one field of moisture over a few metres decides everything at once: where it is dry the grass goes
+  // lighter and yellower and has more dry blades, where it is wet darker and bluer. Separate noises for tint, value and
+  // dry blades, each at its own size, add up to spots laid over the lawn; one cause behind them reads as soil and water.
+  let moisture = grassPatches(root * scale * 0.45 + vec2<f32>(41.0, 9.0), 4);
+  let drier = smoothstep(0.2, 0.85, moisture);
+
+  albedo = albedo * mix(vec3<f32>(1.0), mix(vec3<f32>(0.85, 0.93, 0.95), vec3<f32>(1.15, 1.07, 0.7), drier), variation);
+
+  // From blade to blade the colour itself changes, some bluer, some yellower, and not only the value: a lawn is a mix
+  // of blades, and only lighter and darker copies of one green read as a carpet.
+  let hue = fract(rand * 5.31) - 0.5;
+  albedo = albedo * (vec3<f32>(1.0) + variation * hue * vec3<f32>(0.5, 0.15, -0.6));
+  albedo = albedo * (1.0 + variation * 0.8 * (fract(rand * 13.37) - 0.5));
 
   let dryness = extraFloat(record + 18u);
   let dry = grassVec3(record + 15u) * (0.85 + 0.3 * fract(rand * 7.77));
+  // Dry blades scattered through the lawn, many more of them where it is drier.
+  let dryShare = dryness * (0.25 + 1.8 * drier * drier);
 
-  if (fract(rand * 31.1) < dryness * (0.4 + 1.2 * fine)) {
+  if (fract(rand * 31.1) < dryShare) {
     albedo = mix(dry * 0.8, dry, height);
   } else {
-    // Tips dry first.
-    albedo = mix(albedo, dry, smoothstep(0.82, 1.0, height) * dryness * 1.5);
+    // Some tips dry first.
+    albedo = mix(albedo, dry, smoothstep(0.82, 1.0, height) * min(1.0, dryShare * 1.5) * step(0.5, fract(rand * 3.71)));
   }
 
   // The sheath at the root is paler and duller.
   albedo = mix(albedo * 0.7 + vec3<f32>(0.03, 0.03, 0.01), albedo, smoothstep(0.0, 0.2, height));
+  // A real blade is duller than the green picked for it: a little of the saturation goes.
+  albedo = mix(vec3<f32>(dot(albedo, vec3<f32>(0.2126, 0.7152, 0.0722))), albedo, 0.82);
   albedo = clamp(albedo, vec3<f32>(0.0), vec3<f32>(0.9));
 
   let translucency = extraFloat(record + 19u);
@@ -412,8 +450,8 @@ fn grassSurface(hit: GrassHit, direction: vec3<f32>) -> Surface {
   surface.front = true;
   surface.normal = shading;
   surface.albedo = albedo * (1.0 - 0.5 * translucency);
-  // Light through a leaf is more saturated and yellower than off it.
-  surface.translucent = min(albedo * translucency * vec3<f32>(1.05, 1.2, 0.6), vec3<f32>(0.9));
+  // Light through a leaf is a little yellower than off it; much more and a backlit lawn glows neon.
+  surface.translucent = min(albedo * translucency * vec3<f32>(1.0, 1.1, 0.75), vec3<f32>(0.9));
   surface.opacity = 1.0;
   surface.alpha = 1.0;
   surface.roughness = clamp(extraFloat(record + 20u), 0.0525, 1.0);
@@ -427,6 +465,25 @@ fn grassSurface(hit: GrassHit, direction: vec3<f32>) -> Surface {
   surface.gradientMap = NO_TEXTURE;
 
   return surface;
+}
+
+/**
+ * The floor of a lawn, between the blades: the surface's own colour, darkened and matte, as the deep grass and the
+ * shade under the canopy leave it. It varies a little over a few centimetres, so the light that gets through falls on
+ * something uneven rather than on a smooth plane that the blades' shadows would stripe.
+ */
+fn grassGround(surface: Surface, point: vec3<f32>) -> Surface {
+  var ground = surface;
+  let fine = grassNoise(point.xz * 45.0 + vec2<f32>(3.1, 7.7));
+
+  ground.albedo = surface.albedo * (0.45 + 0.15 * fine);
+  ground.roughness = 1.0;
+  ground.metalness = 0.0;
+  ground.specularColor = vec3<f32>(0.02);
+  ground.clearcoat = 0.0;
+  ground.sheenColor = vec3<f32>(0.0);
+
+  return ground;
 }
 `;
 
@@ -451,6 +508,10 @@ fn traceGrass(origin: vec3<f32>, direction: vec3<f32>, maxDistance: f32) -> Gras
 fn grassSurface(hit: GrassHit, direction: vec3<f32>) -> Surface {
   var surface: Surface;
 
+  return surface;
+}
+
+fn grassGround(surface: Surface, point: vec3<f32>) -> Surface {
   return surface;
 }
 `;

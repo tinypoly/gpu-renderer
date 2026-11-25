@@ -133,7 +133,7 @@ fn emissionWeight(hit: Hit, direction: vec3<f32>, bsdfPdf: f32, lightsOwnDirect:
  */
 fn treeNormal(surface: Surface) -> vec3<f32> {
   if (surface.kind == KIND_VOLUME || surface.kind == KIND_TOON || surface.clearcoat > 0.0 || surface.transmission > 0.0
-    || (GRASS && any(surface.translucent > vec3<f32>(0.0)))) {
+    || (TRANSLUCENT && any(surface.translucent > vec3<f32>(0.0)))) {
     return vec3<f32>(0.0);
   }
 
@@ -202,7 +202,7 @@ fn directLight(
   var shadowFrom = position;
 
   // Light from behind a translucent surface is looked for from its far side, past the surface itself.
-  if (GRASS && any(surface.translucent > vec3<f32>(0.0)) && dot(chosen.direction, surface.facing) < 0.0) {
+  if (TRANSLUCENT && any(surface.translucent > vec3<f32>(0.0)) && dot(chosen.direction, surface.facing) < 0.0) {
     shadowFrom = position - (surface.normal + surface.facing) * RAY_EPSILON;
   }
 
@@ -221,7 +221,14 @@ fn directLight(
   // surface takes all of its direct light this way, because its bounce is not the lobe that lit it.
   let weight = select(1.0, misWeight(chosen.misPdf, reflected.pdf), chosen.misPdf > 0.0 && reflected.pdf > 0.0 && !toon);
 
-  let light = chosen.value * through * weight;
+  var light = chosen.value * through * weight;
+
+  // The sun of a sky with a visible cloud layer comes through it.
+  if (CLOUDS && chosen.kind == LIGHT_DIRECTIONAL && frame.cloudShape.x > 0.0 && frame.cloudSun.y > 0.0
+    && frame.background.w == 0.0 && frame.skyBackground != 0u
+    && dot(chosen.direction, normalize(frame.atmosphereSun.xyz)) > 0.99) {
+    light = light * cloudSunThrough(position, chosen.direction, sample2D(rng).x);
+  }
 
   // The share of it the diffuse lobe reflects, which the denoiser filters apart from the specular one.
   *diffusePart = min(diffuseValue(surface, view, chosen.direction), reflected.value) * light;
@@ -598,7 +605,28 @@ fn traceRadiance(
         // A transparent background leaves the pixel empty, which its alpha says.
         if (frame.background.w != 2.0) {
           alpha = 1.0;
-          radiance = radiance + throughput * backgroundRadiance(direction);
+
+          // A cloud layer stands between the camera and the sky: what it scatters, and the sky through its gaps.
+          if (CLOUDS && frame.cloudShape.x > 0.0 && frame.background.w == 0.0 && frame.skyBackground != 0u) {
+            let clouds = cloudScatter(origin, direction, rng);
+
+            radiance = radiance + throughput * clouds.radiance;
+
+            // A cloud is noisy where the sky behind it is not, so the denoiser has to be let in: it filters what has a
+            // surface to guide it, and a cloud stands as a white one facing the camera, as far as the cloud is.
+            if (clouds.through < 1.0 && !guided) {
+              guideNormal = clouds.faceNormal * (1.0 - clouds.through);
+              guideDistance = min(clouds.distance, 1e6);
+              diffuseAlbedo = vec3<f32>(1.0);
+              specularAlbedoGuide = vec3<f32>(0.0);
+            }
+
+            if (clouds.through > 0.0) {
+              radiance = radiance + throughput * clouds.through * backgroundRadiance(direction);
+            }
+          } else {
+            radiance = radiance + throughput * backgroundRadiance(direction);
+          }
         }
       } else {
         var sky = ambientRadiance(direction);
@@ -692,6 +720,20 @@ fn traceRadiance(
     }
 
     surface = resolveSurfaceFrom(hit.triangle, bary, direction, base);
+
+    // Under a lawn, seen from above, the ground is its floor of dead blades and soil, whatever the material shows.
+    if (GRASS && (materials[m].flags & MATERIAL_GRASS) != 0u && surface.facing.y > 0.5 && direction.y < 0.0) {
+      surface = grassGround(surface, point);
+    }
+
+    // A leaf lets part of its diffuse light through to its far side, a little yellower, and reflects that much less:
+    // a crown against the sun lights up instead of standing dark.
+    if (TRANSLUCENT && materials[m].translucency > 0.0) {
+      let share = materials[m].translucency;
+
+      surface.translucent = min(surface.albedo * share * vec3<f32>(1.0, 1.1, 0.75), vec3<f32>(0.9));
+      surface.albedo = surface.albedo * (1.0 - 0.5 * share);
+    }
 
     // Deep in the path, light reflects off a material that scatters inside as off a diffuse one of the same colour.
     if (SUBSURFACE_WALK && bounce >= frame.subsurfaceDepth) {
@@ -953,7 +995,7 @@ fn traceRadiance(
         nextOrigin = position;
 
         // Through a translucent surface, the path carries on from its far side.
-        if (GRASS && dot(next, surface.facing) < 0.0 && any(surface.translucent > vec3<f32>(0.0))) {
+        if (TRANSLUCENT && dot(next, surface.facing) < 0.0 && any(surface.translucent > vec3<f32>(0.0))) {
           nextOrigin = point - surface.facing * RAY_EPSILON;
         }
         primary = false;

@@ -5,6 +5,7 @@ export { isWebGpuAvailable, requestRenderDevice, requestWebGpuSupport } from "./
 export type { RenderDevice, RenderDeviceOptions, WebGpuSupport } from "./device.js";
 
 export { GpuRenderer, isAbortError } from "./renderer.js";
+export type { DisplayLut } from "./renderer.js";
 export { deviceMemory, setMemoryLogging } from "./memoryProbe.js";
 
 export type {
@@ -38,7 +39,7 @@ export { grassField } from "./grass.js";
 export { waterField } from "./water.js";
 export type { WaterField, WaterInput, WaterMaterial } from "./water.js";
 export type { GrassField, GrassInput, GrassMaterial } from "./grass.js";
-export type { SubsurfaceInput, SubsurfaceMaterial, SubsurfaceMedium } from "./subsurface.js";
+export type { SubsurfaceInput, SubsurfaceMaterial, SubsurfaceMedium, TranslucencyMaterial } from "./subsurface.js";
 
 export type { Bucket, Listener } from "./upstream.js";
 

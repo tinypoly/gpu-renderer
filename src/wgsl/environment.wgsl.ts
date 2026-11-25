@@ -44,7 +44,25 @@ fn environmentDirection(uv: vec2<f32>) -> vec3<f32> {
 }
 
 /** What arrives from a direction: the image if there is one, and the gradient otherwise. */
+/**
+ * The surrounding as what it lights sees it. Rays that bounce read the baked clear sky, with none of the white the
+ * clouds scatter down, so a shaded wall would come out far bluer than under a real sky with clouds in it. The light
+ * keeps its strength and loses part of its colour, more the more of the sky is covered.
+ */
 fn environmentRadiance(direction: vec3<f32>) -> vec3<f32> {
+  let clear = clearSkyRadiance(direction);
+
+  if (!CLOUDS || frame.cloudShape.x <= 0.0) {
+    return clear;
+  }
+
+  let grey = vec3<f32>(dot(clear, vec3<f32>(0.2126, 0.7152, 0.0722)));
+
+  return mix(clear, grey, clamp(0.25 + frame.cloudShape.x * 0.8, 0.0, 0.7));
+}
+
+/** The surrounding exactly as the map holds it. */
+fn clearSkyRadiance(direction: vec3<f32>) -> vec3<f32> {
   if (frame.environmentTexture == NO_TEXTURE) {
     let height = pow(clamp(direction.y * 0.5 + 0.5, 0.0, 1.0), frame.environmentTop.w);
 

@@ -195,6 +195,7 @@ Groups only this renderer reads, all on by default except the physical exposure,
 | `glare.intensity` | `0.06` | Share of the light the rays take, `0` to `1`. |
 | `glare.blades` | `6` | Blades of the aperture: an even count makes as many rays, an odd count twice as many. |
 | `glare.length`, `glare.rotation` | `0.25`, `15` | How far the rays reach, as a share of the half diagonal, and the aperture's turn in degrees. |
+| `camera.skyExposure` | `0` | The fixed exposure of a day, so a host's preview and the render agree. It holds indoors and out. `0` leaves the picture to the meter. |
 | `camera.contrast` | `1` | AgX's look, `0` its base curve (flat on purpose) to `1` a look like Blender's Punchy, pivoted on middle grey so brightness stands; other tone mappings ignore it. |
 | `lens.chromaticAberration` | `0.05` | Lateral colour fringes towards the corners, `0` to `1`. |
 | `lens.distortion` | `0` | Radial distortion of the camera rays: positive is barrel, negative pincushion. |

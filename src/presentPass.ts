@@ -32,6 +32,8 @@ export class PresentPass {
   private bindGroup: GPUBindGroup | null = null;
   private accumulation: GPUBuffer | null = null;
   private source: GPUBuffer | null = null;
+  private lut: GPUBuffer | null = null;
+  private lutSize = 0;
 
   constructor(private readonly device: GPUDevice, readonly format: GPUTextureFormat) {
     const module = createShaderModule(device, "present", PRESENT_WGSL);
@@ -48,13 +50,21 @@ export class PresentPass {
     });
   }
 
+  /** The display table AgX reads, with the length of its edge; a size of 0 keeps the analytic curve. */
+  setDisplayLut(buffer: GPUBuffer, size: number) {
+    if (buffer !== this.lut) this.bindGroup = null;
+
+    this.lut = buffer;
+    this.lutSize = size;
+  }
+
   setAccumulation(accumulation: GPUBuffer) {
     this.accumulation = accumulation;
     this.bind(null);
   }
 
   private bind(denoised: GPUBuffer | null) {
-    if (!this.accumulation) return;
+    if (!this.accumulation || !this.lut) return;
 
     // Without a denoised image the accumulation stands in for it; the uniform says which one to read.
     const source = denoised ?? this.accumulation;
@@ -68,6 +78,7 @@ export class PresentPass {
         { binding: 0, resource: { buffer: this.uniforms } },
         { binding: 1, resource: { buffer: this.accumulation } },
         { binding: 2, resource: { buffer: source } },
+        { binding: 3, resource: { buffer: this.lut } },
       ],
     });
   }
@@ -87,6 +98,7 @@ export class PresentPass {
     this.integers[7] = present.transparent ? 1 : 0;
     this.integers[8] = present.denoised ? 1 : 0;
     this.floats[9] = present.contrast;
+    this.integers[10] = this.lutSize;
     this.device.queue.writeBuffer(this.uniforms, 0, this.values);
 
     const pass = encoder.beginRenderPass({

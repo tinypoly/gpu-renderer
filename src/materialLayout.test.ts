@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 import {
   MATERIAL_ALPHA_HASH,
   MATERIAL_FOG,
+  MATERIAL_GRASS,
   MATERIAL_KIND,
   MATERIAL_LAYOUT,
   MATERIAL_LIT,
@@ -186,4 +187,24 @@ it("writes the transmission words and their maps where the struct says", () => {
   expect(read.word("thicknessMap")).toBe(9);
   expect([read.float("ior"), read.float("thickness")]).toEqual([1.5, 2]);
   expect([0, 1, 2, 3].map(k => read.float("attenuation", k))).toEqual([0.5, 0.25, 1, 3]);
+});
+
+it("marks a lit material that grows a lawn, so the kernel shades its floor under the blades", () => {
+  const lawn = { ...material("MeshStandardMaterial"), grass: true } as SerializedMaterial;
+  const unlit = { ...material("MeshBasicMaterial"), grass: true } as SerializedMaterial;
+
+  expect(materialProperties(lawn).flags & MATERIAL_GRASS).toBe(MATERIAL_GRASS);
+  expect(materialProperties(material("MeshStandardMaterial")).flags & MATERIAL_GRASS).toBe(0);
+  expect(materialProperties(unlit).flags & MATERIAL_GRASS).toBe(0);
+});
+
+it("lets a lit material through to its far side by the share it asks for, clamped, and an unlit one not at all", () => {
+  const leaf = { ...material("MeshStandardMaterial"), translucency: 0.4 } as SerializedMaterial;
+  const over = { ...material("MeshStandardMaterial"), translucency: 3 } as SerializedMaterial;
+  const unlit = { ...material("MeshBasicMaterial"), translucency: 0.4 } as SerializedMaterial;
+
+  expect(materialProperties(leaf).translucency).toBe(0.4);
+  expect(materialProperties(over).translucency).toBe(1);
+  expect(materialProperties(material("MeshStandardMaterial")).translucency).toBe(0);
+  expect(materialProperties(unlit).translucency).toBe(0);
 });

@@ -12,7 +12,9 @@ import {
 } from "./grass.js";
 import { NODE_WORDS } from "./bvh.js";
 
-const field = (input: object = {}) => grassField({ density: 400, ...input }) as GrassField;
+// A small, sparse lawn of fixed measures, so the searches below do not move with the defaults.
+const field = (input: object = {}) =>
+  grassField({ density: 400, height: 0.09, width: 0.005, bend: 0.35, ...input }) as GrassField;
 
 const asFloats = (words: Uint32Array) => new Float32Array(words.buffer, words.byteOffset, words.length);
 
@@ -40,7 +42,7 @@ function ground(grass: GrassField | null): PackedGeometry {
 
 describe("grassField", () => {
   it("takes every default from true and none from nothing", () => {
-    expect(grassField(true)?.height).toBe(0.09);
+    expect(grassField(true)?.height).toBe(0.06);
     expect(grassField(undefined)).toBeNull();
     expect(grassField(false)).toBeNull();
     expect(grassField({ height: 0 })).toBeNull();
